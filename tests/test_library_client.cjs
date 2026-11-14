@@ -222,8 +222,12 @@ async function main() {
     // 借用真实的 el()：把 dialog 注册进 mock 元素表
     const holder = library.internals.el('library-film-dialog');
     holder.querySelectorAll = dialog.querySelectorAll;
-    holder.querySelector = dialog.querySelector;
+    // 候选面板现在按 [data-lib-candidates] 查找（id 会重复，剧集页曾是空的）
     const candidates = library.internals.el('lib-candidates');
+    holder.querySelector = (selector) => {
+      if (selector === '[data-lib-candidates]') return candidates;
+      return dialog.querySelector(selector);
+    };
     candidates.innerHTML = '<ul>旧候选</ul>';
     candidates.classList.remove('hidden');
     const message = library.internals.el('library-film-message');

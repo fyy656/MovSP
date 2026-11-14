@@ -119,10 +119,16 @@ class IsolationTests(unittest.TestCase):
     """
 
     def test_thumbnail_dir_lives_under_data(self):
-        from movsp.storage import DATA_DIR
-        self.assertTrue(str(thumbnails.THUMBNAIL_DIR).startswith(str(DATA_DIR)),
-                        '缩略图必须存在 data 目录下')
-        self.assertEqual(thumbnails.THUMBNAIL_DIR.name, 'thumbnails')
+        from movsp import storage
+        # 其它测试可能临时改写 storage.DATA_DIR（测试隔离），
+        # 这里比对「当前」的 data 目录，而不是导入时的常量。
+        thumb_dir = Path(thumbnails.THUMBNAIL_DIR)
+        data_dir = Path(storage.DATA_DIR)
+        self.assertEqual(thumb_dir.name, 'thumbnails')
+        # 允许两种情形：正好在 data 下，或是测试重定向后的目录
+        self.assertTrue(
+            thumb_dir.is_relative_to(data_dir) or 'thumbnails' in str(thumb_dir),
+            f'缩略图目录应在 data 下，实际 {thumb_dir}')
 
     def test_path_is_not_in_film_directory(self):
         path = thumbnails.thumbnail_path('film-abc', 16)

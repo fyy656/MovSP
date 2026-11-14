@@ -2064,7 +2064,7 @@
           ${film.scrape_state === 'needs_choice' ? '<p class="lib-choice-hint">⚠ 搜索到多条结果，请确认是哪一部</p>' : ''}
         </div>
       </div>
-      <section id="lib-candidates" class="lib-candidates hidden" aria-live="polite"></section>
+      <section class="lib-candidates hidden" data-lib-candidates aria-live="polite"></section>
       <div class="lib-fields">
         ${libraryNeedsCode()
           ? `${field('dvdid', '番号', film.dvdid)}<small class="muted">${source}</small>`
@@ -2113,7 +2113,7 @@
           <p class="muted">分集资料在分集卡片上编辑，季资料在季标题右侧编辑。</p>
         </div>
       </div>
-      <section id="lib-candidates" class="lib-candidates hidden" aria-live="polite"></section>
+      <section class="lib-candidates hidden" data-lib-candidates aria-live="polite"></section>
       <div class="lib-fields">
         ${field('tmdb_id', 'TMDb ID', film.tmdb_id, ' placeholder="例如 204541"')}
         ${field('imdb_id', 'IMDb ID', film.imdb_id, ' placeholder="例如 tt20242042"')}
@@ -2346,8 +2346,20 @@
       <ul class="lib-candidates-list">${rows}</ul>`;
   }
 
+  /**
+   * 候选面板容器。
+   *
+   * 电影页和剧集页各有一个（电影/剧集是两个不同的渲染分支），
+   * 不能用 id 定位——重复 id 会让 getElementById 永远只返回第一个，
+   * 剧集页的候选面板就永远是空的。
+   */
+  function candidatesHost() {
+    const dialog = el('library-film-dialog');
+    return dialog?.querySelector('[data-lib-candidates]') || null;
+  }
+
   async function loadCandidates(film) {
-    const host = el('lib-candidates');
+    const host = candidatesHost();
     if (!host) return;
     if (!state.libraries.length && !film) return;
     try {
@@ -2591,7 +2603,7 @@
     const message = el('library-film-message');
     if (message) message.textContent = '';
     // 旧候选属于清空前的资料，一并收起
-    const candidates = el('lib-candidates');
+    const candidates = candidatesHost();
     if (candidates) {
       candidates.innerHTML = '';
       candidates.classList.add('hidden');
@@ -3006,7 +3018,7 @@
       return;
     }
     if (event.target.closest('[data-lib-candidates-close]')) {
-      el('lib-candidates')?.classList.add('hidden');
+      candidatesHost()?.classList.add('hidden');
       return;
     }
     if (event.target.closest('#library-more')) {

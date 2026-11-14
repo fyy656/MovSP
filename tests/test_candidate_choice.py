@@ -158,10 +158,12 @@ class CandidateFlowTests(unittest.TestCase):
         record = self._wait_task(result['task_id'])
         self.assertEqual(record.get('status'), 'needs_choice')
         self.assertEqual(len(record.get('scrape_candidates') or []), 3)
-        # 影片已落盘最可能的一部，并标记待确认
+        # 待确认时**不落盘**任何结果：用户可能发现所有候选都不对，
+        # 提前写入会让他以为已经改好，还得先清空才能重刮。
         updated = self._wait_film_state(film['id'], 'needs_choice')
         self.assertEqual(updated['scrape_state'], 'needs_choice')
-        self.assertEqual(updated['title'], '默认选中项')
+        self.assertNotEqual(updated['title'], '默认选中项', '不应写入默认候选的标题')
+        self.assertFalse(updated.get('tmdb_id'), '不应写入默认候选的 tmdb_id')
 
     def test_choosing_candidate_requeries_by_id(self):
         library = self._make_library()

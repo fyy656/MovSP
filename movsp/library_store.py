@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import copy
+import datetime as _dt
 import hashlib
 import json
 import os
@@ -1541,10 +1542,39 @@ def _conditions(library_id: str = '', folder_id: str = '', status: str = '', que
     return conditions, params
 
 
+# 待确认状态的最长保留时间。
+# 多结果时不自动采用任何一条，等用户挑；但用户可能一直不回来，
+# 超时后撤销待确认，让这部片回到「未刮削」可以重新刮。
+CHOICE_TTL_SECONDS = 2 * 60 * 60  # 2 小时
+
+
+def _expire_pending_choices() -> None:
+    """撤销超时未选择的待确认状态。
+
+    只是把状态放回 idle，不动已写入的资料（本来也没有写入），
+    用户重新刮削即可再次拿到候选。
+    """
+    from .timeutils import local_now
+
+    # now_iso() 用的是本地时区，这里必须同样用本地时间比较
+    cutoff = (local_now() - _dt.timedelta(seconds=CHOICE_TTL_SECONDS)).isoformat()
+    try:
+        with connection() as db:
+            db.execute(
+                "UPDATE films SET scrape_state='idle', last_error=?, updated_at=? "
+                "WHERE scrape_state='needs_choice' AND updated_at<>'' AND updated_at<?",
+                ('待确认超时，已撤销；需要时重新刮削即可再次选择',
+                 now_iso(), cutoff))
+    except sqlite3.Error:
+        # 清理失败不能影响正常的列表查询
+        pass
+
+
 def list_films(library_id: str = '', folder_id: str = '', status: str = '', query: str = '',
                group_by: str = '', group: str = '', sort: str = 'updated', direction: str = 'desc',
                limit: int = 48, offset: int = 0, kind: str = '', parent: str = '',
                season: int | None = None) -> dict:
+    _expire_pending_choices()
     conditions, params = _conditions(library_id, folder_id, status, query, group_by, group,
                                      kind, parent, season)
     where = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
@@ -2021,7 +2051,7 @@ def _download_artwork(film: dict, url: str, kind: str, overwrite: bool = False) 
 
 def _refresh_series_after_task(film_id: str, status: str, error: str, task: dict | None) -> None:
     """剧集任务结束后刷新：写 tvshow.nfo，再按剧集逻辑重建索引（不改 kind）。"""
-    if status in ('succeeded', 'needs_choice'):
+    if status == 'succeeded':
         apply_native_result(film_id, task or {})
         try:
             refresh_series(film_id)
@@ -2029,9 +2059,15 @@ def _refresh_series_after_task(film_id: str, status: str, error: str, task: dict
             # 剧集刷新失败时不能再退回电影逻辑，否则 kind 会被改写成 movie
             pass
         with connection() as db:
-            new_state = 'idle' if status == 'succeeded' else 'needs_choice'
-            db.execute("UPDATE films SET scrape_state=?,last_error='',updated_at=? WHERE id=?",
-                       (new_state, now_iso(), film_id))
+            db.execute("UPDATE films SET scrape_state='idle',last_error='',updated_at=? WHERE id=?",
+                       (now_iso(), film_id))
+    elif status == 'needs_choice':
+        # 多结果时**不写入任何结果**：用户可能发现所有候选都不对，
+        # 提前落盘会让他以为「已经改好了」，还得先清空才能重刮。
+        # 只把状态挂成待确认，等用户选定后再按 ID 取详情。
+        with connection() as db:
+            db.execute("UPDATE films SET scrape_state='needs_choice',last_error='',updated_at=? WHERE id=?",
+                       (now_iso(), film_id))
     elif status in ('failed', 'cancelled'):
         with connection() as db:
             db.execute("UPDATE films SET scrape_state=?,last_error=?,updated_at=? WHERE id=?",
@@ -2070,10 +2106,9 @@ def refresh_film_after_task(film_id: str, status: str, error: str = '', task: di
             db.execute("UPDATE films SET scrape_state='idle',last_error='',updated_at=? WHERE id=?",
                        (now_iso(), film_id))
     elif status == 'needs_choice':
-        # 资料已抓到，但搜索结果有多条：先落盘最可能的一部，同时标记待用户确认
-        if (task or {}).get('scrape_path') == 'title':
-            apply_native_result(film_id, task or {})
-            _refresh_film(film_id)
+        # 多结果时**不写入任何结果**：用户可能发现所有候选都不对，
+        # 提前落盘会让他以为「已经改好了」，还得先清空才能重刮。
+        # 只把状态挂成待确认，等用户选定后再按 ID 取详情。
         with connection() as db:
             db.execute("UPDATE films SET scrape_state='needs_choice',last_error='',updated_at=? WHERE id=?",
                        (now_iso(), film_id))
@@ -2760,10 +2795,13 @@ def write_raw_nfo(film_id: str, content: str, expected_mtime: float | None = Non
 
 def start_scrape_with_external(film_id: str, *, tmdb_id: str | None = None,
                                imdb_id: str | None = None,
-                               preset_id: str | None = None) -> dict:
+                               preset_id: str | None = None,
+                               media_type: str | None = None) -> dict:
     """用户从候选面板选定一部：记下外部 ID，并立即按该 ID 重刮。
 
     记下 ID 之后，后续每次刮削都直接按 ID 取，不会再出现同名歧义。
+    `media_type`（movie / tv）用于同名跨分类的情况：候选里选的是另一分类的
+    条目时，必须按那个分类取详情，否则会取错或 404。
     """
     film = get_film(film_id, reconcile=False)
     if not film:
@@ -2776,11 +2814,13 @@ def start_scrape_with_external(film_id: str, *, tmdb_id: str | None = None,
         db.execute("UPDATE films SET tmdb_id=?,imdb_id=?,updated_at=? WHERE id=?",
                    (tmdb or film.get('tmdb_id') or '', imdb or film.get('imdb_id') or '',
                     now_iso(), film_id))
-    return start_scrape(film_id, None, preset_id, external={'tmdb': tmdb, 'imdb': imdb})
+    return start_scrape(film_id, None, preset_id,
+                        external={'tmdb': tmdb, 'imdb': imdb},
+                        media_type=media_type)
 
 
 def start_scrape(film_id: str, dvdid: str | None = None, preset_id: str | None = None,
-                 external: dict | None = None) -> dict:
+                 external: dict | None = None, media_type: str | None = None) -> dict:
     from . import tasks
     film = get_film(film_id)
     if not film:
@@ -2846,7 +2886,9 @@ def start_scrape(film_id: str, dvdid: str | None = None, preset_id: str | None =
                              library_film_id=film_id, external_ids=external,
                              is_series=is_series, title_hint=hint, year_hint=hint_year,
                              # 剧集季号：决定 TMDb 取 tv/{id}/season/{n}
-                             season_hint=int(film.get('season_number') or 0) or None)
+                             season_hint=int(film.get('season_number') or 0) or None,
+                             # 候选里选定的条目类型（movie / tv）：同名作品可能跨分类
+                             media_type=media_type)
     with connection() as db:
         db.execute("UPDATE films SET scrape_state='queued',last_task_id=?,last_error='',updated_at=? WHERE id=?",
                    (task['id'], now_iso(), film_id))
