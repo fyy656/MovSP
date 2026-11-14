@@ -419,13 +419,8 @@ def parse_data(movie: "MovieInfo"):
     known_id = str(external.get("tmdb") or "").strip()
     title = str(getattr(movie, "_query_title", "") or "").strip()
     year = getattr(movie, "_query_year", None)
-    # 剧集走 /tv 接口；电影走 /movie。
-    # 但用户可能从候选里选了另一分类的条目（同名动漫/真人版/衍生作），
-    # 以 _query_media_type 为准，否则会拿错的端点查同一个 ID。
+    # 剧集走 /tv 接口；电影走 /movie
     is_series = str(getattr(movie, "_query_kind", "") or "") == "series"
-    forced_type = str(getattr(movie, "_query_media_type", "") or "")
-    if forced_type in ("movie", "tv"):
-        is_series = forced_type == "tv"
     endpoint = "tv" if is_series else "movie"
     search_path = "/search/tv" if is_series else "/search/movie"
     date_key = "first_air_date" if is_series else "release_date"
@@ -447,55 +442,28 @@ def parse_data(movie: "MovieInfo"):
         resp.raise_for_status()
         results = (resp.json() or {}).get("results") or []
 
-        # 电影与剧集在 TMDb 是两套独立条目：
-        # 选「电影」搜不到其实在「剧集」里的作品（例如同名动漫/真人剧）。
-        # 主类型命中不可靠时补搜另一种，合并成候选让用户自己挑。
-        cross_results = []
-        main_weak = (not results) or (not _title_matches(
-            query, (results[0].get("title") or results[0].get("name") or "") if results else ""))
-        if main_weak:
-            other_path = "/search/tv" if not is_series else "/search/movie"
-            other_key = "first_air_date" if not is_series else "release_date"
-            try:
-                cross = session.get(base + other_path, params=params, timeout=20,
-                                    proxies=_proxies())
-                if cross.ok:
-                    cross_results = (cross.json() or {}).get("results") or []
-            except requests.RequestException:
-                cross_results = []
-
-        if not results and not cross_results:
+        if not results:
             raise RuntimeError("TMDb 未找到匹配%s: %s" % ("剧集" if is_series else "影片", query))
 
-        # 主类型优先；主类型为空时用另一种的结果
-        picked, ambiguous = _pick_result(results or cross_results, year,
-                                         date_key=date_key, query=query)
+        picked, ambiguous = _pick_result(results, year, date_key=date_key, query=query)
         movie_id = picked.get("id")
         summary = picked
         if ambiguous:
             # 不用抛异常：仍然给出最可能的结果，同时把候选记下来供界面提示。
             # 候选带上海报/年份/评分，用户才能分辨同名影片。
-            def _candidate(item, kind, date_field):
-                return {
-                    "tmdb_id": item.get("id"),
-                    "kind": kind,  # movie / tv：用户选中后按这个取详情
-                    "title": item.get("title") or item.get("name") or item.get("original_title") or "",
-                    "original_title": item.get("original_title") or item.get("original_name") or "",
-                    "year": str(item.get(date_field) or "")[:4],
-                    "release_date": item.get(date_field) or "",
-                    "score": round(float(item.get("vote_average") or 0), 1),
-                    "poster": (image_base + "/w200" + item["poster_path"]) if item.get("poster_path") else "",
-                    "overview": (item.get("overview") or "")[:160],
-                }
-
-            pool = [_candidate(it, endpoint, date_key) for it in results[:10] if it.get("id")]
-            if cross_results:
-                other_kind = "tv" if not is_series else "movie"
-                other_date = "first_air_date" if not is_series else "release_date"
-                pool += [_candidate(it, other_kind, other_date)
-                         for it in cross_results[:10] if it.get("id")]
+            pool = [
+                {"tmdb_id": item.get("id"),
+                 "title": item.get("title") or item.get("name") or item.get("original_title") or "",
+                 "original_title": item.get("original_title") or item.get("original_name") or "",
+                 "year": str(item.get(date_key) or "")[:4],
+                 "release_date": item.get(date_key) or "",
+                 "score": round(float(item.get("vote_average") or 0), 1),
+                 "poster": (image_base + "/w200" + item["poster_path"]) if item.get("poster_path") else "",
+                 "overview": (item.get("overview") or "")[:160]}
+                for item in results[:10] if item.get("id")
+            ]
             # 选中的那条排最前，界面默认高亮它
-            pool.sort(key=lambda c: c["tmdb_id"] != movie_id)
+            pool.sort(key=lambda c: str(c["tmdb_id"]) != str(movie_id))
             movie._tmdb_candidates = pool
 
     append = "credits,external_ids,aggregate_credits" if is_series else "credits,external_ids"

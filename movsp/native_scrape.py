@@ -60,10 +60,6 @@ def _make_movie(query: dict):
     movie._query_kind = query.get("kind") or "title"
     # 剧集季号：决定 TMDb 取哪一季（0 表示未指定，走剧级信息）
     movie._query_season = int(query.get("season") or 0)
-    # 候选里选定的 TMDb 条目类型（movie / tv）。
-    # 同名作品可能在另一分类下（例如动漫在 tv、真人版在 tv、衍生在 movie），
-    # 用户选哪条就按哪条的端点取详情。
-    movie._query_media_type = str(query.get("media_type") or "")
     return movie
 
 

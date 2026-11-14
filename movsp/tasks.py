@@ -1425,7 +1425,6 @@ def create_task(
     title_hint: str | None = None,
     year_hint: int | None = None,
     season_hint: int | None = None,
-    media_type: str | None = None,
     _snapshot: tuple[dict, dict] | None = None,
     _defer: bool = False,
 ) -> dict:
@@ -1491,7 +1490,7 @@ def create_task(
         task["scrape_path"] = resolved["path"]
         task["scrape_query"] = _query_for_task(input_directory, selected, forced_avid,
                                                external_ids, is_series, title_hint, year_hint,
-                                               season_hint, media_type)
+                                               season_hint)
     except Exception:  # noqa: BLE001 - 推导失败时保持 JAV 引擎的既有行为
         task["scrape_path"] = "jav"
         task["scrape_query"] = None
@@ -1508,7 +1507,7 @@ def _query_for_task(input_directory: str, input_files: list[str] | None,
                     is_series: bool = False, title_hint: str | None = None,
                     year_hint: int | None = None,
                     season_hint: int | None = None,
-                    media_type: str | None = None) -> dict | None:
+                    ) -> dict | None:
     """为标题路径准备查询上下文（番号 / 标题 / 年份 / 外部 ID）。
 
     title_hint 是用户在资料页确认过的标题：它比文件名推测更可信，优先使用。
@@ -1544,8 +1543,6 @@ def _query_for_task(input_directory: str, input_files: list[str] | None,
             # 不指定季就会默认拿第 1 季，多季剧必须靠它定位
             if season_hint:
                 query["season"] = int(season_hint)
-            if media_type in ("movie", "tv"):
-                query["media_type"] = media_type
             return query
         # 任务目录本身通常就是影片目录；NFO 交给 scrape_plan 的调用方按需补充
         query = scrape_plan.detect_query(
@@ -1582,8 +1579,6 @@ def _query_for_task(input_directory: str, input_files: list[str] | None,
             query["external_id"] = merged
         # 候选里选定的条目类型：同名作品可能跨分类（movie / tv），
         # 由用户选的那条决定用哪个端点取详情
-        if media_type in ("movie", "tv"):
-            query["media_type"] = media_type
         return query
     except Exception:  # noqa: BLE001 - 推导失败不影响任务创建
         return None

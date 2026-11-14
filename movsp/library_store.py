@@ -2795,13 +2795,10 @@ def write_raw_nfo(film_id: str, content: str, expected_mtime: float | None = Non
 
 def start_scrape_with_external(film_id: str, *, tmdb_id: str | None = None,
                                imdb_id: str | None = None,
-                               preset_id: str | None = None,
-                               media_type: str | None = None) -> dict:
+                               preset_id: str | None = None) -> dict:
     """用户从候选面板选定一部：记下外部 ID，并立即按该 ID 重刮。
 
     记下 ID 之后，后续每次刮削都直接按 ID 取，不会再出现同名歧义。
-    `media_type`（movie / tv）用于同名跨分类的情况：候选里选的是另一分类的
-    条目时，必须按那个分类取详情，否则会取错或 404。
     """
     film = get_film(film_id, reconcile=False)
     if not film:
@@ -2815,12 +2812,11 @@ def start_scrape_with_external(film_id: str, *, tmdb_id: str | None = None,
                    (tmdb or film.get('tmdb_id') or '', imdb or film.get('imdb_id') or '',
                     now_iso(), film_id))
     return start_scrape(film_id, None, preset_id,
-                        external={'tmdb': tmdb, 'imdb': imdb},
-                        media_type=media_type)
+                        external={'tmdb': tmdb, 'imdb': imdb})
 
 
 def start_scrape(film_id: str, dvdid: str | None = None, preset_id: str | None = None,
-                 external: dict | None = None, media_type: str | None = None) -> dict:
+                 external: dict | None = None) -> dict:
     from . import tasks
     film = get_film(film_id)
     if not film:
@@ -2886,9 +2882,7 @@ def start_scrape(film_id: str, dvdid: str | None = None, preset_id: str | None =
                              library_film_id=film_id, external_ids=external,
                              is_series=is_series, title_hint=hint, year_hint=hint_year,
                              # 剧集季号：决定 TMDb 取 tv/{id}/season/{n}
-                             season_hint=int(film.get('season_number') or 0) or None,
-                             # 候选里选定的条目类型（movie / tv）：同名作品可能跨分类
-                             media_type=media_type)
+                             season_hint=int(film.get('season_number') or 0) or None)
     with connection() as db:
         db.execute("UPDATE films SET scrape_state='queued',last_task_id=?,last_error='',updated_at=? WHERE id=?",
                    (task['id'], now_iso(), film_id))

@@ -3244,9 +3244,6 @@ class FilmChoiceBody(BaseModel):
     tmdb_id: str | None = Field(default=None, max_length=32)
     imdb_id: str | None = Field(default=None, max_length=32)
     preset_id: str | None = Field(default=None, max_length=80)
-    # 候选的 TMDb 类型：movie / tv。同名作品可能在另一分类，
-    # 不传就按影片自身类型取详情，会取错条目或 404。
-    media_type: str | None = Field(default=None, max_length=8)
 
 
 @app.get("/api/library/films/{film_id}/candidates")
@@ -3277,8 +3274,7 @@ def choose_library_film(film_id: str, body: FilmChoiceBody, _: dict = Depends(re
     """用户从候选里选定一部：记下外部 ID，并按该 ID 立即重刮。"""
     try:
         return library_store.start_scrape_with_external(
-            film_id, tmdb_id=body.tmdb_id, imdb_id=body.imdb_id,
-            preset_id=body.preset_id, media_type=body.media_type)
+            film_id, tmdb_id=body.tmdb_id, imdb_id=body.imdb_id, preset_id=body.preset_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
