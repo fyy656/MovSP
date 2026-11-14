@@ -2385,6 +2385,9 @@
       });
       showToast('已按所选影片重新刮削');
       el('library-film-dialog')?.close();
+      // 刷新后 state.active 会带上新 ID；清掉 active 强制下次重新读取，
+      // 避免输入框还留着旧 ID（用户再点「保存」就会把选择覆盖回去）
+      state.active = null;
       await refresh();
     } catch (error) {
       showToast(error.message || '选择失败', 'danger');
@@ -2663,6 +2666,15 @@
     if (dropStaleId) {
       values.tmdb_id = '';
       values.imdb_id = '';
+    }
+    // 用户没主动改 ID 时不要提交它：
+    // 候选面板选过之后库里已经是新 ID，而输入框可能还是打开时的旧值，
+    // 提交上去会把用户刚选的那一部覆盖掉。
+    const idUntouched = String(values.tmdb_id || '').trim() === String(original.tmdb_id || '').trim()
+      && String(values.imdb_id || '').trim() === String(original.imdb_id || '').trim();
+    if (idUntouched && !dropStaleId) {
+      delete values.tmdb_id;
+      delete values.imdb_id;
     }
     state.busy = true;
     const messageTarget = el('library-film-message');

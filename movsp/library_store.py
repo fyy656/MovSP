@@ -2490,8 +2490,17 @@ def update_film(film_id: str, values: dict, write_nfo: bool = True,
     if not film:
         return None
     dvdid = str(values.get('dvdid') or '').strip().upper()
-    tmdb_id = str(values.get('tmdb_id') or '').strip()
-    imdb_id = str(values.get('imdb_id') or '').strip()
+    # 外部 ID 只在「显式提供」时才改：
+    # 前端在没有主动修改 ID 时会省略这两个键，此时保留库里的值。
+    # 否则候选面板刚选定的新 ID 会被输入框里的旧值覆盖回上一次的结果。
+    if 'tmdb_id' in values:
+        tmdb_id = str(values.get('tmdb_id') or '').strip()
+    else:
+        tmdb_id = str(film.get('tmdb_id') or '').strip()
+    if 'imdb_id' in values:
+        imdb_id = str(values.get('imdb_id') or '').strip()
+    else:
+        imdb_id = str(film.get('imdb_id') or '').strip()
     payload = {
         'dvdid': dvdid, 'tmdb_id': tmdb_id, 'imdb_id': imdb_id,
         'title': str(values.get('title') or '').strip(),

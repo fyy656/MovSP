@@ -3143,8 +3143,11 @@ def library_film(film_id: str, _: dict = Depends(current_user)) -> dict:
 @app.patch("/api/library/films/{film_id}")
 def update_library_film(film_id: str, body: LibraryFilmBody, _: dict = Depends(require_admin)) -> dict:
     _library_film_or_404(film_id, reconcile=False)
+    # exclude_unset：前端没主动改的字段不要下发，
+    # 否则输入框里的旧 TMDb ID 会覆盖候选里刚选定的那一条。
+    values = body.model_dump(exclude_unset=True)
     try:
-        film = library_store.update_film(film_id, body.model_dump(), body.write_nfo, body.expected_nfo_mtime)
+        film = library_store.update_film(film_id, values, body.write_nfo, body.expected_nfo_mtime)
     except FileExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, ValueError) as exc:
