@@ -1126,11 +1126,12 @@ def _episode_record(root: dict, series_record: dict, entry: dict) -> dict:
 def _series_records_for(root: dict, series_dir: Path, scanner: dict, minimum: int) -> tuple[list[dict], int]:
     """单个剧集目录 → [series, episode...]。刷新单部剧时复用。
 
-    剧集的最小文件大小取 `min(预设, SERIES_MIN_SIZE)`：预设的阈值是按整部影片定的
-    （默认 232MiB），而一集短剧/番剧只有几十 MB，直接套上去会把整部剧过滤光。
+    最小文件大小按预设值直接生效，与电影路径保持一致。
+    剧集是按「单集」判断的——动漫番剧一集通常 100~300MB，
+    如果预设里填的是按整部影片设的阈值（如 200MiB），要自己确认是否合适。
     """
     extensions = _video_extensions()
-    limit = min(int(minimum or 0), SERIES_MIN_SIZE)
+    limit = int(minimum or 0)
     entries = []
     skipped = 0
     for entry in series_scan.episode_entries(series_dir, extensions):

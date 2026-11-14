@@ -58,7 +58,10 @@ const ADVANCED_TABS = [
 // 所以这些面板不显示，避免让人以为设置坏了。
 const MEDIA_FORM_TABS = [
   { id: 'scanner', section: 'scanner', prefixes: ['minimum_size', 'ignore_folders', 'extensions', 'strm_ignore_minimum_size'],
-    label: '扫描器', description: '决定哪些文件会被扫描。影视只按文件名/目录名取标题，不需要番号规则。' },
+    label: '扫描器',
+    description: '决定哪些文件会被扫描。影视只按文件名/目录名取标题，不需要番号规则。'
+      + '注意「最小匹配文件大小」对剧集是按**单集**判断的：动漫一集通常 100~300MB，'
+      + '如果沿用按整部影片设的阈值（如 200MiB），会把很多剧集过滤掉。' },
   { id: 'crawler', section: 'crawler', label: '刮削器',
     description: '按顺序调用这些刮削器取资料；有 TMDb / IMDb ID 时优先按 ID 精确匹配。' },
   { id: 'network', section: 'network', label: '网络', description: '代理、重试与超时。' },
@@ -155,7 +158,8 @@ const FIELD_DESCRIPTIONS = {
   'scanner.input_directory': '要整理的影片目录。',
   'scanner.filename_extensions': '只扫描这些格式的视频。',
   'scanner.ignored_folder_name_pattern': '跳过名称符合规则的文件夹。',
-  'scanner.minimum_size': '小于此大小的视频会被跳过。请带上单位，例如 200MB 或 1GB。',
+  'scanner.minimum_size': '小于此大小的视频会被跳过。请带上单位，例如 200MB 或 1GB。'
+    + '剧集按单集判断，动漫一集通常 100~300MB，阈值别设太高。',
   'network.proxy_server': '支持 HTTP、SOCKS5 和 SOCKS5H 代理。',
   'network.proxy_free': '仅在未配置代理时生效的站点地址：JavBus、JavDB 在配置了代理后会改用官网，这里的地址就失效；Avsox 始终使用这里的地址。未配置代理时请填写可直连的镜像站，填官网地址会被反爬拦截（表现为“反爬空响应”）。',
   'network.retry': '网络问题导致抓取失败时的重试次数。',
