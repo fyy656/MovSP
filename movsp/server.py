@@ -3542,8 +3542,11 @@ def library_film_stream(film_id: str, request: Request, _: dict = Depends(curren
         raise HTTPException(status_code=404, detail="视频文件不存在或不可访问")
     if target.suffix.lower() not in LOCAL_PLAYABLE_SUFFIXES:
         raise HTTPException(status_code=415, detail="这不是可播放的视频文件")
+    # key 必须与 /playback/stop 里的 stop_stream(film_id) 一致，
+    # 否则停止请求找不到这条流，关掉页面后服务端还在继续读盘。
+    # tag 只用于日志，保留可读的番号。
     tag = str(film.get("dvdid") or "") or film_id
-    return file_stream_response(request, target, tag=tag)
+    return file_stream_response(request, target, tag=tag, key=film_id)
 
 
 @app.get("/api/library/films/{film_id}/gallery")

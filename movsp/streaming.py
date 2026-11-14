@@ -87,8 +87,14 @@ def parse_range(header: str, size: int) -> tuple[int, int] | None:
     return start, end
 
 
-def file_stream_response(request: Request, path: Path, tag: str = "") -> StreamingResponse:
-    """按 Range 返回文件流，客户端断开时立即停止读盘。"""
+def file_stream_response(request: Request, path: Path, tag: str = "",
+                         key: str = "") -> StreamingResponse:
+    """按 Range 返回文件流，客户端断开时立即停止读盘。
+
+    `tag` 只用于日志展示（可读的番号/片名）；
+    `key` 是流的唯一标识，必须与 stop_stream() 用的值一致，
+    否则停止请求找不到这条流。
+    """
     size = path.stat().st_size
     start, end = 0, size - 1
     status_code = 200
@@ -109,7 +115,8 @@ def file_stream_response(request: Request, path: Path, tag: str = "") -> Streami
 
     import asyncio
 
-    cancel_event = _stream_event(tag or str(path))
+    stream_key = key or tag or str(path)
+    cancel_event = _stream_event(stream_key)
 
     async def stream():
         import time as _time
@@ -139,8 +146,8 @@ def file_stream_response(request: Request, path: Path, tag: str = "") -> Streami
             reason = f"写入中断（{type(exc).__name__}）"
         finally:
             await anyio.to_thread.run_sync(handle.close)
-            if _ACTIVE_STREAMS.get(tag or str(path)) is cancel_event:
-                _ACTIVE_STREAMS.pop(tag or str(path), None)
+            if _ACTIVE_STREAMS.get(stream_key) is cancel_event:
+                _ACTIVE_STREAMS.pop(stream_key, None)
             elapsed = _time.monotonic() - started
             logger.info("本地直连播放结束: %s 发送 %.1f MB / 用时 %.1f 秒（%s）",
                         tag, sent / 1024 / 1024, elapsed, reason)

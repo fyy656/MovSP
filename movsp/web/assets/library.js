@@ -1970,9 +1970,15 @@
       playerDialog.addEventListener('click', (event) => {
         if (event.target === playerDialog) destroyPlayer();
       });
-      // 关页面/刷新时也通知服务端收尾
+      // 关页面/刷新时也要收尾：只发停止请求不够，
+      // 浏览器还握着视频连接，服务端会继续读盘。
+      // 必须同时清空 <video> 的 src 并 load()，连接才真正断开。
+      // pagehide 足够覆盖关闭标签/刷新/前进后退，不用再加 beforeunload
+      // （后者里调 load() 可能反而触发新请求）。
       window.addEventListener('pagehide', () => {
-        if (state.playingFilmId) notifyPlaybackStopped(playerPayload);
+        if (!state.playingFilmId) return;
+        abortAllMedia();
+        notifyPlaybackStopped(playerPayload);
       });
     }
     const dialog = el('library-film-dialog');
