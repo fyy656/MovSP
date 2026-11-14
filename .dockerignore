@@ -1,0 +1,11 @@
+.git
+__pycache__
+*.pyc
+data
+video
+dist
+build
+tmp
+comments-service
+debug.log
+*.spec

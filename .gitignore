@@ -1,0 +1,42 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+dist-staged/
+build-*.log
+data/users.json
+data/tasks.json
+data/presets.json
+data/network-settings.json
+data/config.yml
+data/task-config/
+data/task-covers/
+data/task-logs/
+data/ai-settings.json
+data/ai-skills.json
+data/ai-conversations/
+data/crawlers/
+data/RELEASE_NOTES_*.md
+data/*.tmp
+video/
+logo-preview.png
+exe-icon-preview.png
+!JavSPWeb.spec
+
+# Local audit work, database backups, and the independent comments repository
+/tmp/
+# tests/test_multipart.py 在仓库根目录建临时目录（Windows 下句柄未释放时清不掉）
+/tmp*/
+/debug.log
+/comments-service/
+
+# IDE and local assistant workspace
+.idea/
+.workbuddy-ai/
+
+# 内部验收/审计资料，不进入公开仓库
+docs/reports/
+data/crawler-settings.json
+vendor/JavSP/ico.jpeg
+docs/cloudflare/

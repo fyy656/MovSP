@@ -1,0 +1,101 @@
+name: Publish beta Docker image
+
+# 暂停：main 每次推送都会构建 beta 镜像并在容器内跑全套单元测试。
+# 目前 Docker 部署暂时用不到，改为只允许手动触发，避免主分支每次推送都出现红色失败。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/fyy656/movsp
+
+jobs:
+  docker:
+    name: Publish Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Verify browser request and version regressions
+        run: |
+          node tests/test_web_client.cjs
+          node tests/test_scan_client.cjs
+          node tests/test_mount_batch_client.cjs
+          node tests/test_ai_translation_client.cjs
+          node tests/test_cookiecloud_client.cjs
+          node tests/test_comments_client.cjs
+          node tests/test_comment_markdown.cjs
+          node tests/test_community_client.cjs
+          node tests/test_library_playback.cjs
+          node tests/test_demo.cjs
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set beta release label
+        id: release
+        shell: bash
+        run: echo "label=bata.$(TZ=Asia/Shanghai date +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=bata
+      - name: Build candidate image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          build-args: |
+            movsp_RELEASE_LABEL=${{ steps.release.outputs.label }}
+            movsp_RELEASE_COMMIT=${{ github.sha }}
+          load: true
+          tags: movsp:verify
+      - name: Verify scraping regressions in candidate image
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD/tests:/app/tests:ro" movsp:verify \
+            sh -c "python -m pip install -r tests/requirements.txt && python -m unittest discover -s tests -v" \
+            2>&1 | tee /tmp/unittest.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            # 把失败用例写成 annotation，便于在页面/接口直接看到名字
+            grep -E "^(ERROR|FAIL):" /tmp/unittest.log | head -8 | while IFS= read -r line; do
+              echo "::error title=unittest::$line"
+            done
+            tail -n 40 /tmp/unittest.log | grep -E "Error|error|Traceback" | head -8 | while IFS= read -r line; do
+              echo "::error title=unittest detail::$line"
+            done
+            exit "$status"
+          fi
+      - name: Verify supervised web startup
+        shell: bash
+        run: |
+          docker run -d --name movsp-smoke -p 127.0.0.1:18090:8090 movsp:verify
+          trap 'docker rm -fv movsp-smoke' EXIT
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:18090/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs movsp-smoke
+          exit 1
+      - name: Check CA trust and site HTTPS connectivity
+        run: docker run --rm -v "$PWD/tests:/app/tests:ro" movsp:verify python tests/check_https.py
+      - name: Publish verified beta image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          build-args: |
+            movsp_RELEASE_LABEL=${{ steps.release.outputs.label }}
+            movsp_RELEASE_COMMIT=${{ github.sha }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

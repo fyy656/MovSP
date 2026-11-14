@@ -1,0 +1,366 @@
+"""Offline regressions for missing fields, retry policy and log presentation."""
+import ast
+import copy
+import io
+import json
+import logging
+import os
+from pathlib import Path
+import sys
+import subprocess
+import tempfile
+import threading
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch, Mock
+
+import lxml.html
+import requests
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / 'vendor' / 'JavSP'))
+
+from movsp.task_logs import build_log_entries, log_text
+from javsp.datatype import Movie, MovieInfo
+from javsp.web import fc2, javmenu
+from javsp.web.mirrors import get_with_mirror_fallback
+from javsp.web.exceptions import (MovieNotFoundError, MovieDuplicateError, SiteBlocked,
+                                  SitePermissionError, CredentialError, WebsiteError)
+
+
+def event(stage, **values):
+    return 'JAVSP_PROGRESS ' + json.dumps(dict(stage=stage, **values), ensure_ascii=False)
+
+
+def success_log():
+    lines = ['任务已排队: /video/BBAN-601.strm', 'CookieCloud 已同步：11 个站点，30 条 Cookie',
+             '==================================', '# Jav Scraper Package: 1.8.0',
+             event('scan', status='running'), '扫描影片文件...',
+             event('scan', status='completed', total=1), event('movie', status='running', index=1, total=1),
+             event('metadata', dvdid='BBAN-601')]
+    for source in ('javbus', 'javdb', 't66y'):
+        lines.append(event('crawler', name=source, status='running'))
+        lines.extend(event('crawler', name=source, status='retrying', attempt=i, reason='connection timeout') for i in (1, 2))
+        lines.append(event('crawler', name=source, status='success' if source == 't66y' else 'failed', reason='' if source == 't66y' else 'SSLError CERTIFICATE_VERIFY_FAILED'))
+    lines += [event('summary', done=0), event('summary', done=1), event('metadata', dvdid='BBAN-601', title='演示影片'),
+              event('images', kind='cover', done=0, total=1), event('images', kind='cover', done=1, total=1)]
+    for i in range(12):
+        lines += [event('images', kind='fanart', done=i, total=12, status='downloading', current=i+1),
+                  event('images', kind='fanart', done=i+1, total=12, status='completed', current=i+1)]
+    return lines + [event('movie', status='completed', total=1), event('task', status='completed', total=1), 'JavSP 执行完成']
+
+
+class LogTests(unittest.TestCase):
+    def test_process_failure_reason_uses_structured_movie_error(self):
+        from movsp.tasks import _process_failure_reason
+
+        lines = [
+            event('images', kind='fanart', done=0, total=10),
+            event('movie', status='failed', error='[WinError 183] 文件已存在'),
+        ]
+        self.assertEqual(_process_failure_reason(lines), '[WinError 183] 文件已存在')
+
+    def test_process_failure_reason_falls_back_to_log_message(self):
+        from movsp.tasks import _process_failure_reason
+
+        self.assertEqual(_process_failure_reason(['影片刮削失败: extrafanart 已存在']), 'extrafanart 已存在')
+
+    def test_summarized_crawler_failure_survives_log_rendering(self):
+        from movsp.task_logs import build_log_entries, readable_error
+        from movsp.tasks import _crawler_failure_summary
+
+        lines = [
+            event('crawler', name='javsp.web.javlib', status='failed', reason='403 Client Error: Forbidden for url: https://x'),
+            event('crawler', name='javsp.web.avsox', status='not_found', reason='未找到影片'),
+        ]
+        summary = _crawler_failure_summary(lines)
+        self.assertIn('javlib 403 拒绝', readable_error(summary))
+        rows = build_log_entries(lines, 'failed', summary)
+        detail = next(row['detail'] for row in rows if row['group'] == 'result' and row['message'] == '任务失败')
+        self.assertIn('javlib 403 拒绝', detail)
+        self.assertIn('1 个来源未收录该番号', detail)
+
+    def test_blocked_crawlers_explain_the_proxy_hint(self):
+        from movsp.tasks import _crawler_failure_summary
+
+        lines = [
+            event('crawler', name='javsp.web.javlib', status='failed', reason='403 Client Error: Forbidden for url: https://x'),
+            event('crawler', name='javsp.web.jav321', status='failed', reason="SSLError(SSLCertVerificationError(1, 'Hostname mismatch'))"),
+            event('crawler', name='javsp.web.javbus', status='failed', reason='Document is empty'),
+        ]
+        summary = _crawler_failure_summary(lines)
+        self.assertIn('所有来源都被拒绝或不可达', summary)
+        self.assertIn('javlib 403 拒绝', summary)
+        self.assertIn('代理', summary)
+
+    def test_mixed_crawler_failures_report_both_causes(self):
+        from movsp.tasks import _crawler_failure_summary
+
+        lines = [
+            event('crawler', name='javsp.web.javlib', status='failed', reason='403 Client Error'),
+            event('crawler', name='javsp.web.avsox', status='not_found', reason="javsp.web.avsox: 未找到影片: 'EYS-099'"),
+            event('crawler', name='javsp.web.mgstage', status='not_found', reason='mgstage: 未找到影片'),
+        ]
+        summary = _crawler_failure_summary(lines)
+        self.assertIn('1 个来源被拒绝或不可达', summary)
+        self.assertIn('2 个来源未收录该番号', summary)
+
+    def test_crawler_summary_ignores_retry_then_success_and_plain_not_found(self):
+        from movsp.tasks import _crawler_failure_summary
+
+        retried = [
+            event('crawler', name='javsp.web.javbus', status='retrying', attempt=1, reason='connection timeout'),
+            event('crawler', name='javsp.web.javbus', status='success', reason=''),
+        ]
+        self.assertEqual(_crawler_failure_summary(retried), '')
+        self.assertEqual(_crawler_failure_summary([event('crawler', name='javsp.web.avsox', status='not_found', reason='未找到影片')]), '')
+
+    def test_failure_text_prefers_the_actionable_summary(self):
+        from movsp.tasks import _failure_error_text
+
+        self.assertEqual(_failure_error_text(no_result=True, summary='所有来源都被拒绝或不可达（javlib 403 拒绝）', reason='ignored', code=1),
+                         '所有来源都被拒绝或不可达（javlib 403 拒绝）')
+        self.assertEqual(_failure_error_text(no_result=True, summary='', reason='', code=1), '抓取器均未获取到影片信息')
+        self.assertEqual(_failure_error_text(no_result=False, summary='ignored', reason='封面下载失败', code=1), '封面下载失败')
+        self.assertEqual(_failure_error_text(no_result=False, summary='', reason='', code=9), 'JavSP 执行失败（退出码: 9）')
+
+    def test_file_exists_failure_is_actionable(self):
+        for error in ('[WinError 183] 文件已存在', 'FileExistsError: extrafanart', '[Errno 17] File exists'):
+            with self.subTest(error=error):
+                rows = build_log_entries([], 'failed', error)
+                text = '\n'.join(log_text(rows))
+                self.assertIn('整理输出目录', text)
+                self.assertIn('剧照', text)
+                self.assertNotIn('extrafanart', text)
+
+    def test_worker_keeps_traceback_in_rotating_diagnostic_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            logfile = Path(folder) / 'task.log'
+            env = dict(os.environ, PYTHONPATH=str(ROOT / 'vendor/JavSP'), JAVSP_PROGRESS='1', JAVSP_DIAGNOSTIC_LOG=str(logfile))
+            code = "import javsp.__main__ as worker\ntry:\n raise ValueError('diagnostic-test')\nexcept ValueError:\n worker.logger.debug('parser failed', exc_info=True)\nworker.progress_event('task', status='completed')\n"
+            result = subprocess.run([sys.executable, '-c', code], env=env, cwd=ROOT / 'vendor/JavSP', capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', errors='replace'))
+            self.assertIn('Traceback', logfile.read_text(encoding='utf-8'))
+            self.assertNotIn(b'Traceback', result.stdout + result.stderr)
+            self.assertIn(b'JAVSP_PROGRESS', result.stdout)
+
+    def test_task_response_does_not_overwrite_stored_events(self):
+        from movsp import tasks
+        original = success_log()
+        record = dict(id='log-test', input_directory='/not-a-real-video/TEST-001.strm', status='succeeded', log_tail=original)
+        with patch.object(tasks, 'load_tasks', return_value=[copy.deepcopy(record)]):
+            response = tasks.get_task('log-test')
+        self.assertTrue(response['log_entries'])
+        self.assertEqual(response['progress']['images']['fanart_done'], 12)
+        self.assertNotIn('JAVSP_PROGRESS', '\n'.join(response['log_tail']))
+        self.assertEqual(original, success_log())
+
+    def test_one_failed_result_and_active_image_retry(self):
+        lines = [event('movie', status='running', index=1, total=1), event('movie', status='failed', error='抓取器均未获取到影片信息')]
+        rows = build_log_entries(lines, 'failed', '抓取器均未获取到影片信息')
+        self.assertEqual(sum(r['group'] == 'result' for r in rows), 1)
+        rows = build_log_entries([event('image_retry', status='running')], 'succeeded', image_retry_running=True)
+        self.assertTrue(any(r['group'] == 'images' and r['level'] == 'running' for r in rows))
+
+    def test_concurrent_events_are_complete_lines(self):
+        from javsp import progress
+        output = io.StringIO()
+        with patch.object(progress, 'enabled', return_value=True), patch.object(progress.sys, 'stdout', output):
+            workers = [threading.Thread(target=lambda: [progress.emit('crawler', name='test', index=i) for i in range(50)]) for _ in range(4)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 200)
+        for line in lines:
+            self.assertEqual(json.loads(line.removeprefix('JAVSP_PROGRESS '))['name'], 'test')
+
+    def test_success_is_compact_with_source_failures(self):
+        rows = build_log_entries(success_log(), 'succeeded')
+        self.assertLessEqual(len(rows), 13)
+        self.assertEqual(len([r for r in rows if r['group'] == 'sources']), 3)
+        self.assertEqual(len([r for r in rows if r['group'] == 'images']), 2)
+        self.assertEqual(len([r for r in rows if r['group'] == 'result']), 1)
+        text = '\n'.join(log_text(rows))
+        self.assertIn('12/12', text)
+        self.assertIn('HTTPS 证书验证失败', text)
+        self.assertNotIn('正在重试', text)
+        self.assertNotIn('Jav Scraper Package', text)
+
+    def test_traceback_is_hidden_but_actionable_failure_remains(self):
+        lines = ['list index out of range', 'Traceback (most recent call last):',
+                 'File "/app/fc2.py", line 59, in parse_data', 'x = list[0]', '^^^^', 'IndexError: list index out of range',
+                 event('crawler', name='fc2', status='failed', reason='list index out of range')]
+        text = '\n'.join(log_text(build_log_entries(lines, 'failed', '抓取器均未获取到影片信息')))
+        self.assertNotIn('Traceback', text)
+        self.assertNotIn('list[0]', text)
+        self.assertIn('页面缺少预期字段', text)
+        self.assertIn('所有数据源', text)
+
+    def test_fanart_failure_not_erased_by_later_progress(self):
+        lines = [event('images', kind='fanart', done=0, total=3, status='failed', current=1, error='timeout'),
+                 event('images', kind='fanart', done=3, total=3)]
+        rows = build_log_entries(lines)
+        self.assertIn('已下载 2/3 · 1 张失败', '\n'.join(log_text(rows)))
+        self.assertTrue(any('第 1 张' in r['message'] for r in rows))
+
+    def test_movie_scopes_and_unknown_warnings_survive(self):
+        lines = []
+        for i in (1, 2):
+            lines += [event('movie', status='running', index=i, total=2), event('crawler', name='fc2', status='success')]
+        lines += ['磁盘空间不足', '磁盘空间不足']
+        rows = build_log_entries(lines)
+        self.assertEqual(len([r for r in rows if r['group'] == 'sources']), 2)
+        self.assertEqual(sum('磁盘空间不足' in r['message'] for r in rows), 1)
+
+
+class SummaryFailureTests(unittest.TestCase):
+    def run_failed_movie(self, title, cover):
+        movie = Movie('FNS-262')
+        info = MovieInfo('FNS-262')
+        info.title, info.cover = title, cover
+        config = SimpleNamespace(
+            crawler=SimpleNamespace(required_keys=['cover', 'title'], selection={'normal': ['t66y']},
+                                    respect_site_avid=False, normalize_actress_name=False),
+            summarizer=SimpleNamespace(title=SimpleNamespace(remove_trailing_actor_name=False),
+                                       extra_fanarts=SimpleNamespace(enabled=False)),
+            translator=SimpleNamespace(engine='google'),
+        )
+        events = []
+        translate = Mock(return_value=False)
+        namespace = dict(Movie=Movie, MovieInfo=MovieInfo, Dict=dict, Cfg=lambda: config,
+                         os=os, logger=logging.getLogger('summary-test'),
+                         tqdm=lambda *args, **kwargs: args[0] if args else Mock(),
+                         progress_enabled=lambda: True,
+                         progress_event=lambda stage, **values: events.append((stage, values)),
+                         fallback_media_type_id=lambda: 'normal',
+                         parallel_crawler=lambda *args: {'t66y': info}, translate_movie_info=translate,
+                         apply_forced_avid=lambda item: item)
+        tree = ast.parse((ROOT / 'vendor/JavSP/javsp/__main__.py').read_text(encoding='utf-8'))
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in ('info_summary', 'RunNormalMode')]
+        exec(compile(ast.Module(body=functions, type_ignores=[]), 'summary-test', 'exec'), namespace)
+        with self.assertRaises(RuntimeError):
+            namespace['RunNormalMode']([movie])
+        error = next(values['error'] for stage, values in events
+                     if stage == 'movie' and values.get('status') == 'failed')
+        rows = build_log_entries([event(stage, **values) for stage, values in events], 'failed', error)
+        return '\n'.join(log_text(rows)), translate
+
+    def test_missing_cover_reports_field_and_does_not_translate(self):
+        text, translate = self.run_failed_movie('演示标题', None)
+        self.assertIn('必需字段：封面', text)
+        self.assertNotIn('资料汇总完成', text)
+        self.assertNotIn('步骤错误', text)
+        translate.assert_not_called()
+
+    def test_all_missing_fields_are_reported(self):
+        text, translate = self.run_failed_movie(None, None)
+        self.assertIn('必需字段：封面、标题', text)
+        translate.assert_not_called()
+
+    def test_translation_failure_is_distinct_from_missing_fields(self):
+        text, translate = self.run_failed_movie('演示标题', 'https://example.test/cover.jpg')
+        self.assertIn('资料汇总完成', text)
+        self.assertIn('影片信息翻译失败', text)
+        self.assertNotIn('步骤错误', text)
+        translate.assert_called_once()
+
+
+class ParserTests(unittest.TestCase):
+    def test_fc2_missing_optional_fields_preserves_title_and_cover(self):
+        html = lxml.html.fromstring('''<div class="extra items_article_left">
+          <div class="items_article_headerInfo extra"><h3>演示标题</h3></div>
+          <div class="items_article_MainitemThumb"><span><img src="https://example.com/cover.jpg"></span></div>
+        </div>''')
+        movie = MovieInfo('FC2-4971063')
+        response = requests.Response()
+        response.url = 'https://adult.contents.fc2.com/article/4971063/'
+        with patch.object(fc2, 'request_get', return_value=response), patch.object(fc2, 'resp2html', return_value=html):
+            fc2.parse_data(movie)
+        self.assertEqual(movie.title, '演示标题')
+        self.assertEqual(movie.cover, 'https://example.com/cover.jpg')
+        self.assertIsNone(movie.publish_date)
+
+    def test_javmenu_page_without_detail_meta_is_not_found(self):
+        """站点改版后详情只在 meta 里；没有 meta 的页面按“未收录”处理。"""
+        response = requests.Response()
+        response.url = 'https://javmenu.com/zh/TEST-001'
+        for content in ('<html>unknown page</html>', '<html><head><meta property="og:title" content="猜你喜欢"></head></html>'):
+            with patch.object(javmenu.request, 'get', return_value=response), patch.object(javmenu, 'resp2html', return_value=lxml.html.fromstring(content)):
+                with self.assertRaises(MovieNotFoundError):
+                    javmenu.parse_data(MovieInfo('TEST-001'))
+
+    def test_javmenu_parses_meta_description_and_cover(self):
+        response = requests.Response()
+        response.url = 'https://javmenu.com/zh/TEST-001'
+        html = lxml.html.fromstring(
+            '<html><head><meta property="og:title" content="TEST-001 演示标题">'
+            '<meta name="description" content="发佈日期为2025-09-23，主演女优是Alice、Bob，影片时长90分钟，主题为巨乳、单体作品。">'
+            '</head><body><img data-src="https://c0.jdbstatic.com/covers/bk/bKGpqB.jpg"></body></html>')
+        movie = MovieInfo('TEST-001')
+        with patch.object(javmenu.request, 'get', return_value=response), patch.object(javmenu, 'resp2html', return_value=html):
+            javmenu.parse_data(movie)
+        self.assertEqual(movie.title, '演示标题')
+        self.assertEqual(movie.cover, 'https://c0.jdbstatic.com/covers/bk/bKGpqB.jpg')
+        self.assertEqual(movie.publish_date, '2025-09-23')
+        self.assertEqual(movie.actress, ['Alice', 'Bob'])
+        self.assertEqual(movie.duration, '90')
+        self.assertEqual(movie.genre, ['巨乳', '单体作品'])
+
+
+class RetryTests(unittest.TestCase):
+    def test_mirror_fallback_keeps_tls_and_reselects_request_host(self):
+        get = Mock(side_effect=[requests.exceptions.SSLError(), 'ok'])
+        result = get_with_mirror_fallback(get, 'https://mirror.test/search?q=TEST-001', 'https://mirror.test/', 'https://official.test', delay_raise=True)
+        self.assertEqual(result, 'ok')
+        self.assertEqual(get.call_args.args[0], 'https://official.test/search?q=TEST-001')
+        self.assertEqual(get.call_args.kwargs, {'delay_raise': True})
+
+    def test_unrelated_host_and_failing_official_are_not_bypassed(self):
+        for source in ('https://unrelated.test/item', 'https://official.test/item'):
+            get = Mock(side_effect=requests.exceptions.SSLError())
+            with self.assertRaises(requests.exceptions.SSLError):
+                get_with_mirror_fallback(get, source, 'https://mirror.test', 'https://official.test')
+            self.assertEqual(get.call_count, 1)
+        get = Mock(side_effect=requests.exceptions.SSLError())
+        with self.assertRaises(requests.exceptions.SSLError):
+            get_with_mirror_fallback(get, 'https://mirror.test/item', 'https://mirror.test', 'https://official.test')
+        self.assertEqual(get.call_count, 2)
+
+    def run_wrapper(self, error):
+        # Load the actual worker function without starting the CLI application.
+        tree = ast.parse((ROOT / 'vendor/JavSP/javsp/__main__.py').read_text(encoding='utf-8'))
+        parallel = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'parallel_crawler')
+        wrapper = next(n for n in parallel.body if isinstance(n, ast.FunctionDef) and n.name == 'wrapper')
+        module = ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[]))
+        events, calls, complete = [], [], []
+        namespace = dict(globals(), logger=logging.getLogger('test'), tqdm=type('DummyTqdm', (), {}), tqdm_bar=None, progress_enabled=lambda: True,
+                         progress_event=lambda stage, **kw: events.append(kw), mark_crawler_complete=lambda: complete.append(True))
+        exec(compile(module, 'crawler-wrapper', 'exec'), namespace)
+        def parser(info):
+            calls.append(True)
+            raise error
+        namespace['wrapper'](parser, MovieInfo('TEST-001'), 3)
+        self.assertEqual(complete, [True])
+        return calls, events
+
+    def test_forbidden_and_tls_are_not_retried(self):
+        response = requests.Response()
+        response.status_code = 403
+        for error in (requests.HTTPError('403 Forbidden', response=response), requests.exceptions.SSLError('CERTIFICATE_VERIFY_FAILED'), IndexError('list index out of range'), WebsiteError('页面结构变化')):
+            calls, events = self.run_wrapper(error)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(events[-1]['status'], 'failed')
+            self.assertNotIn('retrying', [e['status'] for e in events])
+
+    def test_transient_timeout_retries_without_phantom_last_retry(self):
+        calls, events = self.run_wrapper(requests.exceptions.Timeout('timed out'))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([e['status'] for e in events], ['running', 'retrying', 'retrying', 'failed'])
+
+
+if __name__ == '__main__':
+    unittest.main()

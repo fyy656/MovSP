@@ -1,0 +1,3659 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import ipaddress
+import logging
+import os
+import re
+import json
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
+
+import requests
+import yaml
+from croniter import croniter
+from fastapi import Cookie, Depends, FastAPI, File, UploadFile, HTTPException, Query, Request, Response, WebSocket, status
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from starlette.background import BackgroundTask
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.middleware.gzip import GZipMiddleware
+
+from . import __version__
+from .auth import SESSION_COOKIE, create_session, current_user, remove_session, require_admin
+from .login_security import login_context, login_limiter
+from . import network_access
+from .config_validation import load_base_config, validate_config_data, yaml_error_message
+from .cookiecloud import CookieCloudError, cookiecloud_summary, fetch_cookiecloud, get_synced_cookies, sync_status, start_scheduler as start_cookiecloud_scheduler
+from . import scrapers as scraper_registry
+from .storage import (
+    CUSTOM_CRAWLERS_DIR,
+    delete_auto_scrape_schedule_run,
+    delete_preset,
+    claim_auto_scrape_schedule_run,
+    delete_user,
+    ensure_seed_data,
+    find_user,
+    get_preset,
+    get_disabled_built_in_crawlers,
+    get_qbittorrent_settings,
+    get_cookiecloud_settings,
+    get_qbittorrent_management,
+    IS_FROZEN,
+    VENDOR_DIR,
+    list_presets,
+    list_auto_scrape_schedules,
+    list_downloaders,
+    list_path_mappings,
+    list_media_servers,
+    list_users,
+    now_iso,
+    read_config,
+    record_auto_scrape_schedule_result,
+    record_auto_scrape_schedule_empty,
+    skip_auto_scrape_schedule_run,
+    load_auto_scrape_history,
+    save_preset,
+    save_qbittorrent_settings,
+    save_cookiecloud_settings,
+    save_update_settings,
+    save_network_settings,
+    get_network_settings,
+    save_disabled_built_in_crawlers,
+    save_downloaders,
+    save_path_mappings,
+    save_auto_scrape_history,
+    save_auto_scrape_schedules,
+    save_media_servers,
+    save_qbittorrent_management,
+    upsert_user,
+    verify_password,
+    write_config,
+)
+from .qbittorrent import QbittorrentError, delete_torrent, list_downloads, set_share_limits, set_torrent_transfer_limits, test_connection
+from .media import LOCAL_PLAYABLE_SUFFIXES, connection_error, film_playback, list_media_libraries, overview_libraries, playback_links, stop_playback, sync_media_server, media_sessions, seek_media
+from .tasks import NoScrapeTasksError, active_schedule_task_ids, cancel_task, cancel_tasks, create_tasks, delete_task, delete_tasks, get_cover_path, get_fanart_path, get_task, google_captcha_browser_active, google_cover_thumbnail, list_task_summaries, purge_tasks, recover_interrupted_tasks, retry_task_images, restore_task_files, save_uploaded_cover, search_google_cover, select_google_cover, update_task_metadata
+from .timeutils import local_now, timezone_name
+from .artwork import image_response
+from .avatars import avatar_directory, avatar_url
+from . import library as film_library
+from . import library_store
+from . import thumbnails
+from .media import catalog_task, catalog_image, update_catalog_metadata, clear_catalog_cache
+from .tasks import edit_task_artwork
+from .streaming import file_stream_response, stop_stream
+from .task_store import overview_groups as load_overview_groups, run_counts, start_artwork_path_repair
+from .task_store import ids as load_task_ids
+from . import updater
+from .storage import env_compat
+
+
+ensure_seed_data()
+recover_interrupted_tasks()
+start_artwork_path_repair()
+updater.start_scheduler()
+start_cookiecloud_scheduler()
+app = FastAPI(title="MovSP", version=__version__)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+@app.on_event("startup")
+async def _quiet_connection_errors() -> None:
+    """客户端强制断开时 asyncio 会打印 WinError 10054，属于正常现象，静音掉。"""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+
+    def handler(current_loop, context):
+        if isinstance(context.get("exception"), (ConnectionResetError, ConnectionAbortedError, ConnectionError)):
+            return
+        if previous:
+            previous(current_loop, context)
+        else:
+            current_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+    # 老库第一次打开要补列，先在这里迁移完，别让用户第一次扫描撞上迁移
+    try:
+        library_store.ensure_ready()
+    except Exception:  # noqa: BLE001 - 迁移失败也不该阻止服务启动
+        logging.getLogger("movsp.scrape").exception("媒体库 schema 迁移失败")
+from .ai_router import router as ai_router
+app.include_router(ai_router)
+WEB_DIR = Path(__file__).resolve().parent / "web"
+ASSET_VERSION = hashlib.sha256(b''.join(path.read_bytes() for path in sorted((WEB_DIR / 'assets').iterdir()) if path.is_file())).hexdigest()[:16]
+RELEASE_LABEL = env_compat("MOVSP_RELEASE_LABEL", "").strip()
+NOVNC_DIR = Path(os.environ.get("JAVSP_NOVNC_DIR", "/usr/share/novnc"))
+GOOGLE_VNC_HOST = os.environ.get("JAVSP_GOOGLE_VNC_HOST", "127.0.0.1")
+GOOGLE_VNC_PORT = int(os.environ.get("JAVSP_GOOGLE_VNC_PORT", "5900"))
+COMMENTS_URL = os.environ.get("JAVSP_COMMENTS_URL", "https://comments.rtioo.com").strip().rstrip("/")
+
+
+def _display_version() -> str:
+    value = RELEASE_LABEL or __version__
+    return re.sub(r"^[vV]+", "", str(value))
+
+
+def _app_version() -> str:
+    display = _display_version()
+    return display if re.fullmatch(r'\d+\.\d+\.\d+(?:[-+].*)?', display) else re.sub(r'^[vV]+', '', __version__)
+
+
+@app.middleware("http")
+async def disable_asset_cache(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable" if request.query_params.get("v") == ASSET_VERSION else "public, no-cache"
+    return response
+
+
+app.mount("/assets", StaticFiles(directory=WEB_DIR / "assets"), name="assets")
+app.mount("/google-browser", StaticFiles(directory=NOVNC_DIR, check_dir=False), name="google-browser")
+IS_DOCKER = Path("/.dockerenv").exists() or env_compat("MOVSP_DOCKER", "") == "1"
+
+# 只有来自本机的请求才能操作宿主机的窗口/文件管理器
+_LOCAL_CLIENT_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+def _require_local_client(request: Request, action: str) -> None:
+    """文件类破坏性操作（还原/删除宿主文件）只允许本机调用。"""
+    if not _is_local_client(request):
+        raise HTTPException(status_code=403, detail=f"只有运行服务的主机才能{action}")
+
+
+def _is_local_client(request: Request) -> bool:
+    """请求是否来自运行服务的这台机器（局域网客户端一律视为非本机）。"""
+    client = getattr(request, "client", None)
+    host = str(getattr(client, "host", "") or "")
+    if not host:
+        return False
+    if host in _LOCAL_CLIENT_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+CONTAINER_BROWSE_ROOT = Path("/")
+VIDEO_EXTENSIONS = {".3gp", ".avi", ".f4v", ".flv", ".iso", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".rm", ".rmvb", ".ts", ".vob", ".webm", ".wmv", ".strm", ".mpg"}
+_auto_scrape_run_lock = threading.RLock()
+_CRAWLER_TEST_MARKER = "MOVSP_CRAWLER_TEST "
+_CRAWLER_TEST_SCRIPT = r'''
+import importlib
+import json
+import logging
+import os
+from pathlib import Path
+import sys
+
+MARKER = "MOVSP_CRAWLER_TEST "
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+name, input_value = sys.argv[-2:]
+result = {"crawler": name, "input_value": input_value, "data": {}, "error": ""}
+try:
+    from javsp.datatype import MovieInfo
+    custom_dir_value = env_compat("MOVSP_CUSTOM_CRAWLERS_DIR", "")
+    custom_path = Path(custom_dir_value) / f"{name}.py" if custom_dir_value else None
+    module_name = name if custom_path and custom_path.is_file() else "javsp.web." + name if name in {
+        "airav", "avsox", "avwiki", "dl_getchu", "fanza", "fc2", "fc2fan", "fc2ppvdb", "gyutto",
+        "jav321", "javbus", "javdb", "javlib", "javmenu", "mgstage", "njav", "prestige", "arzon", "arzon_iv",
+    } else name
+    parse_data = getattr(importlib.import_module(module_name), "parse_data", None)
+    if not callable(parse_data):
+        raise ValueError("crawler does not define parse_data(movie)")
+    movie = MovieInfo(input_value)
+    parse_data(movie)
+    result["data"] = vars(movie)
+except Exception as exc:
+    result["error"] = str(exc) or exc.__class__.__name__
+print(MARKER + json.dumps(result, ensure_ascii=False, default=str))
+'''
+
+
+class LoginBody(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class UserBody(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str | None = Field(default=None, max_length=256)
+    password_confirm: str | None = Field(default=None, max_length=256)
+    role: str = "operator"
+    old_username: str | None = None
+
+
+class ConfigBody(BaseModel):
+    content: str = Field(min_length=1)
+
+
+class CookieCloudBody(BaseModel):
+    enabled: bool = False
+    server_url: str = Field(default="", max_length=2048)
+    uuid: str = Field(default="", max_length=512)
+    crypto_type: Literal["auto", "legacy", "aes-128-cbc-fixed"] = "auto"
+    password: str | None = Field(default=None, max_length=2048)
+    clear_password: bool = False
+    sync_interval_minutes: int = Field(default=30, ge=1, le=1440)
+
+
+class CustomCrawlerBody(BaseModel):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    source: str = Field(min_length=1, max_length=200_000)
+    original_name: str | None = Field(default=None, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+
+
+class CrawlerTestBody(BaseModel):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    input_value: str = Field(min_length=1, max_length=256)
+
+
+class ScraperToggleBody(BaseModel):
+    enabled: bool
+
+
+class ScraperSettingsBody(BaseModel):
+    settings: dict = Field(default_factory=dict)
+
+
+class ScraperMetaBody(BaseModel):
+    display_name: str | None = Field(default=None, max_length=80)
+    description: str | None = Field(default=None, max_length=500)
+    homepage: str | None = Field(default=None, max_length=500)
+    provides: list[str] | None = Field(default=None, max_length=20)
+
+
+class ScraperSourceBody(BaseModel):
+    source: str = Field(min_length=1, max_length=200_000)
+
+
+class CancelTasksBody(BaseModel):
+    """要停止的任务 ID；留空表示停止全部排队中/运行中的任务。"""
+
+    ids: list[str] = Field(default_factory=list, max_length=2000)
+
+
+class TaskDeleteBody(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=5000)
+
+
+class TaskPurgeBody(BaseModel):
+    statuses: list[Literal["succeeded", "failed", "cancelled"]] = Field(default_factory=list, max_length=3)
+    before: str | None = Field(default=None, max_length=64)
+    include_scan: bool = False
+    merge_duplicates: bool = False
+    dry_run: bool = True
+    view: Literal["all", "manual", "overview"] = "all"
+    query: str = Field(default="", max_length=200)
+    field: Literal["all", "path", "title", "dvdid", "actress"] = "all"
+    size_min: float | None = Field(default=None, ge=0)
+    size_max: float | None = Field(default=None, ge=0)
+    date_from: str = Field(default="", max_length=64)
+    date_to: str = Field(default="", max_length=64)
+    group_by: Literal["", "library", "actress", "producer", "year"] = ""
+    group: str = Field(default="", max_length=500)
+
+
+class TaskBody(BaseModel):
+    input_directory: str = Field(min_length=1)
+    preset_id: str = "default"
+    input_files: list[str] | None = Field(default=None, min_length=1, max_length=10000)
+
+
+class TaskMetadataBody(BaseModel):
+    dvdid: str = Field(default="", max_length=160)
+    title: str = Field(default="", max_length=1000)
+    actress: list[str] = Field(default_factory=list, max_length=100)
+    director: str = Field(default="", max_length=300)
+    producer: str = Field(default="", max_length=300)
+    publisher: str = Field(default="", max_length=300)
+    publish_date: str = Field(default="", max_length=32)
+    apply_to_folder: bool = False
+
+
+class PresetBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    mode: Literal["yaml", "form"] = "form"
+    content: str | None = None
+    form: dict = Field(default_factory=dict)
+    task_concurrency: int = Field(default=1, ge=1, le=32)
+    # 预设类型：jav（按番号）/ media（按标题）。决定刮削链路与设置面板。
+    kind: Literal["jav", "media"] | None = None
+
+
+class PresetConvertBody(BaseModel):
+    mode: Literal["yaml", "form"]
+    content: str | None = None
+    form: dict = Field(default_factory=dict)
+
+
+class ProxyConnectivityTestBody(BaseModel):
+    proxy_server: str | None = Field(default=None, max_length=2048)
+    crawler_selection: dict | str | None = None
+    preset_id: str = Field(default="default", max_length=80)
+    timeout: str | None = Field(default=None, max_length=32)
+
+
+class PathSelectBody(BaseModel):
+    kind: Literal["file", "directory"] = "file"
+
+
+class QbittorrentSettingsBody(BaseModel):
+    url: str = Field(min_length=1, max_length=512)
+    username: str = Field(min_length=1, max_length=128)
+    password: str | None = Field(default=None, max_length=256)
+
+
+class DownloaderBody(QbittorrentSettingsBody):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class MediaServerBody(BaseModel):
+    server_id: str | None = None
+    name: str = Field(min_length=1, max_length=80)
+    type: Literal["emby", "jellyfin"] = "emby"
+    url: str = Field(min_length=1, max_length=512)
+    external_url: str = Field(default="", max_length=512)
+    api_key: str | None = Field(default=None, max_length=512)
+    auto_scan: bool = False
+    auto_scan_delay: int = Field(default=0, ge=0, le=86400)
+    libraries: list[str] = Field(default_factory=list, max_length=100)
+
+
+class AutoScrapeRuleBody(BaseModel):
+    id: str | None = Field(default=None, max_length=64)
+    enabled: bool = True
+    tags: str = Field(default="", max_length=512)
+    category: str = Field(default="", max_length=256)
+    preset_id: str = Field(default="default", max_length=128)
+
+
+class DownloadAutoScrapePathCheckBody(BaseModel):
+    tags: str = Field(default="", max_length=512)
+    category: str = Field(default="", max_length=256)
+
+
+class AutoScrapeScheduleBody(BaseModel):
+    name: str = Field(default="", max_length=80)
+    enabled: bool = True
+    cron: str = Field(min_length=1, max_length=160)
+    input_directory: str = Field(min_length=1, max_length=2048)
+    preset_id: str = Field(default="default", max_length=128)
+
+
+class QbittorrentManagementBody(BaseModel):
+    takeover_enabled: bool = False
+    takeover_tags: str = Field(default="", max_length=512)
+    takeover_category: str = Field(default="", max_length=256)
+    # 分享率/做种时间沿用 qBittorrent 的取值约定：-2 沿用全局、-1 不限制、>=0 为阈值。
+    # 默认用 -2，开启接管时不会把用户的全局做种策略改成“永久做种”。
+    ratio_limit: float = Field(default=-2, ge=-2, le=100000)
+    seeding_time_limit: int = Field(default=-2, ge=-2, le=10_000_000)
+    inactive_seeding_time_limit: int = Field(default=-2, ge=-2, le=10_000_000)
+    download_limit_kib: int = Field(default=-1, ge=-1, le=10_000_000)
+    upload_limit_kib: int = Field(default=-1, ge=-1, le=10_000_000)
+    auto_remove: bool = False
+    auto_scrape_enabled: bool = False
+    auto_scrape_tags: str = Field(default="", max_length=512)
+    auto_scrape_category: str = Field(default="", max_length=256)
+    auto_scrape_preset_id: str = "default"
+    auto_scrape_rules: list[AutoScrapeRuleBody] = Field(default_factory=list, max_length=100)
+
+
+class PathMappingBody(BaseModel):
+    source_path: str = Field(min_length=1, max_length=1024)
+    target_path: str = Field(min_length=1, max_length=1024)
+
+
+class PathMappingsBody(BaseModel):
+    mappings: list[PathMappingBody] = Field(default_factory=list, max_length=100)
+
+
+class UpdateSettingsBody(BaseModel):
+    check_enabled: bool = True
+    auto_update: bool = False
+    experience_program: bool = False
+    check_interval_hours: int = Field(default=24, ge=1, le=168)
+
+
+@app.get("/api/runtime")
+def runtime(request: Request, _: dict = Depends(current_user)) -> dict:
+    from .ai import settings as ai_settings
+    config = ai_settings()
+    # local_client 告诉前端：这台浏览器是否跑在服务端主机上（决定是否显示“打开文件所在目录”这类本机操作）
+    return {"deployment": "docker" if IS_DOCKER else ("exe" if IS_FROZEN else "python"), "docker": IS_DOCKER, "local_client": _is_local_client(request), "version": _display_version(), "app_version": _app_version(), "timezone": timezone_name(), "ai_enabled": config["enabled"], "comments_url": COMMENTS_URL}
+
+
+@app.get("/api/update")
+def update_status(_: dict = Depends(current_user)) -> dict:
+    return updater.status()
+
+
+@app.put("/api/update/settings")
+def update_settings(body: UpdateSettingsBody, _: dict = Depends(require_admin)) -> dict:
+    switching = body.experience_program != (updater.channel() == 'bata')
+    save_update_settings(body.model_dump())
+    response = updater.status()
+    if switching:
+        try:
+            response['activation'] = updater.apply()
+        except updater.UpdateError as exc:
+            response['activation_error'] = str(exc)
+        response.update(updater.status())
+    return response
+
+
+@app.post("/api/update/check")
+def check_update(_: dict = Depends(require_admin)) -> dict:
+    return updater.check(force=True)
+
+
+class NetworkSettingsBody(BaseModel):
+    lan_access: bool = False
+
+
+@app.get("/api/network/settings")
+def network_settings(_: dict = Depends(current_user)) -> dict:
+    """局域网访问设置、可用的本机访问地址与防火墙状态（地址在开启前即可预览）。"""
+    port = network_access.listen_port()
+    return {
+        "settings": get_network_settings(),
+        "port": port,
+        "addresses": network_access.lan_addresses(port),
+        "firewall": network_access.firewall_status(port),
+        "deployment": "docker" if IS_DOCKER else ("exe" if IS_FROZEN else "python"),
+    }
+
+
+@app.put("/api/network/settings")
+def update_network_settings(body: NetworkSettingsBody, _: dict = Depends(require_admin)) -> dict:
+    """保存局域网访问偏好；开启/关闭时同步维护 Windows 防火墙规则。
+
+    监听地址在下次启动时生效（Docker 部署由 MOVSP_HOST 决定，不受此开关影响）。
+    """
+    settings = save_network_settings(body.model_dump())
+    firewall = network_access.apply_lan_access(settings["lan_access"])
+    return {"settings": settings, "firewall": firewall}
+
+
+@app.post("/api/update/apply")
+def apply_update(_: dict = Depends(require_admin)) -> dict:
+    try:
+        return updater.apply()
+    except updater.UpdateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+_native_path_lock = threading.Lock()
+
+
+def _select_native_paths(kind: str, multiple: bool = False) -> list[str]:
+    if IS_DOCKER:
+        raise HTTPException(status_code=400, detail="容器环境请使用网页内的路径浏览器")
+    if not _native_path_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="已有文件选择窗口打开，请先完成选择")
+    root = None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        if kind == "directory":
+            selected = filedialog.askdirectory(parent=root, title="选择待刮削目录")
+        else:
+            choose = filedialog.askopenfilenames if multiple else filedialog.askopenfilename
+            selected = choose(
+                parent=root, title="选择待刮削视频文件（可按 Ctrl/Shift 多选）" if multiple else "选择待刮削视频文件",
+                filetypes=[("视频文件", "*.3gp *.avi *.f4v *.flv *.iso *.m2ts *.m4v *.mkv *.mov *.mp4 *.mpeg *.rm *.rmvb *.ts *.vob *.webm *.wmv *.strm *.mpg"), ("所有文件", "*.*")],
+            )
+        return list(selected or []) if multiple and kind == "file" else ([selected] if selected else [])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"无法打开系统选择窗口: {exc}") from exc
+    finally:
+        try:
+            if root is not None:
+                root.destroy()
+        finally:
+            _native_path_lock.release()
+
+
+@app.post("/api/path/select")
+def select_path(body: PathSelectBody, request: Request, _: dict = Depends(current_user)) -> dict:
+    """调用宿主机原生的“选择文件夹/文件”对话框，只允许本机调用。"""
+    if not _is_local_client(request):
+        raise HTTPException(status_code=403, detail="只有运行服务的主机才能使用系统选择框，请直接填写路径")
+    paths = _select_native_paths(body.kind)
+    return {"path": paths[0] if paths else None}
+
+
+@app.post("/api/path/select-multi")
+def select_multi_paths(body: PathSelectBody, request: Request, _: dict = Depends(current_user)) -> dict:
+    if not _is_local_client(request):
+        raise HTTPException(status_code=403, detail="只有运行服务的主机才能使用系统选择框，请直接填写路径")
+    return {"paths": _select_native_paths(body.kind, multiple=True)}
+
+
+@app.get("/api/path/options")
+def path_options(_: dict = Depends(current_user)) -> list[dict]:
+    """Compatibility endpoint kept for older Web clients.
+
+    It intentionally exposes only the first level. New clients use
+    ``/api/path/browse`` to navigate one directory at a time.
+    """
+    if not IS_DOCKER:
+        return []
+    root = CONTAINER_BROWSE_ROOT
+    if not root.exists():
+        return []
+    options = [{"path": "/", "kind": "directory"}]
+    try:
+        for item in sorted(root.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold())):
+            if item.is_dir() or (item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS):
+                options.append({"path": item.as_posix(), "kind": "directory" if item.is_dir() else "file"})
+    except OSError:
+        return options
+    return options
+
+
+def _container_browse_path(path: str | None) -> Path:
+    """Resolve an absolute or root-relative path inside the container."""
+    root = CONTAINER_BROWSE_ROOT.resolve()
+    requested = str(path or root).strip()
+    requested_path = Path(requested)
+    candidate = requested_path if requested_path.is_absolute() else root / requested_path
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="路径必须位于容器文件系统内") from exc
+    return resolved
+
+
+@app.get("/api/path/browse")
+def browse_path(path: str = Query(default="/", max_length=2048), _: dict = Depends(current_user)) -> dict:
+    if not IS_DOCKER:
+        raise HTTPException(status_code=400, detail="当前部署方式不需要浏览容器路径")
+    current = _container_browse_path(path)
+    if not current.exists() or not current.is_dir():
+        raise HTTPException(status_code=400, detail="目录不存在或不可访问")
+    root = CONTAINER_BROWSE_ROOT.resolve()
+    entries: list[dict] = []
+    try:
+        children = sorted(current.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold()))
+        for item in children:
+            resolved = item.resolve()
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                continue
+            if item.is_dir():
+                entries.append({"name": item.name, "path": resolved.as_posix(), "kind": "directory"})
+            elif item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS:
+                entries.append({"name": item.name, "path": resolved.as_posix(), "kind": "file"})
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"无法读取目录: {exc}") from exc
+    parent = current.parent if current != root else None
+    return {"path": current.as_posix(), "parent": parent.as_posix() if parent else None, "entries": entries}
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok", "version": __version__}
+
+
+@app.get("/api/public-info")
+def public_info() -> dict:
+    return {"name": "MovSP", "version": _display_version()}
+
+
+@app.get("/login")
+def login_page() -> HTMLResponse:
+    document = (WEB_DIR / 'login.html').read_text(encoding='utf-8').replace('__ASSET_VERSION__', ASSET_VERSION)
+    return HTMLResponse(document, headers={'Cache-Control': 'no-cache'})
+
+
+@app.get("/")
+def index_page() -> HTMLResponse:
+    asset_version = ASSET_VERSION
+    document = (WEB_DIR / "index.html").read_text(encoding="utf-8").replace("__ASSET_VERSION__", asset_version)
+    return HTMLResponse(document, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/favicon.ico")
+def favicon() -> FileResponse:
+    return FileResponse(WEB_DIR / "assets" / "movsp-logo.ico", headers={"Cache-Control": "no-cache"})
+
+
+@app.post("/api/auth/login")
+def login(body: LoginBody, response: Response, request: Request) -> dict:
+    client_ip, secure = login_context(request)
+    with login_limiter.attempt(client_ip, body.username) as attempt:
+        user = find_user(body.username)
+        if not user or not verify_password(body.password, user["password"]):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
+        attempt.success = True
+    response.set_cookie(SESSION_COOKIE, create_session(user), httponly=True, secure=secure, samesite="lax", max_age=43200)
+    return {"username": user["username"], "role": user.get("role", "operator")}
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response, request: Request, cookie_token: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict:
+    remove_session(cookie_token)
+    response.delete_cookie(SESSION_COOKIE, httponly=True, secure=login_context(request)[1], samesite="lax")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def me(user: dict = Depends(current_user)) -> dict:
+    return user
+
+
+@app.get("/api/users")
+def users(_: dict = Depends(require_admin)) -> list[dict]:
+    return list_users()
+
+
+class ProfileBody(BaseModel):
+    display_name: str = Field(min_length=1, max_length=32)
+    avatar_id: str = Field(default="", max_length=32)
+
+
+class CommunitySessionBody(ProfileBody):
+    comment_token: str = Field(pattern=r"^[A-Za-z0-9_-]{40,100}$")
+    comment_username: str = Field(min_length=1, max_length=24)
+
+
+@app.put("/api/profile/community")
+def save_community_session(body: CommunitySessionBody, response: Response, user: dict = Depends(current_user)) -> dict:
+    """Cache this account's Worker session; public authorship is verified by the Worker."""
+    from .storage import user_profile
+    if not re.fullmatch(re.escape(body.comment_username) + r"#[A-Z0-9]{4}", body.display_name):
+        raise HTTPException(status_code=422, detail="评论身份无效")
+    if body.avatar_id and body.avatar_id not in avatar_directory():
+        raise HTTPException(status_code=422, detail="请从头像库选择头像")
+    response.headers["Cache-Control"] = "no-store"
+    return user_profile(user["username"], community=body.model_dump())
+
+
+@app.delete("/api/profile/community")
+def clear_community_session(response: Response, user: dict = Depends(current_user)) -> dict:
+    """Drop this account's cached comment session after signing out of the comment service."""
+    from .storage import user_profile
+    response.headers["Cache-Control"] = "no-store"
+    return user_profile(user["username"], clear_community=True)
+
+
+@app.get("/api/profile")
+def get_profile(response: Response, user: dict = Depends(current_user)) -> dict:
+    from .storage import user_profile
+    response.headers["Cache-Control"] = "no-store"
+    return user_profile(user["username"])
+
+
+@app.put("/api/profile")
+def save_profile(body: ProfileBody, response: Response, user: dict = Depends(current_user)) -> dict:
+    from .storage import user_profile
+    name = body.display_name.strip()
+    if not name or any(ord(c) < 32 for c in name):
+        raise HTTPException(status_code=422, detail="请填写有效的用户名")
+    if body.avatar_id and body.avatar_id not in avatar_directory():
+        raise HTTPException(status_code=422, detail="请从头像库选择头像")
+    response.headers["Cache-Control"] = "no-store"
+    return user_profile(user["username"], {"display_name": name, "avatar_id": body.avatar_id})
+
+
+@app.get('/api/avatars/{avatar_id}')
+def avatar_image(avatar_id: str) -> Response:
+    url = avatar_url(avatar_id)
+    if not url:
+        raise HTTPException(404, '头像不存在')
+    return Response(status_code=302, headers={'Location': url, 'Cache-Control': 'public, max-age=86400'})
+
+
+def _validate_password_change(body: UserBody, required: bool = False) -> None:
+    if required and not body.password:
+        raise HTTPException(status_code=400, detail="新用户必须设置密码")
+    if body.password and body.password != body.password_confirm:
+        raise HTTPException(status_code=400, detail="两次输入的新密码不一致")
+
+
+@app.post("/api/users")
+def create_user(body: UserBody, _: dict = Depends(require_admin)) -> dict:
+    if find_user(body.username):
+        raise HTTPException(status_code=409, detail="用户名已存在")
+    _validate_password_change(body, required=True)
+    upsert_user(body.username, body.password, body.role)
+    return {"ok": True}
+
+
+@app.put("/api/users/{username}")
+def update_user(username: str, body: UserBody, _: dict = Depends(require_admin)) -> dict:
+    if not find_user(username):
+        raise HTTPException(status_code=404, detail="用户不存在")
+    _validate_password_change(body)
+    if body.username != username and find_user(body.username):
+        raise HTTPException(status_code=409, detail="用户名已存在")
+    upsert_user(body.username, body.password, body.role, old_username=username)
+    return {"ok": True}
+
+
+@app.delete("/api/users/{username}")
+def remove_user(username: str, user: dict = Depends(require_admin)) -> dict:
+    if username == user["username"]:
+        raise HTTPException(status_code=400, detail="不能删除当前登录账号")
+    if not delete_user(username):
+        raise HTTPException(status_code=400, detail="至少保留一个用户")
+    return {"ok": True}
+
+
+@app.get("/api/presets")
+def presets(user: dict = Depends(current_user)) -> list[dict]:
+    if user.get("role") == "admin":
+        return [_public_preset(item) for item in list_presets()]
+    return [_operator_preset(_public_preset(item)) for item in list_presets()]
+
+
+@app.post("/api/presets/convert")
+def convert_preset(body: PresetConvertBody, user: dict = Depends(current_user)) -> dict:
+    result = _convert_preset(body)
+    if user.get("role") == "admin":
+        return result
+    if "form" in result:
+        return {"form": _redact_config(result["form"])}
+    return {"content": _redacted_yaml(result.get("content") or "")}
+
+
+def _convert_preset(body: PresetConvertBody) -> dict:
+    base = _base_config()
+    if body.mode == "yaml":
+        if not body.content:
+            raise HTTPException(status_code=400, detail="YAML 内容不能为空")
+        try:
+            parsed = yaml.safe_load(body.content) or {}
+        except yaml.YAMLError as exc:
+            raise HTTPException(status_code=400, detail=yaml_error_message(exc)) from exc
+        if not isinstance(parsed, dict):
+            raise HTTPException(status_code=400, detail="配置文件最外层应按“配置项: 内容”填写，不能是列表或一段普通文字")
+        try:
+            validate_config_data(_deep_merge(base, parsed))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"form": _deep_merge(base, parsed)}
+    form = _normalize_form(body.form, base)
+    try:
+        validate_config_data(_deep_merge(base, form))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"content": yaml.safe_dump(_deep_merge(base, form), allow_unicode=True, sort_keys=False)}
+
+
+def _preset_kind_for(body: PresetBody, form: dict, fallback: dict | None = None) -> str:
+    """确定预设类型。
+
+    优先用请求里显式声明的 kind；没传时沿用原值；都没有就按刮削器能力推断。
+    """
+    declared = getattr(body, "kind", None)
+    if declared in ("jav", "media"):
+        return declared
+    if fallback and str(fallback.get("kind") or "") in ("jav", "media"):
+        return str(fallback["kind"])
+    return scraper_registry.preset_kind({"form": form})
+
+
+def _prepare_preset(body: PresetBody) -> dict:
+    base = _base_config()
+    if body.mode == "yaml":
+        if not body.content:
+            raise HTTPException(status_code=400, detail="YAML 预设不能为空")
+        try:
+            parsed = yaml.safe_load(body.content)
+        except yaml.YAMLError as exc:
+            raise HTTPException(status_code=400, detail=yaml_error_message(exc)) from exc
+        if not isinstance(parsed, dict):
+            raise HTTPException(status_code=400, detail="配置文件最外层应按“配置项: 内容”填写，不能是列表或一段普通文字")
+        form = {}
+    else:
+        form = _normalize_form(body.form, base)
+        # 影视预设先裁掉 JavSP 专用字段，再做校验：
+        # 否则那些「本来就不生效」的设置会因为格式不合法把保存拦下来。
+        if getattr(body, "kind", None) == "media":
+            form = scraper_registry.trim_media_preset(form)
+        parsed = form
+    # 影视预设不经过 JavSP 引擎，没必要（也不应该）用 JavSP 的规则校验它
+    if getattr(body, "kind", None) != "media":
+        try:
+            validate_config_data(_deep_merge(base, parsed))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"form": form, "parsed": parsed}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _drop_empty_strings(value):
+    if isinstance(value, dict):
+        return {
+            key: cleaned
+            for key, item in value.items()
+            if (cleaned := _drop_empty_strings(item)) is not None
+        }
+    if isinstance(value, list):
+        return [_drop_empty_strings(item) for item in value]
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def _coerce_like(value, template):
+    if isinstance(value, dict):
+        template = template if isinstance(template, dict) else {}
+        return {key: _coerce_like(item, template.get(key)) for key, item in value.items()}
+    if isinstance(value, str):
+        if isinstance(template, str):
+            return value
+        try:
+            parsed = yaml.safe_load(value)
+        except yaml.YAMLError:
+            parsed = value
+        if parsed is None and value.strip() not in {"", "null", "~"}:
+            return value
+        return parsed
+    return value
+
+
+def _base_config() -> dict:
+    return load_base_config()
+
+
+_CRAWLER_IDS = {
+    "airav", "avsox", "avwiki", "dl_getchu", "fanza", "fc2", "fc2fan", "fc2ppvdb", "gyutto",
+    "jav321", "javbus", "javdb", "javlib", "javmenu", "mgstage", "njav", "prestige", "arzon", "arzon_iv",
+}
+
+
+def _built_in_crawler_paths() -> dict[str, Path]:
+    crawlers: dict[str, Path] = {}
+    web_dir = VENDOR_DIR / "javsp" / "web"
+    for path in sorted(web_dir.glob("*.py")):
+        if path.stem.startswith("_") or path.stem in {"base", "exceptions", "proxyfree", "translate"}:
+            continue
+        crawlers[path.stem] = path
+    return crawlers
+
+
+def _crawler_catalog() -> list[dict]:
+    """兼容旧接口：返回当前「已启用」的刮削器，附带展示名。"""
+    disabled = get_disabled_built_in_crawlers()
+    result = []
+    for name in scraper_registry.available_names():
+        if name in disabled:
+            continue
+        entry = scraper_registry.catalog_entry(name)
+        result.append({
+            "name": name,
+            "kind": "built_in" if entry["kind"] == "built_in" else "custom",
+            "display_name": entry.get("display_name") or name,
+        })
+    return result
+
+
+def _available_crawler_names() -> set[str]:
+    """所有登记的刮削器（含已停用），供测试 / 校验使用。"""
+    return set(scraper_registry.available_names())
+
+
+def _crawler_source(name: str) -> dict | None:
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+        return None
+    path = (CUSTOM_CRAWLERS_DIR / f"{name}.py").resolve()
+    if path.parent == CUSTOM_CRAWLERS_DIR.resolve() and path.is_file():
+        return {"name": name, "kind": "custom", "source": path.read_text(encoding="utf-8")}
+    built_in = _built_in_crawler_paths()
+    if name in built_in and name not in get_disabled_built_in_crawlers():
+        return {"name": name, "kind": "built_in", "source": built_in[name].read_text(encoding="utf-8")}
+    return None
+
+
+def _normalize_form(form: dict, base: dict | None = None) -> dict:
+    base = base or _base_config()
+    normalized = {}
+    for section, value in form.items():
+        if not isinstance(value, (str, dict)):
+            raise HTTPException(status_code=400, detail=f"分类 {section} 必须是 YAML 文本或对象")
+        if isinstance(value, str):
+            try:
+                value = yaml.safe_load(value) or {}
+            except yaml.YAMLError as exc:
+                raise HTTPException(status_code=400, detail=yaml_error_message(exc, section)) from exc
+        if not isinstance(value, dict):
+            raise HTTPException(status_code=400, detail=f"分类 {section} 应按“配置项: 内容”填写，不能是列表或一段普通文字")
+        value = _drop_empty_strings(value) or {}
+        normalized[section] = _coerce_like(value, base.get(section, {}))
+    crawler = normalized.get("crawler")
+    if isinstance(crawler, dict):
+        # 预设只关心「用哪些刮削器」这一份有序列表（默认空，由用户添加）。
+        # 旧版本按影片分类的 selection 会在保存时归一化成扁平列表，
+        # 运行期再由 tasks 展开回引擎需要的分类结构。
+        scrapers = crawler.get("scrapers")
+        if isinstance(scrapers, list):
+            crawler["scrapers"] = _dedupe_names(scrapers)
+        elif isinstance(crawler.get("selection"), dict):
+            crawler["scrapers"] = _flatten_selection(crawler["selection"])
+        crawler.pop("selection", None)
+    return normalized
+
+
+def _dedupe_names(values) -> list[str]:
+    """去重并保留顺序，只接受合法模块名。"""
+    seen: list[str] = []
+    for item in values if isinstance(values, (list, tuple)) else []:
+        name = str(item or "").strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _flatten_selection(selection: dict) -> list[str]:
+    """把旧版「按分类分组」的 selection 合并成一个有序列表。"""
+    if not isinstance(selection, dict):
+        return []
+    ordered: list[str] = []
+    # 普通影片排在最前，其余分类按出现顺序追加
+    keys = ["normal"] + [key for key in selection if key != "normal"]
+    for key in keys:
+        names = selection.get(key)
+        if isinstance(names, list):
+            ordered.extend(names)
+    return _dedupe_names(ordered)
+
+
+def _public_preset(preset: dict) -> dict:
+    result = dict(preset)
+    try:
+        result["task_concurrency"] = max(1, min(32, int(result.get("task_concurrency", 1))))
+    except (TypeError, ValueError):
+        result["task_concurrency"] = 1
+    # 老预设没有 kind：按刮削器能力推断，前端据此选择面板
+    result["kind"] = scraper_registry.preset_kind(preset)
+    base = _base_config()
+    if result.get("mode") == "form":
+        result["form_text"] = {
+            section: yaml.safe_dump(value or {}, allow_unicode=True, sort_keys=False)
+            for section, value in (result.get("form") or {}).items()
+        }
+        result["form_values"] = _deep_merge(base, result.get("form") or {})
+    elif result.get("content"):
+        try:
+            parsed = yaml.safe_load(result["content"]) or {}
+        except yaml.YAMLError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            result["form_text"] = {
+                section: yaml.safe_dump(value or {}, allow_unicode=True, sort_keys=False)
+                for section, value in parsed.items()
+                if isinstance(value, dict)
+            }
+            result["form_values"] = _deep_merge(base, parsed)
+    if "form_values" not in result:
+        result["form_values"] = base
+    # 统一成扁平刮削器列表：避免 base 里的 selection 泄漏到前端，
+    # 也让旧预设自动升级成新结构（前端只认 crawler.scrapers）。
+    values = result["form_values"]
+    if isinstance(values, dict) and isinstance(values.get("crawler"), dict):
+        crawler = values["crawler"]
+        if not isinstance(crawler.get("scrapers"), list):
+            crawler["scrapers"] = _flatten_selection(crawler.get("selection") or {})
+        crawler.pop("selection", None)
+    return result
+
+
+# Operators may run tasks with a preset but never read the credentials inside it.
+_SENSITIVE_CONFIG_KEY = re.compile(
+    r"pass(?:word|wd)?|secret|token|api[_-]?key|access[_-]?key|app[_-]?(?:id|key|secret)|"
+    r"cookies?|authori[sz]ation|credential|private[_-]?key|session|signature|uuid",
+    re.IGNORECASE,
+)
+_REDACTED = "********"
+
+
+def _redact_url(value: str) -> str:
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return value
+    if not parts.scheme or not parts.netloc:
+        return value
+    netloc = parts.netloc
+    if "@" in netloc:
+        netloc = _REDACTED + "@" + netloc.rsplit("@", 1)[1]
+    query = parts.query
+    if query:
+        query = "&".join(
+            (pair.split("=", 1)[0] + "=" + _REDACTED) if "=" in pair and _SENSITIVE_CONFIG_KEY.search(pair.split("=", 1)[0]) else pair
+            for pair in query.split("&")
+        )
+    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+
+
+def _redact_config(value, key: str = "", inherited: bool = False):
+    sensitive = inherited or bool(key and _SENSITIVE_CONFIG_KEY.search(key))
+    if isinstance(value, dict):
+        return {k: _redact_config(v, str(k), sensitive) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_config(item, key, sensitive) for item in value]
+    if sensitive and value is not None and value != "" and not isinstance(value, bool):
+        return _REDACTED
+    if isinstance(value, str):
+        return _redact_url(value)
+    return value
+
+
+def _redacted_yaml(content: str) -> str:
+    try:
+        parsed = yaml.safe_load(content) if content else {}
+    except yaml.YAMLError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    return yaml.safe_dump(_redact_config(parsed), allow_unicode=True, sort_keys=False) if parsed else ""
+
+
+def _operator_preset(preset: dict) -> dict:
+    """Allow-list the preset fields an operator needs; secrets are masked."""
+    result = {key: preset[key] for key in ("id", "name", "mode", "task_concurrency", "created_at", "updated_at") if key in preset}
+    form = _redact_config(preset.get("form") or {})
+    result["form"] = form
+    result["form_values"] = _redact_config(preset.get("form_values") or {})
+    result["content"] = _redacted_yaml(preset.get("content") or "")
+    source = form if preset.get("mode") == "form" else (yaml.safe_load(result["content"]) if result["content"] else {})
+    result["form_text"] = {
+        section: yaml.safe_dump(value or {}, allow_unicode=True, sort_keys=False)
+        for section, value in (source or {}).items()
+        if isinstance(value, dict)
+    }
+    result["redacted"] = True
+    return result
+
+
+_JAPAN_RESTRICTED_CRAWLERS = {
+    "mgstage": ("MGStage", "mgstage.com"),
+    "prestige": ("Prestige", "prestige-av.com"),
+    "fc2": ("FC2", "adult.contents.fc2.com"),
+    "fanza": ("FANZA", "dmm.co.jp"),
+}
+_GEO_IP_ENDPOINTS = ("https://ipwho.is/", "https://ipapi.co/json/")
+
+
+def _proxy_test_timeout(value: str | None) -> int:
+    """Keep the interactive test quick even if the preset has a long timeout."""
+    match = re.fullmatch(r"PT(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?", str(value or "").strip(), re.IGNORECASE)
+    if not match:
+        return 6
+    seconds = int(match.group(1) or 0) * 60 + float(match.group(2) or 0)
+    return max(2, min(10, int(seconds or 6)))
+
+
+def _selected_crawlers(value: dict | str | None) -> set[str]:
+    if isinstance(value, str):
+        try:
+            value = yaml.safe_load(value) or {}
+        except yaml.YAMLError:
+            return set()
+    if not isinstance(value, dict):
+        return set()
+    if isinstance(value.get("selection"), (dict, str)):
+        return _selected_crawlers(value["selection"])
+    selected: set[str] = set()
+    for crawlers in value.values():
+        if isinstance(crawlers, list):
+            selected.update(str(crawler).strip().lower() for crawler in crawlers)
+    return selected
+
+
+def _proxy_connectivity_test(body: ProxyConnectivityTestBody) -> dict:
+    raw_proxy = str(body.proxy_server or "").strip()
+    if raw_proxy.lower() in {"", "null", "~"}:
+        raw_proxy = ""
+    if raw_proxy:
+        parsed = urlsplit(raw_proxy)
+        if parsed.scheme.lower() not in {"http", "https", "socks5", "socks5h"} or not parsed.hostname:
+            raise HTTPException(status_code=400, detail="代理服务器地址必须是 http、https、socks5 或 socks5h 地址")
+
+    session = requests.Session()
+    session.trust_env = False
+    if raw_proxy:
+        session.proxies.update({"http": raw_proxy, "https": raw_proxy})
+    result: dict[str, object] = {
+        "route": "配置代理" if raw_proxy else "直连",
+        "proxy_configured": bool(raw_proxy),
+        "reachable": False,
+        "ip": "",
+        "country": "",
+    }
+    for endpoint in _GEO_IP_ENDPOINTS:
+        try:
+            response = session.get(endpoint, timeout=_proxy_test_timeout(body.timeout), headers={"Accept": "application/json"})
+            response.raise_for_status()
+            data = response.json()
+            country = str(data.get("country_code") or data.get("country") or "").upper()
+            if country:
+                result.update({"reachable": True, "ip": str(data.get("ip") or "").strip(), "country": country})
+                break
+        except (requests.RequestException, ValueError, TypeError):
+            continue
+
+    selected_crawlers = _selected_crawlers(body.crawler_selection)
+    if not selected_crawlers:
+        preset = get_preset(body.preset_id)
+        if preset:
+            preset_values = _public_preset(preset).get("form_values") or {}
+            selected_crawlers = _selected_crawlers((preset_values.get("crawler") or {}).get("selection"))
+    restricted = [details for crawler, details in _JAPAN_RESTRICTED_CRAWLERS.items() if crawler in selected_crawlers]
+    site_names = [name for name, _ in restricted]
+    domains = [domain for _, domain in restricted]
+    hint = ""
+    if domains:
+        rules = "\n".join(f"  - DOMAIN-SUFFIX,{domain},JP" for domain in sorted(set(domains)))
+        hint = "Clash/Mihomo 覆写提示（先确保存在名为 JP 的日本策略组）：\nrules:\n" + rules
+    result.update({
+        "restricted_sites": site_names,
+        "japan_required": bool(restricted),
+        "japan_compatible": bool(result["reachable"] and result["country"] == "JP") if restricted else None,
+        "clash_mihomo_hint": hint,
+    })
+    if site_names:
+        site_text = "、".join(site_names)
+        route_text = "直连" if not raw_proxy else "配置代理"
+        if result["reachable"] and result["country"] == "JP":
+            preflight = f"网络预检：正在检查 {site_text} 所需的出口地区\n网络预检通过：{site_text} 的{route_text}出口地区满足已知限制。"
+        elif not result["reachable"]:
+            preflight = (
+                f"网络预检：正在检查 {site_text} 所需的出口地区\n"
+                f"网络预检：无法查询{route_text}出口地区；将继续执行刮削。\n"
+                f"网络预检警告：已启用的 {site_text} 存在日本地区访问限制，但无法查询{route_text}出口地区。"
+                "这些爬虫可能返回 403、登录页或地区限制页面；刮削会继续，其他爬虫不受影响。"
+            )
+        else:
+            preflight = (
+                f"网络预检：正在检查 {site_text} 所需的出口地区\n"
+                f"网络预检警告：已启用的 {site_text} 存在日本地区访问限制，但当前{route_text}出口地区为 {result['country']}。"
+                "这些爬虫可能返回 403、登录页或地区限制页面；刮削会继续，其他爬虫不受影响。"
+            )
+    else:
+        preflight = "网络预检：当前爬虫选择中没有需要日本出口地区的爬虫。"
+    result["preflight_message"] = preflight
+    return result
+
+
+@app.post("/api/presets/network/proxy-test")
+def test_preset_proxy_connectivity(body: ProxyConnectivityTestBody, _: dict = Depends(require_admin)) -> dict:
+    return _proxy_connectivity_test(body)
+
+
+@app.post("/api/presets")
+def create_preset(body: PresetBody, _: dict = Depends(require_admin)) -> dict:
+    prepared = _prepare_preset(body)
+    form = prepared["form"]
+    kind = _preset_kind_for(body, form)
+    if kind == "media":
+        form = scraper_registry.trim_media_preset(form)
+    preset = {
+        "id": uuid.uuid4().hex[:10],
+        "name": body.name,
+        "mode": body.mode,
+        "content": body.content or "",
+        "form": form,
+        "kind": kind,
+        "task_concurrency": body.task_concurrency,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    save_preset(preset)
+    library_store.invalidate_preset_cache()
+    return _public_preset(preset)
+
+
+@app.put("/api/presets/{preset_id}")
+def update_preset(preset_id: str, body: PresetBody, _: dict = Depends(require_admin)) -> dict:
+    current = get_preset(preset_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="预设不存在")
+    prepared = _prepare_preset(body)
+    form = prepared["form"]
+    kind = _preset_kind_for(body, form, fallback=current)
+    if kind == "media":
+        form = scraper_registry.trim_media_preset(form)
+    current.update({"name": body.name, "mode": body.mode, "content": body.content or "",
+                    "form": form, "kind": kind, "task_concurrency": body.task_concurrency,
+                    "updated_at": now_iso()})
+    save_preset(current)
+    library_store.invalidate_preset_cache()
+    return _public_preset(current)
+
+
+@app.delete("/api/presets/{preset_id}")
+def remove_preset(preset_id: str, _: dict = Depends(require_admin)) -> dict:
+    if not delete_preset(preset_id):
+        raise HTTPException(status_code=400, detail="默认预设不能删除，或预设不存在")
+    return {"ok": True}
+
+
+# Kept as a compatibility API for integrations. The web UI uses presets instead.
+@app.get("/api/config")
+def get_config(_: dict = Depends(require_admin)) -> dict:
+    content = read_config()
+    try:
+        parsed = yaml.safe_load(content) or {}
+    except yaml.YAMLError as exc:
+        parsed = {"_error": yaml_error_message(exc)}
+    return {"content": content, "parsed": parsed}
+
+
+@app.get("/api/cookiecloud")
+def get_cookiecloud(_: dict = Depends(require_admin)) -> dict:
+    return {**get_cookiecloud_settings(), 'sync': sync_status()}
+
+
+@app.put("/api/cookiecloud")
+def update_cookiecloud(body: CookieCloudBody, _: dict = Depends(require_admin)) -> dict:
+    if body.enabled and (not body.server_url.strip() or not body.uuid.strip()):
+        raise HTTPException(status_code=400, detail="启用 CookieCloud 前请填写服务地址和 UUID")
+    if body.enabled and body.clear_password:
+        raise HTTPException(status_code=400, detail="启用 CookieCloud 时不能清除密码")
+    if body.enabled and not (body.password or get_cookiecloud_settings(include_password=True).get("password")):
+        raise HTTPException(status_code=400, detail="启用 CookieCloud 前请填写密码")
+    saved = save_cookiecloud_settings(body.model_dump(exclude_none=True))
+    return {**saved, 'sync': sync_status()}
+
+
+@app.post("/api/cookiecloud/test")
+def test_cookiecloud(body: CookieCloudBody, _: dict = Depends(require_admin)) -> dict:
+    configured = get_cookiecloud_settings(include_password=True)
+    settings = {**configured, **body.model_dump(exclude_none=True)}
+    if not body.password:
+        settings["password"] = configured.get("password", "")
+    try:
+        cookies = fetch_cookiecloud(settings)
+    except CookieCloudError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **cookiecloud_summary(cookies)}
+
+
+@app.post("/api/cookiecloud/sync")
+def sync_cookiecloud(_: dict = Depends(require_admin)) -> dict:
+    if not get_cookiecloud_settings()['enabled']:
+        raise HTTPException(400, '请先保存并启用 CookieCloud')
+    try:
+        get_synced_cookies(force=True)
+    except CookieCloudError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {'ok': True, 'sync': sync_status()}
+
+
+@app.get("/api/crawler-config")
+def get_crawler_config(_: dict = Depends(current_user)) -> dict:
+    return {
+        "crawlers": _crawler_catalog(),
+        "disabled_built_ins": sorted(get_disabled_built_in_crawlers()),
+    }
+
+
+@app.get("/api/crawler-config/names")
+def get_crawler_config_names(_: dict = Depends(current_user)) -> dict:
+    return {
+        "crawlers": _crawler_catalog(),
+        "disabled_built_ins": sorted(get_disabled_built_in_crawlers()),
+    }
+
+
+@app.get("/api/crawler-config/{name}")
+def get_crawler_source(name: str, _: dict = Depends(require_admin)) -> dict:
+    crawler = _crawler_source(name)
+    if not crawler:
+        raise HTTPException(status_code=404, detail="爬虫不存在或已移除")
+    return crawler
+
+
+@app.put("/api/crawler-config/custom")
+def save_custom_crawler(body: CustomCrawlerBody, _: dict = Depends(require_admin)) -> dict:
+    if "def parse_data" not in body.source:
+        raise HTTPException(status_code=400, detail="爬虫代码必须定义 parse_data(movie) 函数")
+    try:
+        compile(body.source, f"{body.name}.py", "exec")
+    except SyntaxError as exc:
+        raise HTTPException(status_code=400, detail=f"Python 语法错误: {exc.msg}（第 {exc.lineno} 行）") from exc
+    CUSTOM_CRAWLERS_DIR.mkdir(parents=True, exist_ok=True)
+    path = (CUSTOM_CRAWLERS_DIR / f"{body.name}.py").resolve()
+    if path.parent != CUSTOM_CRAWLERS_DIR.resolve():
+        raise HTTPException(status_code=400, detail="爬虫名称无效")
+    original_name = body.original_name or ""
+    if body.name in _built_in_crawler_paths() and original_name != body.name:
+        raise HTTPException(status_code=409, detail="爬虫名称已被内置爬虫使用，请使用其他名称")
+    if path.exists() and original_name != body.name:
+        raise HTTPException(status_code=409, detail="爬虫名称已存在，请使用其他名称")
+    old_path = None
+    if original_name and original_name != body.name:
+        old_path = (CUSTOM_CRAWLERS_DIR / f"{original_name}.py").resolve()
+        if old_path.parent != CUSTOM_CRAWLERS_DIR.resolve() or not old_path.is_file():
+            raise HTTPException(status_code=404, detail="原自定义爬虫不存在，无法重命名")
+    path.write_text(body.source, encoding="utf-8")
+    if old_path:
+        old_path.unlink()
+    return {"ok": True, "name": body.name}
+
+
+@app.delete("/api/crawler-config/custom/{name}")
+def delete_custom_crawler(name: str, _: dict = Depends(require_admin)) -> dict:
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+        raise HTTPException(status_code=400, detail="爬虫名称无效")
+    path = (CUSTOM_CRAWLERS_DIR / f"{name}.py").resolve()
+    if path.parent != CUSTOM_CRAWLERS_DIR.resolve() or not path.is_file():
+        raise HTTPException(status_code=404, detail="自定义爬虫不存在")
+    path.unlink()
+    return {"ok": True}
+
+
+@app.delete("/api/crawler-config/built-in/{name}")
+def disable_built_in_crawler(name: str, _: dict = Depends(require_admin)) -> dict:
+    """兼容旧接口：停用一块积木（等同于新的启用开关）。"""
+    if name not in set(scraper_registry.available_names()):
+        raise HTTPException(status_code=404, detail="刮削器不存在")
+    scraper_registry.set_enabled(name, False)
+    return {"ok": True, "name": name}
+
+
+@app.post("/api/crawler-config/built-in/{name}/restore")
+def restore_built_in_crawler(name: str, _: dict = Depends(require_admin)) -> dict:
+    """兼容旧接口：恢复一块积木。"""
+    if name not in set(scraper_registry.available_names()):
+        raise HTTPException(status_code=404, detail="刮削器不存在")
+    scraper_registry.set_enabled(name, True)
+    return {"ok": True, "name": name}
+
+
+def _run_crawler_test(name: str, value: str) -> dict:
+    """Run one crawler (built-in or plugin) against an explicit ID.
+
+    Returns all ``MovieInfo`` fields plus ``error`` / ``output``. Shared by the
+    legacy /api/crawler-config/test and the new /api/scrapers/{name}/test.
+    """
+    config_path = None
+    cookiecloud_path = None
+    cookiecloud_warning = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".yml", delete=False) as config_file:
+            config_file.write(read_config())
+            config_path = config_file.name
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(CUSTOM_CRAWLERS_DIR) + os.pathsep + str(VENDOR_DIR) + os.pathsep + env.get("PYTHONPATH", "")
+        env["MOVSP_CUSTOM_CRAWLERS_DIR"] = str(CUSTOM_CRAWLERS_DIR)
+        from . import scrapers as scraper_registry
+        scraper_registry.ensure_plugin_files()
+        env.update(scraper_registry.runtime_env())
+        settings = get_cookiecloud_settings(include_password=True)
+        if settings.get("enabled"):
+            try:
+                cookies = get_synced_cookies(settings)
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as cookie_file:
+                    json.dump(cookies, cookie_file, ensure_ascii=False)
+                    cookiecloud_path = cookie_file.name
+                env["JAVSP_COOKIECLOUD_FILE"] = cookiecloud_path
+            except CookieCloudError as exc:
+                cookiecloud_warning = f"CookieCloud 同步失败，测试将不携带登录 Cookie：{exc}"
+        completed = subprocess.run(
+            [sys.executable, "-c", _CRAWLER_TEST_SCRIPT, "-c", config_path, name, value],
+            cwd=str(VENDOR_DIR),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=90,
+        )
+        output = completed.stdout.decode("utf-8", errors="replace")
+        result_line = next((line for line in reversed(output.splitlines()) if line.startswith(_CRAWLER_TEST_MARKER)), "")
+        if not result_line:
+            return {"crawler": name, "input_value": value, "data": {}, "error": "刮削器测试未返回结果", "output": output[-40_000:]}
+        result = json.loads(result_line[len(_CRAWLER_TEST_MARKER):])
+        result["output"] = output.replace(result_line, "").strip()[-40_000:]
+        if cookiecloud_warning:
+            result["output"] = (cookiecloud_warning + "\n" + result["output"]).strip()
+        return result
+    except subprocess.TimeoutExpired:
+        return {"crawler": name, "input_value": value, "data": {}, "error": "刮削器测试超时（90 秒）", "output": ""}
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {"crawler": name, "input_value": value, "data": {}, "error": str(exc) or exc.__class__.__name__, "output": ""}
+    finally:
+        if config_path:
+            try:
+                Path(config_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        if cookiecloud_path:
+            try:
+                Path(cookiecloud_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+@app.post("/api/crawler-config/test")
+def test_crawler(body: CrawlerTestBody, _: dict = Depends(require_admin)) -> dict:
+    """兼容旧接口：按名字运行一次刮削器测试。"""
+    if body.name not in _available_crawler_names():
+        raise HTTPException(status_code=404, detail="爬虫不存在")
+    value = body.input_value.strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="请输入要测试的番号")
+    return _run_crawler_test(body.name, value)
+
+
+# ---------------------------------------------------------------------------
+# 刮削器（搭积木）管理接口
+# ---------------------------------------------------------------------------
+
+def _scraper_or_404(name: str) -> dict:
+    if name not in set(scraper_registry.available_names()):
+        raise HTTPException(status_code=404, detail="刮削器不存在")
+    return scraper_registry.catalog_entry(name)
+
+
+def _public_scrapers(user: dict) -> list[dict]:
+    admin = user.get("role") == "admin"
+    result = scraper_registry.catalog()
+    if not admin:
+        # 非管理员不接触任何密钥：配置打码、源码与设置编辑入口隐藏。
+        for item in result:
+            item["settings"] = scraper_registry.public_settings(item["name"])
+            item["editable_source"] = False
+    return result
+
+
+@app.get("/api/scrapers")
+def list_scrapers(user: dict = Depends(current_user)) -> dict:
+    """刮削器目录（含开关、配置、最近状态），供管理页与预设页共用。"""
+    return {"scrapers": _public_scrapers(user), "status": scraper_registry.all_statuses()}
+
+
+@app.post("/api/scrapers/{name}/enable")
+def enable_scraper(name: str, body: ScraperToggleBody, user: dict = Depends(require_admin)) -> dict:
+    try:
+        scraper_registry.set_enabled(name, body.enabled)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="刮削器不存在") from None
+    return {"ok": True, "name": name, "enabled": body.enabled,
+            "scrapers": _public_scrapers(user)}
+
+
+@app.put("/api/scrapers/{name}/settings")
+def save_scraper_settings(name: str, body: ScraperSettingsBody, user: dict = Depends(require_admin)) -> dict:
+    _scraper_or_404(name)
+    scraper_registry.update_settings(name, body.settings)
+    return {"ok": True, "name": name, "settings": scraper_registry.get_settings(name),
+            "scrapers": _public_scrapers(user)}
+
+
+@app.put("/api/scrapers/{name}/meta")
+def save_scraper_meta(name: str, body: ScraperMetaBody, user: dict = Depends(require_admin)) -> dict:
+    """编辑积木的展示名 / 说明 / 推荐分类（不影响引擎里的模块名）。"""
+    _scraper_or_404(name)
+    scraper_registry.set_overrides(name, body.model_dump(exclude_none=True))
+    return {"ok": True, "name": name, "scrapers": _public_scrapers(user)}
+
+
+@app.get("/api/scrapers/{name}/source")
+def get_scraper_source(name: str, _: dict = Depends(require_admin)) -> dict:
+    entry = _scraper_or_404(name)
+    if entry["kind"] == "built_in":
+        source = _crawler_source(name)
+        return {"name": name, "kind": "built_in", "source": (source or {}).get("source", ""),
+                "editable": False, "restorable": False}
+    source = scraper_registry.plugin_source(name)
+    if source is None:
+        custom = _crawler_source(name)
+        source = (custom or {}).get("source", "")
+        restorable = False
+    else:
+        restorable = name in scraper_registry.PLUGIN_SOURCES
+    return {"name": name, "kind": entry["kind"], "source": source,
+            "editable": True, "restorable": restorable}
+
+
+@app.put("/api/scrapers/{name}/source")
+def save_scraper_source(name: str, body: ScraperSourceBody, user: dict = Depends(require_admin)) -> dict:
+    """保存用户编辑的刮削器源码（插件 / 自定义积木）。"""
+    entry = _scraper_or_404(name)
+    if entry["kind"] == "built_in":
+        raise HTTPException(status_code=400, detail="内置刮削器源码只读，如需要请复制成自定义积木")
+    if "def parse_data" not in body.source:
+        raise HTTPException(status_code=400, detail="刮削器代码必须定义 parse_data(movie) 函数")
+    try:
+        compile(body.source, f"{name}.py", "exec")
+    except SyntaxError as exc:
+        raise HTTPException(status_code=400, detail=f"Python 语法错误: {exc.msg}（第 {exc.lineno} 行）") from exc
+    scraper_registry.save_source(name, body.source)
+    return {"ok": True, "name": name, "scrapers": _public_scrapers(user)}
+
+
+@app.post("/api/scrapers/{name}/restore")
+def restore_scraper_source(name: str, _: dict = Depends(require_admin)) -> dict:
+    try:
+        source = scraper_registry.restore_source(name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "name": name, "source": source}
+
+
+class ScraperCustomBody(BaseModel):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    display_name: str = Field(default="", max_length=80)
+
+
+@app.post("/api/scrapers/custom")
+def create_custom_scraper(body: ScraperCustomBody, user: dict = Depends(require_admin)) -> dict:
+    """新增一块自定义积木（从 parse_data 模板开始编辑）。"""
+    import re as _re
+    if not _re.fullmatch(r"[a-z][a-z0-9_]*", body.name):
+        raise HTTPException(status_code=400, detail="名称需以小写字母开头，只含小写字母、数字与下划线")
+    if body.name in scraper_registry.reserved_names() or body.name in set(scraper_registry.available_names()):
+        raise HTTPException(status_code=409, detail="该名称已被使用，请换一个")
+    template = (
+        "from javsp.datatype import MovieInfo\n\n\n"
+        "def parse_data(movie: MovieInfo):\n"
+        "    # 在这里填充 movie.title / movie.cover 等字段\n"
+        "    raise NotImplementedError('Implement this scraper')\n"
+    )
+    scraper_registry.save_source(body.name, template)
+    if body.display_name.strip():
+        scraper_registry.set_overrides(body.name, {"display_name": body.display_name.strip()})
+    return {"ok": True, "name": body.name, "scrapers": _public_scrapers(user)}
+
+
+@app.delete("/api/scrapers/custom/{name}")
+def delete_custom_scraper(name: str, user: dict = Depends(require_admin)) -> dict:
+    entry = _scraper_or_404(name)
+    if entry["kind"] != "custom":
+        raise HTTPException(status_code=400, detail="只能删除自定义积木；内置与插件积木请改用启用开关")
+    if not scraper_registry.delete_source(name):
+        raise HTTPException(status_code=404, detail="自定义刮削器文件不存在")
+    return {"ok": True, "name": name, "scrapers": _public_scrapers(user)}
+
+
+class ScraperTestBody(BaseModel):
+    # 留空时使用积木自己声明的检测样本
+    input_value: str = Field(default="", max_length=256)
+    check_only: bool = False
+
+
+def _probe_scraper(name: str, input_value: str, check_only: bool) -> dict:
+    """跑一次检测并把结果写成细粒度状态。
+
+    check_only=True  只检查开关 / 配置 / 源码语法，不联网
+    check_only=False 真实调用一次刮削器，按能力严格判定是否可用
+    """
+    entry = scraper_registry.catalog_entry(name)
+    mode = "check" if check_only else "test"
+    if check_only:
+        probe = _run_crawler_probe(name)
+        state = "ok" if probe["ok"] else "request_error"
+        status = scraper_registry.make_status(state, probe["message"], mode=mode)
+        scraper_registry.set_status(name, status)
+        return {"status": status, "result": probe}
+
+    # 用积木自己的能力样本检测，避免拿番号去搜标题型刮削器
+    sample = str(input_value or "").strip() or str(entry.get("sample") or "").strip()
+    if not sample:
+        status = scraper_registry.make_status(
+            "request_error", "这块刮削器没有声明检测样本，无法测试", mode=mode)
+        scraper_registry.set_status(name, status)
+        return {"status": status, "result": {"error": status["message"]}}
+
+    started = time.monotonic()
+    result = _run_crawler_test(name, sample)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    http_status = _extract_http_status(result)
+    error = str(result.get("error") or "")
+    if error:
+        status = scraper_registry.status_from_error(
+            RuntimeError(error), http_status=http_status, elapsed_ms=elapsed_ms, mode=mode)
+    else:
+        capability = str(entry.get("sample_capability") or "")
+        ok, message = scraper_registry.evaluate_result(result.get("data") or {}, sample, capability)
+        status = scraper_registry.make_status(
+            "ok" if ok else "invalid_response", message,
+            http_status=http_status, elapsed_ms=elapsed_ms, mode=mode)
+    scraper_registry.set_status(name, status)
+    return {"status": status, "result": result}
+
+
+def _extract_http_status(result: dict) -> int:
+    """从测试输出里尽量解析出 HTTP 状态码，用于区分 401/403/407/429。"""
+    text = f"{result.get('error') or ''}\n{result.get('output') or ''}"
+    match = re.search(r"\bHTTP\s*(?:Status\s*)?(\d{3})\b", text, re.I)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\b(4\d{2}|5\d{2})\b", text)
+    return int(match.group(1)) if match else 0
+
+
+def _run_crawler_probe(name: str) -> dict:
+    """只检查开关、配置与源码是否齐备，不发起网络请求。"""
+    if not scraper_registry.is_enabled(name):
+        return {"ok": False, "message": "该刮削器已停用"}
+    entry = scraper_registry.catalog_entry(name)
+    missing = []
+    for field in entry.get("settings_schema") or []:
+        if field.get("required") and not str(scraper_registry.get_settings(name).get(field["key"]) or "").strip():
+            missing.append(field.get("label") or field["key"])
+    if missing:
+        return {"ok": False, "message": "缺少配置：" + "、".join(missing)}
+    # 插件 / 自定义积木的源码必须定义 parse_data；内置源码由引擎保证。
+    if entry["kind"] != "built_in":
+        scraper_registry.ensure_plugin_files()
+        source = scraper_registry.custom_source(name)
+        if not source:
+            return {"ok": False, "message": "找不到刮削器源码文件"}
+        if "def parse_data" not in source:
+            return {"ok": False, "message": "源码缺少 parse_data(movie) 函数"}
+        try:
+            compile(source, f"{name}.py", "exec")
+        except SyntaxError as exc:
+            return {"ok": False, "message": f"源码语法错误：{exc.msg}（第 {exc.lineno} 行）"}
+    return {"ok": True, "message": "模块与配置就绪"}
+
+
+@app.post("/api/scrapers/{name}/test")
+def test_scraper(name: str, body: ScraperTestBody, _: dict = Depends(require_admin)) -> dict:
+    _scraper_or_404(name)
+    # 不传输入时自动使用积木自己的检测样本
+    return _probe_scraper(name, body.input_value.strip(), body.check_only)
+
+
+class ScraperCheckAllBody(BaseModel):
+    names: list[str] = Field(default_factory=list, max_length=100)
+
+
+@app.post("/api/scrapers/check-all")
+def check_all_scrapers(body: ScraperCheckAllBody, user: dict = Depends(require_admin)) -> dict:
+    """统一体检：逐块检查配置与模块，把状态写回目录。"""
+    names = body.names or [item for item in scraper_registry.available_names()
+                           if scraper_registry.is_enabled(item)]
+    updates = {}
+    for name in names:
+        if name not in set(scraper_registry.available_names()):
+            continue
+        probe = _run_crawler_probe(name)
+        updates[name] = scraper_registry.make_status(
+            "ok" if probe["ok"] else "request_error", probe["message"], mode="check")
+    scraper_registry.set_statuses(updates)
+    return {"ok": True, "status": scraper_registry.all_statuses(), "scrapers": _public_scrapers(user)}
+
+
+@app.put("/api/config")
+def update_config(body: ConfigBody, _: dict = Depends(require_admin)) -> dict:
+    try:
+        parsed = yaml.safe_load(body.content)
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=400, detail=yaml_error_message(exc)) from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="配置文件最外层应按“配置项: 内容”填写，不能是列表或一段普通文字")
+    try:
+        validate_config_data(_deep_merge(_base_config(), parsed))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    write_config(body.content)
+    return {"ok": True}
+
+
+class RetryFailedBody(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=2000)
+
+
+@app.post("/api/tasks/retry-failed", status_code=202)
+def retry_failed_tasks_route(body: RetryFailedBody | None = None,
+                             _: dict = Depends(current_user)) -> dict:
+    """把失败的任务批量重新派到队列（可选只重试指定 id）。"""
+    from . import tasks as task_runner
+
+    ids = list(body.ids) if body else []
+    return task_runner.retry_failed_tasks(ids or None)
+
+
+@app.post("/api/tasks/{task_id}/retry", status_code=202)
+def retry_task_route(task_id: str, _: dict = Depends(current_user)) -> dict:
+    """重新刮削单个失败/已取消的任务。"""
+    from . import tasks as task_runner
+
+    try:
+        new_id = task_runner.retry_task(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"task_id": new_id, "task": get_task(new_id)}
+
+
+@app.get("/api/tasks")
+def tasks(request: Request, limit: int | None = Query(default=None, ge=1, le=500), offset: int = Query(default=0, ge=0),
+          view: Literal['all', 'manual', 'overview'] = 'all', query: str = '',
+          field: Literal['all', 'path', 'title', 'dvdid', 'actress'] = 'all', status: str = '',
+          size_min: float | None = Query(default=None, ge=0), size_max: float | None = Query(default=None, ge=0),
+          date_from: str = '', date_to: str = '', sort: Literal['created_at', 'publish_date'] = 'created_at',
+          direction: Literal['asc', 'desc'] = 'desc', group_by: Literal['', 'library', 'actress', 'producer', 'year'] = '',
+          group: str = Query(default='', max_length=500), _: dict = Depends(current_user)) -> Response:
+    if view == 'overview':
+        return _etag_json(request, film_library.overview_page(limit or 24, offset, overview_libraries(),
+            group_by=group_by, group=group, query=query, sort=sort, direction=direction))
+    result = list_task_summaries(limit, offset, view=view, query=query, field=field, status=status,
+                               size_min=size_min, size_max=size_max, date_from=date_from,
+                               date_to=date_to, sort=sort, direction=direction)
+    return _etag_json(request, result)
+
+
+def _etag_json(request: Request, result: dict) -> Response:
+    payload = json.dumps(result, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    etag = 'W/"' + hashlib.sha256(payload).hexdigest() + '"'
+    headers = {'ETag': etag, 'Cache-Control': 'private, no-cache'}
+    if request.headers.get('if-none-match') == etag:
+        return Response(status_code=304, headers=headers)
+    return Response(payload, media_type='application/json', headers=headers)
+
+
+@app.get("/api/tasks/overview-groups")
+def task_overview_groups(request: Request, by: Literal['all', 'library', 'actress', 'producer', 'year'] = 'all',
+                         offset: int = Query(default=0, ge=0), limit: int = Query(default=24, ge=1, le=120),
+                         query: str = Query(default='', max_length=200), _: dict = Depends(current_user)) -> Response:
+    libraries = overview_libraries()
+    result = film_library.overview_groups(by, offset, limit, query.strip(), libraries)
+    result['libraries_available'] = bool(libraries)
+    return _etag_json(request, result)
+
+
+@app.get("/api/tasks/ids")
+def task_ids(request: Request, view: Literal['all', 'manual', 'overview'] = 'all',
+             query: str = '', field: Literal['all', 'path', 'title', 'dvdid', 'actress'] = 'all',
+             status: str = '', size_min: float | None = Query(default=None, ge=0),
+             size_max: float | None = Query(default=None, ge=0), date_from: str = '', date_to: str = '',
+             group_by: Literal['', 'library', 'actress', 'producer', 'year'] = '',
+             group: str = Query(default='', max_length=500), _: dict = Depends(current_user)) -> Response:
+    """Every task id behind the current filter, for "select all matches"."""
+    roots = []
+    if view == 'overview' and group_by == 'library':
+        roots = next((library['roots'] for library in overview_libraries() if library['key'] == group), [])
+    result = load_task_ids(view=view, query=query, field=field, status=status, size_min=size_min,
+                           size_max=size_max, date_from=date_from, date_to=date_to,
+                           group_by=group_by, group=group, group_roots=roots)
+    return _etag_json(request, {"ids": result, "total": len(result)})
+
+
+@app.post("/api/tasks", status_code=202)
+def start_task(body: TaskBody, _: dict = Depends(current_user)) -> dict:
+    try:
+        from .task_scans import submit_scan
+        task = submit_scan(body.input_directory, body.preset_id, body.input_files)
+        return {"tasks": [task], "count": 1, "scan": True}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/tasks/{task_id}")
+def task(task_id: str, _: dict = Depends(current_user)) -> dict:
+    item = catalog_task(task_id) if task_id.startswith('media-') else get_task(task_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return item
+
+
+@app.get("/api/tasks/{task_id}/playback")
+def task_playback(task_id: str, _: dict = Depends(current_user)) -> dict:
+    item = catalog_task(task_id) if task_id.startswith('media-') else get_task(task_id)
+    if not item:
+        raise HTTPException(404, "任务不存在")
+    try:
+        links = playback_links(item)
+    except Exception as exc:
+        raise HTTPException(400, "媒体库读取失败：" + connection_error(exc)) from exc
+    if not links:
+        raise HTTPException(404, "未在绑定媒体库中找到影片，请确认外部播放地址、媒体库路径及扫描状态")
+    return {"links": links}
+
+
+@app.get("/api/tasks/{task_id}/playback/sessions")
+def task_playback_sessions(task_id: str, _: dict = Depends(current_user)) -> dict:
+    item = catalog_task(task_id) if task_id.startswith('media-') else get_task(task_id)
+    if not item: raise HTTPException(404, "任务不存在")
+    try: return {"sessions": media_sessions(item)}
+    except Exception as exc: raise HTTPException(400, "媒体库会话读取失败：" + connection_error(exc)) from exc
+
+
+class PlaybackSeekBody(BaseModel):
+    server_id: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=256)
+    seconds: int = Field(ge=0, le=604800)
+
+
+@app.post("/api/tasks/{task_id}/playback/seek")
+def task_playback_seek(task_id: str, body: PlaybackSeekBody, _: dict = Depends(current_user)) -> dict:
+    item = catalog_task(task_id) if task_id.startswith('media-') else get_task(task_id)
+    if not item: raise HTTPException(404, "任务不存在")
+    try:
+        seek_media(item, body.server_id, body.session_id, body.seconds)
+    except ValueError as exc: raise HTTPException(400, "媒体库跳转失败：" + str(exc)) from exc
+    except Exception as exc: raise HTTPException(400, "媒体库跳转失败：" + connection_error(exc)) from exc
+    return {"ok": True, "seconds": body.seconds}
+
+
+@app.patch("/api/tasks/{task_id}/metadata")
+def update_task_details(task_id: str, body: TaskMetadataBody, _: dict = Depends(current_user)) -> dict:
+    if task_id.startswith('media-'):
+        try:
+            return {'ok': True, **update_catalog_metadata(task_id, body.model_dump())}
+        except Exception as exc:
+            raise HTTPException(400, '媒体库资料保存失败：' + connection_error(exc)) from exc
+    try:
+        result = update_task_metadata(task_id, body.model_dump(), body.apply_to_folder)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"写入 NFO 失败：{exc}") from exc
+    if result is None:
+        raise HTTPException(status_code=400, detail="任务不存在，或任务仍在运行中")
+    return {"ok": True, **result}
+
+
+@app.get("/api/tasks/{task_id}/cover/{index:int}")
+def task_cover(task_id: str, index: int, request: Request, thumbnail: bool = False, _: dict = Depends(current_user)) -> Response:
+    if task_id.startswith('media-'):
+        return _media_image_response(task_id, 'cover', index)
+    path = get_cover_path(task_id, index)
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="封面不存在")
+    return image_response(path, request, thumbnail)
+
+
+@app.get("/api/tasks/{task_id}/fanart/{index:int}")
+def task_fanart(task_id: str, index: int, request: Request, _: dict = Depends(current_user)) -> Response:
+    if task_id.startswith('media-'):
+        return _media_image_response(task_id, 'fanart', index)
+    path = get_fanart_path(task_id, index)
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="剧照不存在")
+    return image_response(path, request)
+
+
+def _media_image_response(task_id, kind, index):
+    try:
+        response = catalog_image(task_id, kind, index)
+        return Response(response.content, media_type=response.headers.get('Content-Type', 'image/jpeg'),
+                        headers={'Cache-Control': 'private, max-age=300'})
+    except Exception as exc:
+        raise HTTPException(404, '媒体库图片读取失败') from exc
+
+
+@app.put('/api/tasks/{task_id}/artwork/{kind}/{index}')
+async def put_task_artwork(task_id: str, kind: Literal['cover', 'fanart'], index: int,
+                           file: UploadFile = File(...), _: dict = Depends(current_user)):
+    content = await file.read(16 * 1024 * 1024 + 1)
+    try:
+        if index < -1 or not content or len(content) > 16 * 1024 * 1024:
+            raise ValueError('图片位置无效或文件超过 16 MB')
+        if task_id.startswith('media-'):
+            import io
+            from PIL import Image, ImageOps
+            with Image.open(io.BytesIO(content)) as image:
+                image = ImageOps.exif_transpose(image).convert('RGB')
+                buffer = io.BytesIO()
+                image.save(buffer, 'JPEG', quality=92)
+            catalog_image(task_id, kind, index, content=buffer.getvalue())
+        else:
+            edit_task_artwork(task_id, kind, index, content)
+    except (OSError, ValueError, requests.RequestException) as exc:
+        raise HTTPException(400, '图片保存失败，请确认文件格式、影片状态及媒体库写入权限') from exc
+    return {'ok': True}
+
+
+@app.delete('/api/tasks/{task_id}/artwork/{kind}/{index}')
+def remove_task_artwork(task_id: str, kind: Literal['cover', 'fanart'], index: int, request: Request,
+                        _: dict = Depends(current_user)):
+    _require_local_client(request, "删除图片文件")
+    try:
+        if index < 0:
+            raise ValueError('图片位置无效')
+        if task_id.startswith('media-'):
+            catalog_image(task_id, kind, index, delete=True)
+        else:
+            edit_task_artwork(task_id, kind, index, delete=True)
+    except (OSError, ValueError, requests.RequestException) as exc:
+        raise HTTPException(400, '图片删除失败，请刷新后重试并确认写入权限') from exc
+    return {'ok': True}
+
+
+def _public_media_server(server: dict) -> dict:
+    return {
+        "id": server.get("id", ""),
+        "name": server.get("name", ""),
+        "type": server.get("type", "emby"),
+        "url": server.get("url", ""),
+        "external_url": server.get("external_url", ""),
+        "api_key_set": bool(server.get("api_key")),
+        "auto_scan": bool(server.get("auto_scan")),
+        "auto_scan_delay": int(server.get("auto_scan_delay", 0) or 0),
+        "libraries": list(server.get("libraries") or []),
+    }
+
+
+def _media_server_from_body(body: MediaServerBody, current: dict | None = None) -> dict:
+    current = current or {}
+    return {
+        "id": current.get("id") or uuid.uuid4().hex,
+        "name": body.name.strip(),
+        "type": body.type,
+        "url": body.url.strip().rstrip("/"),
+        "external_url": body.external_url.strip().rstrip("/"),
+        "api_key": body.api_key.strip() if body.api_key else current.get("api_key", ""),
+        "auto_scan": body.auto_scan,
+        "auto_scan_delay": body.auto_scan_delay,
+        "libraries": [str(value).strip() for value in body.libraries if str(value).strip()],
+    }
+
+
+def _validate_media_server(server: dict, require_library: bool = True) -> None:
+    try:
+        libraries = list_media_libraries(server)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="媒体服务器连接失败: " + connection_error(exc)) from exc
+    available = {item["id"] for item in libraries}
+    selected = set(server.get("libraries") or [])
+    if require_library and available and not selected:
+        raise HTTPException(status_code=400, detail="请选择要管理的媒体库")
+    if selected - available:
+        raise HTTPException(status_code=400, detail="选择的媒体库不存在或已失效，请重新读取")
+    server["available_libraries"] = libraries
+
+
+def _find_media_server(server_id: str) -> tuple[int, dict] | tuple[None, None]:
+    for index, server in enumerate(list_media_servers()):
+        if server.get("id") == server_id:
+            return index, server
+    return None, None
+
+
+@app.get("/api/media-servers")
+def get_media_servers(_: dict = Depends(require_admin)) -> list[dict]:
+    return [_public_media_server(server) for server in list_media_servers()]
+
+
+@app.post("/api/media-servers")
+def create_media_server(body: MediaServerBody, _: dict = Depends(require_admin)) -> dict:
+    server = _media_server_from_body(body)
+    _validate_media_server(server)
+    server.pop("available_libraries", None)
+    servers = list_media_servers()
+    servers.append(server)
+    save_media_servers(servers)
+    clear_catalog_cache()
+    return _public_media_server(server)
+
+
+@app.put("/api/media-servers/{server_id}")
+def update_media_server(server_id: str, body: MediaServerBody, _: dict = Depends(require_admin)) -> dict:
+    index, current = _find_media_server(server_id)
+    if current is None or index is None:
+        raise HTTPException(status_code=404, detail="媒体服务器不存在")
+    server = _media_server_from_body(body, current)
+    _validate_media_server(server)
+    server.pop("available_libraries", None)
+    servers = list_media_servers()
+    servers[index] = server
+    save_media_servers(servers)
+    clear_catalog_cache()
+    return _public_media_server(server)
+
+
+@app.delete("/api/media-servers/{server_id}")
+def remove_media_server(server_id: str, _: dict = Depends(require_admin)) -> dict:
+    servers = [server for server in list_media_servers() if server.get("id") != server_id]
+    if len(servers) == len(list_media_servers()):
+        raise HTTPException(status_code=404, detail="媒体服务器不存在")
+    save_media_servers(servers)
+    clear_catalog_cache()
+    return {"ok": True}
+
+
+@app.post("/api/media-servers/{server_id}/sync")
+def sync_configured_media_server(server_id: str, _: dict = Depends(require_admin)) -> dict:
+    _, server = _find_media_server(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="媒体服务器不存在")
+    try:
+        clear_catalog_cache()
+        return sync_media_server(server)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="媒体库同步失败: " + connection_error(exc)) from exc
+
+
+@app.post("/api/media-servers/libraries")
+def probe_media_server_libraries(body: MediaServerBody, _: dict = Depends(require_admin)) -> dict:
+    current = {}
+    if body.server_id:
+        _, current = _find_media_server(body.server_id)
+        current = current or {}
+    server = _media_server_from_body(body, current)
+    try:
+        return {"libraries": list_media_libraries(server)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="媒体服务器连接失败: " + connection_error(exc)) from exc
+
+
+def _public_qbittorrent_settings(settings: dict) -> dict:
+    return {
+        "url": settings.get("url", "http://127.0.0.1:8080"),
+        "username": settings.get("username", ""),
+        "password_set": bool(settings.get("password")),
+    }
+
+
+def _qbittorrent_settings_from_body(body: QbittorrentSettingsBody, current: dict) -> dict:
+    return {
+        "url": body.url.strip().rstrip("/"),
+        "username": body.username.strip(),
+        "password": body.password if body.password else current.get("password", ""),
+    }
+
+
+@app.get("/api/qbittorrent/settings")
+def get_qbittorrent_config(_: dict = Depends(require_admin)) -> dict:
+    return _public_qbittorrent_settings(get_qbittorrent_settings())
+
+
+@app.put("/api/qbittorrent/settings")
+def update_qbittorrent_config(body: QbittorrentSettingsBody, _: dict = Depends(require_admin)) -> dict:
+    current = get_qbittorrent_settings()
+    settings = _qbittorrent_settings_from_body(body, current)
+    try:
+        test_connection(settings)
+    except QbittorrentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    save_qbittorrent_settings(settings)
+    return _public_qbittorrent_settings(settings)
+
+
+@app.post("/api/qbittorrent/test")
+def test_qbittorrent_config(body: QbittorrentSettingsBody, _: dict = Depends(require_admin)) -> dict:
+    current = get_qbittorrent_settings()
+    try:
+        result = test_connection(_qbittorrent_settings_from_body(body, current))
+    except QbittorrentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result}
+
+
+def _public_downloader(settings: dict) -> dict:
+    return {
+        "id": settings.get("id", ""),
+        "name": settings.get("name", "qBittorrent"),
+        "type": "qbittorrent",
+        "url": settings.get("url", ""),
+        "username": settings.get("username", ""),
+        "password_set": bool(settings.get("password")),
+    }
+
+
+def _downloader_from_body(body: DownloaderBody, current: dict | None = None) -> dict:
+    current = current or {}
+    return {
+        "id": current.get("id") or uuid.uuid4().hex,
+        "name": body.name.strip(),
+        "type": "qbittorrent",
+        "url": body.url.strip().rstrip("/"),
+        "username": body.username.strip(),
+        "password": body.password if body.password else current.get("password", ""),
+    }
+
+
+def _find_downloader(downloader_id: str) -> tuple[int, dict] | tuple[None, None]:
+    for index, downloader in enumerate(list_downloaders()):
+        if downloader.get("id") == downloader_id:
+            return index, downloader
+    return None, None
+
+
+@app.get("/api/downloaders")
+def get_downloaders(_: dict = Depends(require_admin)) -> list[dict]:
+    return [_public_downloader(downloader) for downloader in list_downloaders()]
+
+
+@app.post("/api/downloaders")
+def create_downloader(body: DownloaderBody, _: dict = Depends(require_admin)) -> dict:
+    downloader = _downloader_from_body(body)
+    try:
+        test_connection(downloader)
+    except QbittorrentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    downloaders = list_downloaders()
+    downloaders.append(downloader)
+    save_downloaders(downloaders)
+    return _public_downloader(downloader)
+
+
+@app.put("/api/downloaders/{downloader_id}")
+def update_downloader(downloader_id: str, body: DownloaderBody, _: dict = Depends(require_admin)) -> dict:
+    index, current = _find_downloader(downloader_id)
+    if current is None or index is None:
+        raise HTTPException(status_code=404, detail="下载器不存在")
+    downloader = _downloader_from_body(body, current)
+    try:
+        test_connection(downloader)
+    except QbittorrentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    downloaders = list_downloaders()
+    downloaders[index] = downloader
+    save_downloaders(downloaders)
+    return _public_downloader(downloader)
+
+
+@app.post("/api/downloaders/test")
+def test_downloader(body: DownloaderBody, _: dict = Depends(require_admin)) -> dict:
+    try:
+        result = test_connection(_downloader_from_body(body))
+    except QbittorrentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result}
+
+
+@app.post("/api/downloaders/{downloader_id}/test")
+def test_saved_downloader(downloader_id: str, body: DownloaderBody, _: dict = Depends(require_admin)) -> dict:
+    _, current = _find_downloader(downloader_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="下载器不存在")
+    try:
+        result = test_connection(_downloader_from_body(body, current))
+    except QbittorrentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result}
+
+
+@app.delete("/api/downloaders/{downloader_id}")
+def remove_downloader(downloader_id: str, _: dict = Depends(require_admin)) -> dict:
+    downloaders = list_downloaders()
+    filtered = [downloader for downloader in downloaders if downloader.get("id") != downloader_id]
+    if len(filtered) == len(downloaders):
+        raise HTTPException(status_code=404, detail="下载器不存在")
+    save_downloaders(filtered)
+    return {"ok": True}
+
+
+def _public_qbittorrent_management(settings: dict) -> dict:
+    rules = _auto_scrape_rules(settings)
+    first_rule = rules[0] if rules else {"enabled": False, "tags": "", "category": "", "preset_id": "default"}
+    return {
+        "takeover_enabled": bool(settings.get("takeover_enabled")),
+        "takeover_tags": settings.get("takeover_tags", ""),
+        "takeover_category": settings.get("takeover_category", ""),
+        "ratio_limit": settings.get("ratio_limit", -2),
+        "seeding_time_limit": settings.get("seeding_time_limit", -2),
+        "inactive_seeding_time_limit": settings.get("inactive_seeding_time_limit", -2),
+        "download_limit_kib": settings.get("download_limit_kib", -1),
+        "upload_limit_kib": settings.get("upload_limit_kib", -1),
+        "auto_remove": bool(settings.get("auto_remove")),
+        # Keep the legacy values in responses for clients from older packaged builds.
+        "auto_scrape_enabled": bool(first_rule.get("enabled")),
+        "auto_scrape_tags": first_rule.get("tags", ""),
+        "auto_scrape_category": first_rule.get("category", ""),
+        "auto_scrape_preset_id": first_rule.get("preset_id", "default"),
+        "auto_scrape_rules": rules,
+    }
+
+
+def _managed_download(item: dict, management: dict) -> bool:
+    if not management.get("takeover_enabled"):
+        return False
+    tags = {value.strip() for value in str(management.get("takeover_tags") or "").split(",") if value.strip()}
+    item_tags = {value.strip() for value in str(item.get("tags") or "").split(",") if value.strip()}
+    category = str(management.get("takeover_category") or "").strip()
+    return (not tags or bool(tags & item_tags)) and (not category or item.get("category") == category)
+
+
+def _apply_transfer_limits() -> tuple[int, list[str]]:
+    management = get_qbittorrent_management()
+    if not management.get("takeover_enabled"):
+        return 0, []
+    applied = 0
+    errors: list[str] = []
+    for settings in list_downloaders():
+        try:
+            managed = [item for item in list_downloads(settings) if _managed_download(item, management)]
+            for item in managed:
+                set_torrent_transfer_limits(settings, item["hash"], int(management.get("download_limit_kib", -1)), int(management.get("upload_limit_kib", -1)))
+            expected_download = 0 if int(management.get("download_limit_kib", -1)) < 0 else int(management["download_limit_kib"]) * 1024
+            expected_upload = 0 if int(management.get("upload_limit_kib", -1)) < 0 else int(management["upload_limit_kib"]) * 1024
+            refreshed = {item["hash"]: item for item in list_downloads(settings)}
+            for item in managed:
+                actual = refreshed.get(item["hash"])
+                if not actual or actual.get("download_limit") != expected_download or actual.get("upload_limit") != expected_upload:
+                    errors.append(f"{settings.get('name') or '下载器'}: qBittorrent 未确认 {item['name']} 的限速设置")
+                    continue
+                applied += 1
+        except QbittorrentError as exc:
+            errors.append(f"{settings.get('name') or '下载器'}: {exc}")
+    return applied, errors
+
+
+def _auto_scrape_rules(management: dict) -> list[dict]:
+    """Return the new multi-rule representation, upgrading a legacy saved rule."""
+    rules: list[dict] = []
+    raw_rules = management.get("auto_scrape_rules")
+    if isinstance(raw_rules, list):
+        for raw in raw_rules:
+            if not isinstance(raw, dict):
+                continue
+            rules.append({
+                "id": str(raw.get("id") or uuid.uuid4().hex[:12]),
+                "enabled": bool(raw.get("enabled", True)),
+                "tags": str(raw.get("tags") or "").strip(),
+                "category": str(raw.get("category") or "").strip(),
+                "preset_id": str(raw.get("preset_id") or "default").strip() or "default",
+            })
+    if not rules and management.get("auto_scrape_enabled"):
+        rules.append({
+            "id": "legacy-default",
+            "enabled": True,
+            "tags": str(management.get("auto_scrape_tags") or "").strip(),
+            "category": str(management.get("auto_scrape_category") or "").strip(),
+            "preset_id": str(management.get("auto_scrape_preset_id") or "default").strip() or "default",
+        })
+    return rules
+
+
+def _auto_scrape_match(item: dict, rule: dict) -> bool:
+    if not rule.get("enabled") or float(item.get("progress", 0) or 0) < 100:
+        return False
+    return _auto_scrape_download_matches(item, rule)
+
+
+def _auto_scrape_download_matches(item: dict, rule: dict) -> bool:
+    tags = {value.strip() for value in str(rule.get("tags") or "").split(",") if value.strip()}
+    item_tags = {value.strip() for value in str(item.get("tags") or "").split(",") if value.strip()}
+    category = str(rule.get("category") or "").strip()
+    return (not tags or bool(tags & item_tags)) and (not category or item.get("category") == category)
+
+
+def _map_download_path(source_path: str, mappings: list[dict]) -> str:
+    source = str(source_path or "").strip().replace("\\", "/").rstrip("/")
+    if not source:
+        return ""
+    for mapping in sorted(mappings, key=lambda item: len(str(item.get("source_path") or "")), reverse=True):
+        source_root = str(mapping.get("source_path") or "").strip().replace("\\", "/").rstrip("/")
+        target_root = str(mapping.get("target_path") or "").strip().rstrip("/\\")
+        if not source_root or not target_root:
+            continue
+        insensitive = os.name == "nt" or ":" in source_root
+        compared_source = source.lower() if insensitive else source
+        compared_root = source_root.lower() if insensitive else source_root
+        if compared_source == compared_root or compared_source.startswith(compared_root + "/"):
+            suffix = source[len(source_root):].lstrip("/")
+            return os.path.normpath(os.path.join(target_root, *suffix.split("/"))) if suffix else os.path.normpath(target_root)
+    return source_path
+
+
+def _check_download_auto_scrape_path(rule: dict) -> dict:
+    """Probe current qBittorrent paths before a download-auto-scrape rule is added."""
+    mappings = list_path_mappings()
+    candidates = 0
+    accessible = 0
+    issues: list[str] = []
+    for downloader in list_downloaders():
+        try:
+            downloads = list_downloads(downloader)
+        except QbittorrentError as exc:
+            issues.append(f"{downloader.get('name') or '下载器'} 无法读取：{exc}")
+            continue
+        for item in downloads:
+            if not _auto_scrape_download_matches(item, rule):
+                continue
+            source_path = str(item.get("content_path") or "").strip()
+            if not source_path:
+                continue
+            candidates += 1
+            mapped_path = _map_download_path(source_path, mappings)
+            if os.path.exists(mapped_path):
+                accessible += 1
+            else:
+                name = str(item.get("name") or item.get("hash") or "未命名任务")
+                issues.append(f"{name}：{source_path} 无法映射到当前环境可访问的文件")
+    return {
+        "ok": not any("无法映射" in issue for issue in issues),
+        "candidates": candidates,
+        "accessible": accessible,
+        "issues": issues,
+        "message": "未找到可验证的现有下载任务；规则已允许创建，首个匹配任务会再次校验路径。" if not candidates else "路径映射可识别当前匹配下载任务。",
+    }
+
+
+def _auto_scrape_downloads(downloader: dict, downloads: list[dict], management: dict) -> None:
+    rules = [rule for rule in _auto_scrape_rules(management) if rule.get("enabled")]
+    if not rules:
+        return
+    mappings = list_path_mappings()
+    history = load_auto_scrape_history()
+    changed = False
+    for item in downloads:
+        # A completed download starts at most one scrape. The first matching rule
+        # defines the preset so broad fallback rules can safely be placed last.
+        rule = next((candidate for candidate in rules if _auto_scrape_match(item, candidate)), None)
+        if rule is None:
+            continue
+        key = f"{downloader.get('id')}:{item.get('hash')}"
+        if key in history:
+            continue
+        preset_id = rule["preset_id"]
+        if not get_preset(preset_id):
+            continue
+        mapped_path = _map_download_path(str(item.get("content_path") or ""), mappings)
+        if not mapped_path or not os.path.exists(mapped_path):
+            continue
+        try:
+            created = create_tasks(mapped_path, preset_id, source="download")
+        except ValueError:
+            continue
+        history[key] = {
+            "id": key,
+            "created_at": now_iso(),
+            "downloader_id": str(downloader.get("id") or ""),
+            "downloader_name": str(downloader.get("name") or "下载器"),
+            "rule_id": str(rule.get("id") or ""),
+            "download_name": str(item.get("name") or ""),
+            "download_path": str(item.get("content_path") or ""),
+            "path": mapped_path,
+            "preset_id": preset_id,
+            "task_ids": [task["id"] for task in created],
+        }
+        changed = True
+    if changed:
+        save_auto_scrape_history(history)
+
+
+def _auto_remove_downloads(settings: dict, downloads: list[dict], management: dict) -> list[str]:
+    removed: list[str] = []
+    for item in downloads:
+        if not management.get("auto_remove") or item.get("progress", 0) < 100:
+            continue
+        ratio_limit = float(management.get("ratio_limit", -2))
+        seed_limit = int(management.get("seeding_time_limit", -2))
+        inactive_limit = int(management.get("inactive_seeding_time_limit", -2))
+        reached = (ratio_limit >= 0 and item.get("ratio", 0) >= ratio_limit) or (seed_limit >= 0 and item.get("seeding_time", 0) >= seed_limit * 60) or (inactive_limit >= 0 and item.get("inactive_seeding_time", 0) >= inactive_limit * 60)
+        if reached:
+            delete_torrent(settings, item["hash"])
+            removed.append(item["hash"])
+    return removed
+
+
+@app.get("/api/downloads/settings")
+def get_download_management(_: dict = Depends(require_admin)) -> dict:
+    return _public_qbittorrent_management(get_qbittorrent_management())
+
+
+@app.post("/api/downloads/auto-scrape/path-check")
+def check_download_auto_scrape_path(body: DownloadAutoScrapePathCheckBody, _: dict = Depends(require_admin)) -> dict:
+    return _check_download_auto_scrape_path({"enabled": True, "tags": body.tags.strip(), "category": body.category.strip()})
+
+
+@app.get("/api/download-auto-scrape-runs")
+def download_auto_scrape_runs(_: dict = Depends(require_admin)) -> list[dict]:
+    runs = [
+        {**entry, "id": str(entry.get("id") or run_id)}
+        for run_id, entry in load_auto_scrape_history().items()
+        if isinstance(entry, dict)
+    ]
+    return run_counts(sorted(runs, key=lambda item: str(item.get("created_at") or ""), reverse=True))
+
+
+@app.put("/api/downloads/settings")
+def update_download_management(body: QbittorrentManagementBody, _: dict = Depends(require_admin)) -> dict:
+    management = body.model_dump()
+    management["takeover_tags"] = management["takeover_tags"].strip()
+    management["takeover_category"] = management["takeover_category"].strip()
+    rules: list[dict] = []
+    seen_rule_ids: set[str] = set()
+    for rule in body.auto_scrape_rules:
+        rule_id = (rule.id or uuid.uuid4().hex[:12]).strip()
+        if not rule_id or rule_id in seen_rule_ids:
+            rule_id = uuid.uuid4().hex[:12]
+        seen_rule_ids.add(rule_id)
+        preset_id = rule.preset_id.strip() or "default"
+        if not get_preset(preset_id):
+            raise HTTPException(status_code=400, detail="指定的刮削预设不存在")
+        rules.append({
+            "id": rule_id,
+            "enabled": rule.enabled,
+            "tags": rule.tags.strip(),
+            "category": rule.category.strip(),
+            "preset_id": preset_id,
+        })
+    management["auto_scrape_rules"] = rules
+    # Preserve a meaningful legacy snapshot for an older executable sharing data.
+    first_rule = rules[0] if rules else {"enabled": False, "tags": "", "category": "", "preset_id": "default"}
+    management["auto_scrape_enabled"] = bool(first_rule["enabled"])
+    management["auto_scrape_tags"] = first_rule["tags"]
+    management["auto_scrape_category"] = first_rule["category"]
+    management["auto_scrape_preset_id"] = first_rule["preset_id"]
+    save_qbittorrent_management(management)
+    applied, errors = _apply_transfer_limits()
+    return {**_public_qbittorrent_management(management), "limit_applied_count": applied, "limit_apply_errors": errors}
+
+
+@app.get("/api/downloads")
+def downloads(_: dict = Depends(current_user)) -> dict:
+    from .download_cache import snapshots
+    management = get_qbittorrent_management()
+    result = snapshots(list_downloaders())
+    for snapshot in result:
+        snapshot.pop('checked', None)
+        for item in snapshot['items']:
+            item['managed'] = _managed_download(item, management)
+    return {"takeover_enabled": bool(management.get("takeover_enabled")), "downloaders": result}
+
+
+@app.get("/api/path-mappings")
+def get_path_mappings(_: dict = Depends(require_admin)) -> dict:
+    return {"mappings": list_path_mappings()}
+
+
+@app.put("/api/path-mappings")
+def update_path_mappings(body: PathMappingsBody, _: dict = Depends(require_admin)) -> dict:
+    mappings = [{"id": uuid.uuid4().hex[:12], "source_path": item.source_path.strip(), "target_path": item.target_path.strip()} for item in body.mappings]
+    save_path_mappings(mappings)
+    return {"mappings": mappings}
+
+
+@app.delete("/api/downloads/{downloader_id}/{torrent_hash}")
+def remove_managed_download(downloader_id: str, torrent_hash: str, _: dict = Depends(require_admin)) -> dict:
+    management = get_qbittorrent_management()
+    _, settings = _find_downloader(downloader_id)
+    if settings is None:
+        raise HTTPException(status_code=404, detail="下载器不存在")
+    try:
+        managed_hashes = {item["hash"] for item in list_downloads(settings) if _managed_download(item, management)}
+        if torrent_hash not in managed_hashes:
+            raise HTTPException(status_code=404, detail="该任务不在当前接管范围内")
+        delete_torrent(settings, torrent_hash)
+    except QbittorrentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+def _schedule_next_run(cron: str) -> str | None:
+    try:
+        return croniter(cron, local_now()).get_next(datetime).isoformat(timespec="minutes")
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _public_auto_scrape_schedule(schedule: dict) -> dict:
+    return {**schedule, "runs": run_counts(schedule.get('runs') or []), "next_run_at": _schedule_next_run(str(schedule.get("cron") or ""))}
+
+
+def _validate_auto_scrape_schedule(body: AutoScrapeScheduleBody) -> tuple[str, str, str]:
+    cron = body.cron.strip()
+    input_directory = body.input_directory.strip()
+    preset_id = body.preset_id.strip() or "default"
+    if not croniter.is_valid(cron):
+        raise HTTPException(status_code=400, detail="Cron 表达式无效，请使用标准五段格式，例如：0 2 * * *")
+    path = Path(os.path.abspath(os.path.expanduser(input_directory)))
+    if not path.is_dir():
+        raise HTTPException(status_code=400, detail="自动刮削目录不存在或不是文件夹")
+    if not get_preset(preset_id):
+        raise HTTPException(status_code=400, detail="指定的刮削预设不存在")
+    return cron, str(path), preset_id
+
+
+def _find_auto_scrape_schedule(schedule_id: str) -> tuple[int, dict | None]:
+    schedules = list_auto_scrape_schedules()
+    for index, schedule in enumerate(schedules):
+        if schedule.get("id") == schedule_id:
+            return index, schedule
+    return -1, None
+
+
+def _run_auto_scrape_schedule(schedule_id: str, run_key: str) -> tuple[dict, list[dict]]:
+    # A slow scrape must not cause the same cron rule to pile up new batches.
+    # The lock also closes the small race between the active-task check and creation.
+    with _auto_scrape_run_lock:
+        active_ids = active_schedule_task_ids(schedule_id)
+        if active_ids:
+            skipped = skip_auto_scrape_schedule_run(schedule_id, run_key, "上一次定时刮削尚未完成，已跳过本次运行")
+            if not skipped:
+                raise ValueError("本次定时运行已处理")
+            return skipped, []
+        claimed = claim_auto_scrape_schedule_run(schedule_id, run_key)
+        if not claimed:
+            raise ValueError("无法创建定时自动刮削运行记录")
+        try:
+            created = create_tasks(
+                str(claimed["input_directory"]),
+                str(claimed["preset_id"]),
+                source="schedule",
+                schedule_id=str(claimed["id"]),
+            )
+        except ValueError as exc:
+            if isinstance(exc, NoScrapeTasksError):
+                record_auto_scrape_schedule_empty(str(claimed["id"]), "未发现符合条件的影片，已跳过本次运行")
+                claimed["last_result"] = "未发现符合条件的影片，已跳过本次运行"
+                return claimed, []
+            record_auto_scrape_schedule_result(str(claimed["id"]), f"执行失败：{exc}")
+            raise
+        except Exception as exc:  # noqa: BLE001
+            record_auto_scrape_schedule_result(str(claimed["id"]), f"执行异常：{exc}")
+            raise
+        record_auto_scrape_schedule_result(str(claimed["id"]), f"已创建 {len(created)} 个任务", [str(task["id"]) for task in created])
+        return claimed, created
+
+
+@app.get("/api/auto-scrape-schedules")
+def get_auto_scrape_schedules(_: dict = Depends(require_admin)) -> list[dict]:
+    return [_public_auto_scrape_schedule(schedule) for schedule in list_auto_scrape_schedules()]
+
+
+@app.post("/api/auto-scrape-schedules")
+def create_auto_scrape_schedule(body: AutoScrapeScheduleBody, _: dict = Depends(require_admin)) -> dict:
+    cron, input_directory, preset_id = _validate_auto_scrape_schedule(body)
+    schedules = list_auto_scrape_schedules()
+    now = now_iso()
+    schedule = {
+        "id": uuid.uuid4().hex[:12],
+        "name": body.name.strip() or Path(input_directory).name or "自动刮削规则",
+        "enabled": body.enabled,
+        "cron": cron,
+        "input_directory": input_directory,
+        "preset_id": preset_id,
+        "created_at": now,
+        "updated_at": now,
+        "last_run_key": "",
+        "last_run_at": "",
+        "last_result": "尚未执行",
+        "runs": [],
+    }
+    schedules.append(schedule)
+    save_auto_scrape_schedules(schedules)
+    return _public_auto_scrape_schedule(schedule)
+
+
+@app.put("/api/auto-scrape-schedules/{schedule_id}")
+def update_auto_scrape_schedule(schedule_id: str, body: AutoScrapeScheduleBody, _: dict = Depends(require_admin)) -> dict:
+    cron, input_directory, preset_id = _validate_auto_scrape_schedule(body)
+    index, existing = _find_auto_scrape_schedule(schedule_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="自动刮削规则不存在")
+    schedules = list_auto_scrape_schedules()
+    schedule = {
+        **existing,
+        "name": body.name.strip() or Path(input_directory).name or "自动刮削规则",
+        "enabled": body.enabled,
+        "cron": cron,
+        "input_directory": input_directory,
+        "preset_id": preset_id,
+        "updated_at": now_iso(),
+    }
+    schedules[index] = schedule
+    save_auto_scrape_schedules(schedules)
+    return _public_auto_scrape_schedule(schedule)
+
+
+@app.post("/api/auto-scrape-schedules/{schedule_id}/run", status_code=202)
+def run_auto_scrape_schedule_now(schedule_id: str, _: dict = Depends(require_admin)) -> dict:
+    _, schedule = _find_auto_scrape_schedule(schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="自动刮削规则不存在")
+    try:
+        claimed, created = _run_auto_scrape_schedule(schedule_id, f"manual-{uuid.uuid4().hex}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    skipped = not created and claimed.get("last_result") == "上一次定时刮削尚未完成，已跳过本次运行"
+    return {"schedule_id": schedule_id, "run_id": claimed["last_run_key"], "count": len(created), "task_ids": [task["id"] for task in created], "skipped": skipped, "message": claimed.get("last_result", "")}
+
+
+@app.delete("/api/auto-scrape-schedules/{schedule_id}/runs/{run_id}")
+def delete_auto_scrape_run(schedule_id: str, run_id: str, _: dict = Depends(require_admin)) -> dict:
+    if not delete_auto_scrape_schedule_run(schedule_id, run_id):
+        raise HTTPException(status_code=404, detail="运行记录不存在")
+    return {"ok": True}
+
+
+@app.delete("/api/auto-scrape-schedules/{schedule_id}")
+def delete_auto_scrape_schedule(schedule_id: str, _: dict = Depends(require_admin)) -> dict:
+    schedules = list_auto_scrape_schedules()
+    filtered = [schedule for schedule in schedules if schedule.get("id") != schedule_id]
+    if len(filtered) == len(schedules):
+        raise HTTPException(status_code=404, detail="自动刮削规则不存在")
+    save_auto_scrape_schedules(filtered)
+    return {"ok": True}
+
+
+def _auto_scrape_schedule_worker() -> None:
+    while True:
+        now = local_now()
+        minute_key = now.strftime("%Y-%m-%dT%H:%M")
+        for schedule in list_auto_scrape_schedules():
+            if not schedule.get("enabled"):
+                continue
+            try:
+                due = croniter.match(str(schedule.get("cron") or ""), now)
+            except (TypeError, ValueError, KeyError):
+                continue
+            if not due:
+                continue
+            try:
+                _run_auto_scrape_schedule(str(schedule["id"]), minute_key)
+            except Exception:
+                # The execution helper has already saved the failure detail.
+                continue
+        # Wake frequently enough after start-up, while the minute claim prevents repeats.
+        time.sleep(10)
+
+
+threading.Thread(target=_auto_scrape_schedule_worker, name="auto-scrape-scheduler", daemon=True).start()
+
+
+def _torrent_limits_match(item: dict, management: dict) -> bool:
+    """True when the torrent already carries the configured limits.
+
+    qBittorrent accepts repeated identical writes, but every tick used to send three
+    requests per managed torrent (speed limits plus share limits). Skip the ones that
+    already match; a manual change in qBittorrent is still reverted on the next tick.
+    """
+    download = int(management.get("download_limit_kib", -1))
+    upload = int(management.get("upload_limit_kib", -1))
+    expected_download = 0 if download < 0 else download * 1024
+    expected_upload = 0 if upload < 0 else upload * 1024
+    if item.get("download_limit") != expected_download or item.get("upload_limit") != expected_upload:
+        return False
+    for key, fallback in (("ratio_limit", -2), ("seeding_time_limit", -2), ("inactive_seeding_time_limit", -2)):
+        try:
+            if float(item.get(key, fallback)) != float(management.get(key, fallback)):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _run_qbittorrent_management_once() -> None:
+    """One takeover/auto-scrape pass over every configured downloader."""
+    management = get_qbittorrent_management()
+    if not (management.get("takeover_enabled") or any(rule.get("enabled") for rule in _auto_scrape_rules(management))):
+        return
+    for settings in list_downloaders():
+        try:
+            downloads = list_downloads(settings)
+            managed = [item for item in downloads if _managed_download(item, management)]
+            if management.get("takeover_enabled"):
+                for item in managed:
+                    if _torrent_limits_match(item, management):
+                        continue
+                    set_torrent_transfer_limits(
+                        settings,
+                        item["hash"],
+                        int(management.get("download_limit_kib", -1)),
+                        int(management.get("upload_limit_kib", -1)),
+                    )
+                    set_share_limits(settings, item["hash"], management)
+                _auto_remove_downloads(settings, managed, management)
+            _auto_scrape_downloads(settings, downloads, management)
+        except QbittorrentError:
+            continue
+
+
+def _qbittorrent_management_worker() -> None:
+    while True:
+        try:
+            _run_qbittorrent_management_once()
+        except QbittorrentError:
+            pass
+        time.sleep(60)
+
+
+threading.Thread(target=_qbittorrent_management_worker, name="qbittorrent-management", daemon=True).start()
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def stop_task(task_id: str, _: dict = Depends(current_user)) -> dict:
+    if not cancel_task(task_id):
+        raise HTTPException(status_code=400, detail="任务当前不可取消")
+    return {"ok": True}
+
+
+@app.post("/api/tasks/cancel")
+def stop_tasks(body: CancelTasksBody, _: dict = Depends(current_user)) -> dict:
+    """停止排队中与运行中的任务；body.ids 为空表示停止全部。"""
+    return {"ok": True, "cancelled": cancel_tasks(set(body.ids) if body.ids else None)}
+
+
+@app.post("/api/tasks/{task_id}/images/retry")
+def retry_images(task_id: str, _: dict = Depends(current_user)) -> dict:
+    if not retry_task_images(task_id):
+        raise HTTPException(status_code=400, detail="该任务没有可重新下载的失败图片，或图片重试正在进行")
+    return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/cover/search", status_code=202)
+@app.post("/api/tasks/{task_id}/cover/google-search", status_code=202, include_in_schema=False)
+def search_task_cover_with_google(task_id: str, _: dict = Depends(current_user)) -> dict:
+    if not search_google_cover(task_id):
+        raise HTTPException(status_code=400, detail="任务不存在、封面已存在，或爬虫封面搜索正在进行")
+    return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/cover/upload")
+async def upload_task_cover(task_id: str, file: UploadFile = File(...), _: dict = Depends(current_user)) -> dict:
+    content = await file.read(16 * 1024 * 1024 + 1)
+    if not save_uploaded_cover(task_id, content):
+        raise HTTPException(status_code=400, detail="封面文件无效、过大，或该任务已有封面")
+    return {"ok": True}
+
+
+@app.get("/api/tasks/{task_id}/cover/candidates")
+@app.get("/api/tasks/{task_id}/cover/google-candidates", include_in_schema=False)
+def google_cover_candidates(task_id: str, _: dict = Depends(current_user)) -> dict:
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"candidates": task.get("google_cover_candidates") or [], "status": task.get("google_cover_search_status") or "idle", "error": task.get("google_cover_search_error") or ""}
+
+
+@app.get("/api/tasks/{task_id}/cover/candidates/{candidate_id}/thumbnail")
+def google_cover_candidate_thumbnail(task_id: str, candidate_id: str, _: dict = Depends(current_user)) -> Response:
+    try:
+        image = google_cover_thumbnail(task_id, candidate_id)
+    except (OSError, requests.RequestException, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="候选封面预览下载失败") from exc
+    if not image:
+        raise HTTPException(status_code=404, detail="候选封面不存在")
+    content, media_type = image
+    return Response(content=content, media_type=media_type, headers={"Cache-Control": "private, max-age=300"})
+
+
+@app.websocket("/api/tasks/{task_id}/cover/browser")
+async def google_cover_browser(task_id: str, websocket: WebSocket) -> None:
+    try:
+        current_user(websocket.cookies.get(SESSION_COOKIE))
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
+    if not google_captcha_browser_active(task_id):
+        await websocket.close(code=1008)
+        return
+    try:
+        reader, writer = await asyncio.open_connection(GOOGLE_VNC_HOST, GOOGLE_VNC_PORT)
+    except OSError:
+        await websocket.close(code=1011)
+        return
+    await websocket.accept()
+
+    async def client_to_vnc() -> None:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            payload = message.get("bytes")
+            if payload is None and message.get("text") is not None:
+                payload = message["text"].encode()
+            if payload:
+                writer.write(payload)
+                await writer.drain()
+
+    async def vnc_to_client() -> None:
+        while payload := await reader.read(65536):
+            await websocket.send_bytes(payload)
+
+    async def check_session() -> None:
+        # Existing browser connections must also lose access after revocation.
+        while True:
+            await asyncio.sleep(1)
+            try:
+                current_user(websocket.cookies.get(SESSION_COOKIE))
+            except HTTPException:
+                await websocket.close(code=1008)
+                return
+
+    client_task = asyncio.create_task(client_to_vnc())
+    vnc_task = asyncio.create_task(vnc_to_client())
+    session_task = asyncio.create_task(check_session())
+    tasks = {client_task, vnc_task, session_task}
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        writer.close()
+        await writer.wait_closed()
+
+
+@app.post("/api/tasks/{task_id}/cover/select")
+@app.post("/api/tasks/{task_id}/cover/google-select", include_in_schema=False)
+def select_task_cover_with_google(task_id: str, body: dict, _: dict = Depends(current_user)) -> dict:
+    candidate_id = str(body.get("candidate_id") or "")
+    if not candidate_id or not select_google_cover(task_id, candidate_id):
+        raise HTTPException(status_code=400, detail="封面候选项无效或下载正在进行")
+    return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/restore")
+def restore_files(task_id: str, request: Request, _: dict = Depends(current_user)) -> dict:
+    """把整理后的文件还原回原位（会移动/删除宿主文件），仅限本机。"""
+    _require_local_client(request, "还原文件")
+    if not restore_task_files(task_id):
+        raise HTTPException(status_code=400, detail="无法还原：原文件已存在、整理后文件不存在，或任务没有完整的整理记录")
+    return {"ok": True}
+
+
+@app.post("/api/tasks/delete")
+def remove_tasks(body: TaskDeleteBody, _: dict = Depends(current_user)) -> dict:
+    """Delete selected records in one transaction; running tasks are skipped."""
+    return delete_tasks(body.ids)
+
+
+@app.post("/api/tasks/purge")
+def purge_task_records(body: TaskPurgeBody, _: dict = Depends(require_admin)) -> dict:
+    """Preview or delete records by status, age and the current filter."""
+    roots = []
+    if body.view == 'overview' and body.group_by == 'library':
+        roots = next((library['roots'] for library in overview_libraries() if library['key'] == body.group), [])
+    return purge_tasks(statuses=body.statuses, before=body.before or '', include_scan=body.include_scan,
+                       merge_duplicates=body.merge_duplicates, dry_run=body.dry_run,
+                       view=body.view, query=body.query, field=body.field,
+                       size_min=body.size_min, size_max=body.size_max,
+                       date_from=body.date_from, date_to=body.date_to,
+                       group_by=body.group_by, group=body.group, group_roots=roots)
+
+
+@app.delete("/api/tasks/{task_id}")
+def remove_task(task_id: str, _: dict = Depends(current_user)) -> dict:
+    if not delete_task(task_id):
+        raise HTTPException(status_code=400, detail="任务不存在或仍在运行，请先停止任务")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- 媒体库（磁盘目录索引）
+# 一个媒体库 = 一个名字 + 多个文件夹；数据源是磁盘上的视频/NFO/图片，任务记录只是历史。
+# 读写细节在 library_store.py，这里只做参数校验、权限与错误映射。
+class LibraryCreateBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    preset_id: str = "default"
+    folders: list[dict] = Field(default_factory=list, max_length=50)
+    scan: bool = True
+    kind: Literal["movie", "series"] = "movie"
+
+
+class LibraryOrderBody(BaseModel):
+    """顶部标签栏的拖拽排序结果（媒体库 id 的完整顺序）。"""
+    ids: list[str] = Field(default_factory=list, max_length=200)
+
+
+class LibraryUpdateBody(BaseModel):
+    name: str | None = Field(default=None, max_length=80)
+    preset_id: str | None = None
+    kind: Literal["movie", "series"] | None = None
+
+
+class LibraryFolderBody(BaseModel):
+    path: str = Field(min_length=1, max_length=2048)
+    recursive: bool = True
+    name: str = Field(default="", max_length=80)
+    scan: bool = True
+
+
+class LibraryFolderUpdateBody(BaseModel):
+    recursive: bool | None = None
+    name: str | None = Field(default=None, max_length=80)
+
+
+class LibraryFilmBody(BaseModel):
+    dvdid: str = Field(default="", max_length=64)
+    # 普通电影/剧集的外部 ID：前端资料页可编辑，缺了会被 FastAPI 静默丢弃
+    tmdb_id: str = Field(default="", max_length=32)
+    imdb_id: str = Field(default="", max_length=32)
+    title: str = Field(default="", max_length=1000)
+    original_title: str = Field(default="", max_length=1000)
+    plot: str = Field(default="", max_length=20000)
+    release_date: str = Field(default="", max_length=32)
+    studio: str = Field(default="", max_length=300)
+    publisher: str = Field(default="", max_length=300)
+    director: str = Field(default="", max_length=300)
+    runtime: int = Field(default=0, ge=0, le=640000)
+    actress: list[str] = Field(default_factory=list, max_length=100)
+    # 剧集季编号：决定刮削取 TMDb 的哪一季
+    season_number: int = Field(default=0, ge=0, le=200)
+    write_nfo: bool = True
+    expected_nfo_mtime: float | None = None
+
+
+class LibraryNfoBody(BaseModel):
+    content: str = Field(min_length=1, max_length=2_000_000)
+    expected_mtime: float | None = None
+
+
+class LibraryScrapeBody(BaseModel):
+    dvdid: str | None = Field(default=None, max_length=64)
+    preset_id: str | None = None
+
+
+class LibraryBatchScrapeBody(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=2000)
+    library_id: str = ""
+    folder_id: str = ""
+    status: str = ""
+    query: str = Field(default="", max_length=200)
+    group_by: str = ""
+    group: str = Field(default="", max_length=200)
+    preset_id: str | None = None
+    limit: int = Field(default=2000, ge=1, le=5000)
+
+
+def _library_film_or_404(film_id: str, reconcile: bool = True) -> dict:
+    film = library_store.get_film(film_id, reconcile=reconcile)
+    if not film:
+        raise HTTPException(status_code=404, detail="影片不存在")
+    return film
+
+
+def _library_or_404(library_id: str) -> dict:
+    library = library_store.get_library(library_id)
+    if not library:
+        raise HTTPException(status_code=404, detail="媒体库不存在")
+    return library
+
+
+@app.get("/api/library/libraries")
+def library_libraries(_: dict = Depends(current_user)) -> dict:
+    return {"libraries": library_store.list_libraries()}
+
+
+@app.post("/api/library/libraries", status_code=201)
+def create_library(body: LibraryCreateBody, _: dict = Depends(require_admin)) -> dict:
+    try:
+        library = library_store.add_library(body.name, body.preset_id, body.folders, body.kind)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    scan = None
+    if body.scan and library["folders"]:
+        try:
+            scan = library_store.start_scan(library["id"])
+        except ValueError:
+            scan = None
+    return {"library": library_store.get_library(library["id"]), "scan": scan}
+
+
+@app.put("/api/library/libraries/order")
+def reorder_libraries(body: LibraryOrderBody, _: dict = Depends(current_user)) -> dict:
+    """保存媒体库标签顺序：只是界面顺序，登录用户都能调整。"""
+    return {"libraries": library_store.reorder_libraries(body.ids)}
+
+
+@app.put("/api/library/libraries/{library_id}")
+def update_library(library_id: str, body: LibraryUpdateBody, _: dict = Depends(require_admin)) -> dict:
+    _library_or_404(library_id)
+    try:
+        library = library_store.update_library(library_id, name=body.name.strip() if body.name is not None else None,
+                                               preset_id=body.preset_id, kind=body.kind)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"library": library}
+
+
+@app.delete("/api/library/libraries/{library_id}")
+def delete_library(library_id: str, _: dict = Depends(require_admin)) -> dict:
+    """只删除索引，磁盘上的视频、NFO 与图片不受影响"""
+    _library_or_404(library_id)
+    library_store.delete_library(library_id)
+    return {"ok": True}
+
+
+@app.post("/api/library/libraries/{library_id}/folders", status_code=201)
+def add_library_folder(library_id: str, body: LibraryFolderBody, _: dict = Depends(require_admin)) -> dict:
+    _library_or_404(library_id)
+    try:
+        folder = library_store.add_folder(library_id, body.path, body.recursive, body.name)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    scan = None
+    if body.scan:
+        try:
+            scan = library_store.start_scan(library_id)
+        except ValueError:
+            scan = None
+    return {"folder": folder, "library": library_store.get_library(library_id), "scan": scan}
+
+
+@app.put("/api/library/libraries/{library_id}/folders/{folder_id}")
+def update_library_folder(library_id: str, folder_id: str, body: LibraryFolderUpdateBody,
+                          _: dict = Depends(require_admin)) -> dict:
+    _library_or_404(library_id)
+    folder = library_store.update_folder(folder_id, recursive=body.recursive,
+                                         name=body.name.strip() if body.name is not None else None)
+    if not folder:
+        raise HTTPException(status_code=404, detail="文件夹不存在")
+    return {"folder": folder, "library": library_store.get_library(library_id)}
+
+
+@app.delete("/api/library/libraries/{library_id}/folders/{folder_id}")
+def remove_library_folder(library_id: str, folder_id: str, _: dict = Depends(require_admin)) -> dict:
+    _library_or_404(library_id)
+    if not library_store.remove_folder(library_id, folder_id):
+        raise HTTPException(status_code=404, detail="该媒体库里没有这个文件夹")
+    return {"ok": True, "library": library_store.get_library(library_id)}
+
+
+@app.post("/api/library/libraries/{library_id}/scan", status_code=202)
+def scan_library(library_id: str, _: dict = Depends(current_user)) -> dict:
+    try:
+        return {"scan": library_store.start_scan(library_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/library/scans/{scan_id}")
+def library_scan(scan_id: str, _: dict = Depends(current_user)) -> dict:
+    scan = library_store.get_scan(scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="扫描记录不存在")
+    return {"scan": scan}
+
+
+@app.get("/api/library/films")
+def library_films(library_id: str = "", folder_id: str = "", status: str = "",
+                  query: str = Query(default="", max_length=200),
+                  group_by: str = "", group: str = Query(default="", max_length=200), sort: str = "updated",
+                  direction: Literal["asc", "desc"] = "desc",
+                  kind: str = "", parent: str = "", season: int | None = None,
+                  limit: int = Query(default=48, ge=1, le=200), offset: int = Query(default=0, ge=0),
+                  _: dict = Depends(current_user)) -> dict:
+    """影片墙 / 剧集墙 / 分集列表共用：kind=series 时额外带季数与集数。"""
+    payload = library_store.list_films(library_id, folder_id, status, query.strip(), group_by, group,
+                                       sort, direction, limit, offset, kind, parent, season)
+    if kind == "series":
+        counts = library_store.series_stats(library_id, parent)
+        for item in payload["items"]:
+            stat = counts.get(item["id"]) or {}
+            item["episode_count"] = stat.get("episodes", 0)
+            item["season_count"] = stat.get("seasons", 0)
+    return payload
+
+
+@app.get("/api/library/series/{film_id}/seasons")
+def library_series_seasons(film_id: str, _: dict = Depends(current_user)) -> dict:
+    """剧集的季列表 + 观看进度：分集是分页的，季标签和「看到哪」必须单独取。"""
+    film = library_store.get_film(film_id)
+    if not film:
+        raise HTTPException(status_code=404, detail="剧集不存在")
+    if film.get("kind") != "series":
+        raise HTTPException(status_code=400, detail="这不是剧集条目")
+    seasons = library_store.series_seasons(film_id)
+    return {"seasons": seasons, "episodes": sum(entry["episodes"] for entry in seasons),
+            "progress": library_store.series_progress(film_id)}
+
+
+class LibraryProgressBody(BaseModel):
+    position: float = Field(default=0, ge=0)
+    duration: float = Field(default=0, ge=0)
+
+
+@app.put("/api/library/films/{film_id}/progress")
+def library_film_progress(film_id: str, body: LibraryProgressBody,
+                          _: dict = Depends(current_user)) -> dict:
+    """记录播放进度（电影与分集共用），跨设备共享。"""
+    try:
+        return {"progress": library_store.save_progress(film_id, body.position, body.duration)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/library/films/{film_id}/progress")
+def library_film_progress_clear(film_id: str, _: dict = Depends(current_user)) -> dict:
+    return {"ok": library_store.clear_progress(film_id)}
+
+
+@app.post("/api/library/films/{film_id}/refresh")
+def library_film_refresh(film_id: str, _: dict = Depends(require_admin)) -> dict:
+    """剧集库的「刷新」：重新读取 tvshow.nfo 与分集 NFO（不联网）。"""
+    try:
+        film = library_store.refresh_series(film_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"film": film}
+
+
+@app.get("/api/library/films/{film_id}")
+def library_film(film_id: str, _: dict = Depends(current_user)) -> dict:
+    return {"film": _library_film_or_404(film_id)}
+
+
+@app.patch("/api/library/films/{film_id}")
+def update_library_film(film_id: str, body: LibraryFilmBody, _: dict = Depends(require_admin)) -> dict:
+    _library_film_or_404(film_id, reconcile=False)
+    try:
+        film = library_store.update_film(film_id, body.model_dump(), body.write_nfo, body.expected_nfo_mtime)
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"保存资料失败：{exc}") from exc
+    return {"film": film}
+
+
+class LibrarySeasonNfoBody(BaseModel):
+    season: int = Field(default=1, ge=0)
+    content: str = ""
+    expected_mtime: float | None = None
+
+
+@app.get("/api/library/series/{film_id}/season-nfo")
+def library_season_nfo(film_id: str, season: int = 1, _: dict = Depends(current_user)) -> dict:
+    """某一季的 season.nfo：多季时放在 Sxx 子目录，单季放在剧集目录。"""
+    try:
+        return library_store.read_season_nfo(film_id, season)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/library/series/{film_id}/season-nfo")
+def library_season_nfo_write(film_id: str, body: LibrarySeasonNfoBody,
+                             _: dict = Depends(require_admin)) -> dict:
+    try:
+        return library_store.write_season_nfo(film_id, body.season, body.content, body.expected_mtime)
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class LibrarySeasonScrapeBody(BaseModel):
+    season: int = Field(default=1, ge=0, le=200)
+
+
+@app.post("/api/library/series/{film_id}/season-scrape", status_code=202)
+def library_season_scrape(film_id: str, body: LibrarySeasonScrapeBody,
+                          _: dict = Depends(require_admin)) -> dict:
+    """按 TMDb 取一整季的分集资料，写入各集 NFO 与 season.nfo。
+
+    同步执行（一次 HTTP 请求即可取回整季，通常 1-3 秒），
+    返回已写入的集数与缺失的集号。
+    """
+    film = _library_film_or_404(film_id, reconcile=False)
+    if film.get("kind") != "series":
+        raise HTTPException(status_code=400, detail="只有剧集可以刮削分集")
+    tmdb_id = str(film.get("tmdb_id") or "").strip()
+    if not tmdb_id:
+        raise HTTPException(status_code=400, detail="这部剧还没有 TMDb ID，请先刮削剧集资料或手动填写")
+    preset_id = library_store.library_preset_for_folder(film["root_id"]) or "default"
+    preset = get_preset(preset_id) or {}
+    crawler = ((preset.get("form") or {}).get("crawler") or {})
+    nodes = [{"name": str(name)} for name in (crawler.get("scrapers") or []) if str(name).strip()]
+    try:
+        from . import native_scrape
+        outcome = native_scrape.scrape_season(tmdb_id, body.season, nodes)
+        if not outcome.get("ok"):
+            raise HTTPException(status_code=400, detail=outcome.get("error") or "取分集资料失败")
+        result = library_store.apply_season_result(film_id, body.season, outcome.get("data") or {})
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"film": library_store.get_film(film_id, reconcile=False), **result}
+
+
+@app.get("/api/library/films/{film_id}/nfo")
+def library_film_nfo(film_id: str, _: dict = Depends(current_user)) -> dict:
+    _library_film_or_404(film_id, reconcile=False)
+    return library_store.read_nfo(film_id) or {}
+
+
+@app.put("/api/library/films/{film_id}/nfo")
+def write_library_film_nfo(film_id: str, body: LibraryNfoBody, _: dict = Depends(require_admin)) -> dict:
+    _library_film_or_404(film_id, reconcile=False)
+    try:
+        film = library_store.write_raw_nfo(film_id, body.content, body.expected_mtime)
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"写入 NFO 失败：{exc}") from exc
+    return {"film": film, "nfo": library_store.read_nfo(film_id)}
+
+
+@app.post("/api/library/films/{film_id}/scrape", status_code=202)
+def scrape_library_film(film_id: str, body: LibraryScrapeBody, _: dict = Depends(require_admin)) -> dict:
+    try:
+        return library_store.start_scrape(film_id, body.dvdid, body.preset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class FilmChoiceBody(BaseModel):
+    """用户在候选面板里选定的一项。"""
+    tmdb_id: str | None = Field(default=None, max_length=32)
+    imdb_id: str | None = Field(default=None, max_length=32)
+    preset_id: str | None = Field(default=None, max_length=80)
+
+
+@app.get("/api/library/films/{film_id}/candidates")
+def library_film_candidates(film_id: str, _: dict = Depends(current_user)) -> dict:
+    """返回这部影片最近的候选列表（标题路径多结果时）。
+
+    候选来自任务记录；没有候选时返回空列表，前端据此不显示面板。
+    """
+    film = library_store.get_film(film_id, reconcile=False)
+    if not film:
+        raise HTTPException(status_code=404, detail="影片不存在")
+    task_id = str(film.get("last_task_id") or "")
+    record = None
+    if task_id:
+        from .task_store import record as task_record
+        record = task_record(task_id, logs=False)
+    candidates = list((record or {}).get("scrape_candidates") or [])
+    return {
+        "candidates": candidates,
+        "status": (record or {}).get("status") or "",
+        "query": (record or {}).get("scrape_query") or {},
+        "task_id": task_id,
+    }
+
+
+@app.post("/api/library/films/{film_id}/choose", status_code=202)
+def choose_library_film(film_id: str, body: FilmChoiceBody, _: dict = Depends(require_admin)) -> dict:
+    """用户从候选里选定一部：记下外部 ID，并按该 ID 立即重刮。"""
+    try:
+        return library_store.start_scrape_with_external(
+            film_id, tmdb_id=body.tmdb_id, imdb_id=body.imdb_id, preset_id=body.preset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/library/films/scrape", status_code=202)
+def scrape_library_films(body: LibraryBatchScrapeBody, _: dict = Depends(require_admin)) -> dict:
+    """批量刮削：按当前筛选范围（库/文件夹/状态/搜索/分组）或显式 ids 入队。
+
+    已完整的影片同样可以入队，用于补齐 NFO 里缺的字段；预设的必需字段仍然生效。
+    """
+    film_ids = list(dict.fromkeys(body.ids))
+    if not film_ids:
+        film_ids = library_store.film_ids(body.library_id, body.folder_id, body.status,
+                                          body.query.strip(), body.group_by, body.group, body.limit)
+    accepted: list[str] = []
+    skipped: list[dict] = []
+    for film_id in film_ids:
+        try:
+            accepted.append(library_store.start_scrape(film_id, None, body.preset_id)["task_id"])
+        except ValueError as exc:
+            skipped.append({"id": film_id, "reason": str(exc)})
+    return {"accepted": accepted, "skipped": skipped, "total": len(film_ids)}
+
+
+@app.get("/api/library/groups")
+def library_groups(by: str = "actress", library_id: str = "", folder_id: str = "",
+                   query: str = Query(default="", max_length=200), _: dict = Depends(current_user)) -> dict:
+    try:
+        return library_store.groups(by, library_id, query.strip(), folder_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# explorer 对超过 MAX_PATH 的路径会解析失败，直接打开“文档”目录；
+# 240 字符以上先换 8.3 短路径，再不行就退回打开父目录。
+_WINDOWS_REVEAL_LIMIT = 240
+
+
+def _windows_short_path(target: Path) -> str:
+    """返回 Windows 8.3 短路径；卷上关闭了短名生成时返回空串。"""
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = ctypes.windll.kernel32.GetShortPathNameW(str(target), buffer, len(buffer))
+        if 0 < size < len(buffer):
+            return buffer.value
+    except Exception:  # noqa: BLE001 - 拿不到短路径就退回其它方式
+        pass
+    return ""
+
+
+def _reveal_command(target: Path) -> list[str] | None:
+    """构造打开命令；返回 None 表示应改用 startfile 打开父目录。"""
+    if os.name == "nt":
+        if target.is_file():
+            candidate = str(target)
+            if len(candidate) > _WINDOWS_REVEAL_LIMIT:
+                short = _windows_short_path(target)
+                if not short:
+                    return None
+                candidate = short
+            return ["explorer", f"/select,{candidate}"]
+        candidate = str(target)
+        if len(candidate) > _WINDOWS_REVEAL_LIMIT:
+            short = _windows_short_path(target)
+            if not short:
+                return None
+            candidate = short
+        return ["explorer", candidate]
+    if sys.platform == "darwin":
+        return ["open", "-R", str(target)]
+    return ["xdg-open", str(target.parent if target.is_file() else target)]
+
+
+def _window_class(hwnd: int) -> str:
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(256)
+        if ctypes.windll.user32.GetClassNameW(hwnd, buffer, 256):
+            return buffer.value
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _foreground_explorer_window(keywords, timeout: float = 6.0) -> None:
+    """把刚打开的资源管理器窗口提到前台。
+
+    explorer 由后台进程启动时不会自动置前，Windows 也限制后台进程 SetForegroundWindow；
+    这里先交给前台线程（AttachThreadInput）再调用，成功率最高。失败不影响打开结果。
+    """
+    if os.name != "nt":
+        return
+    names = [str(name).casefold() for name in (keywords or []) if str(name).strip()]
+    if not names:
+        return
+    try:
+        import ctypes
+        import time as _time
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        matches: list[int] = []
+
+        def collect(hwnd, _param):
+            # 只认资源管理器文件窗口，避免误抓其它标题相近的窗口
+            if _window_class(hwnd) != "CabinetWClass":
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length:
+                buffer = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buffer, length + 1)
+                title = buffer.value.casefold()
+                if any(name in title for name in names):
+                    matches.append(hwnd)
+            return True
+
+        callback = EnumProc(collect)
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            matches.clear()
+            user32.EnumWindows(callback, 0)
+            if matches:
+                hwnd = matches[0]
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                foreground = user32.GetForegroundWindow()
+                current = kernel32.GetCurrentThreadId()
+                target_thread = user32.GetWindowThreadProcessId(foreground, None)
+                attached = False
+                if target_thread and target_thread != current:
+                    attached = bool(user32.AttachThreadInput(current, target_thread, True))
+                user32.BringWindowToTop(hwnd)
+                if not user32.SetForegroundWindow(hwnd):
+                    # 系统仍拒绝时至少切一次并闪烁任务栏，提示用户切换
+                    try:
+                        user32.SwitchToThisWindow(hwnd, True)
+                        user32.FlashWindow(hwnd, True)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if attached:
+                    user32.AttachThreadInput(current, target_thread, False)
+                return
+            _time.sleep(0.15)
+    except Exception:  # noqa: BLE001 - 置顶失败不应影响“打开目录”
+        pass
+
+
+def _focus_opened_folder(*names: str) -> None:
+    """后台线程把对应目录的资源管理器窗口提到前台。"""
+    threading.Thread(target=_foreground_explorer_window, args=(list(names),), daemon=True).start()
+
+
+def _reveal_in_file_manager(target: Path) -> Path:
+    """在本机文件管理器里定位文件；仅用于非容器部署。返回打开的目标（文件或目录）。"""
+    folder = target.parent if target.is_file() else target
+    try:
+        if os.name == "nt":
+            command = _reveal_command(target)
+            if command is None:
+                # 超长且文件没有短路径：至少把所在目录打开（目录也可能超长，再试一次短路径）
+                os.startfile(_windows_short_path(folder) or str(folder))
+            else:
+                subprocess.Popen(command)
+            short_folder = Path(_windows_short_path(folder)).name if _windows_short_path(folder) else ''
+            _focus_opened_folder(folder.name, short_folder)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"无法打开文件管理器：{exc}") from exc
+    return folder
+
+
+@app.post("/api/library/films/{film_id}/reveal")
+def reveal_library_film(film_id: str, request: Request, _: dict = Depends(current_user)) -> dict:
+    """打开影片所在目录。路径来自索引，不接受任意路径；只允许本机调用。"""
+    if not _is_local_client(request):
+        raise HTTPException(status_code=403, detail="只有运行服务的主机才能打开文件管理器")
+    film = _library_film_or_404(film_id, reconcile=False)
+    if IS_DOCKER:
+        raise HTTPException(status_code=400, detail="容器部署无法打开宿主机的文件夹，请在宿主机上打开对应路径")
+    raw = str(film.get("video_path") or film.get("dir_path") or "")
+    if not raw:
+        raise HTTPException(status_code=404, detail="影片没有记录文件路径")
+    target = Path(raw)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="文件已不存在，无法打开所在目录")
+    opened = _reveal_in_file_manager(target)
+    return {"ok": True, "path": str(opened)}
+
+
+class PlaybackStopBody(BaseModel):
+    server_id: str = ""
+    play_session_id: str = ""
+
+
+_VIDEO_MEDIA_TYPES = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+    ".webm": "video/webm",
+}
+
+
+def _video_media_type(path: Path) -> str:
+    return _VIDEO_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
+
+
+@app.get("/api/library/films/{film_id}/playback")
+def library_film_playback(film_id: str, prefer: Literal['auto', 'emby', 'local'] = 'auto',
+                          start: int = Query(default=0, ge=0, le=86400 * 24),
+                          _: dict = Depends(current_user)) -> dict:
+    """媒体库播放地址：默认先本地直连，播不了再走媒体服务器转码；可指定起点。"""
+    film = _library_film_or_404(film_id, reconcile=False)
+    try:
+        return film_playback(film, prefer, start)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=connection_error(exc)) from exc
+
+
+@app.post("/api/library/films/{film_id}/playback/stop")
+def library_film_playback_stop(film_id: str, body: "PlaybackStopBody | None" = None,
+                               _: dict = Depends(current_user)) -> dict:
+    """关闭播放器时调用：立刻结束媒体服务器的转码会话，避免磁盘/网络继续被占满。"""
+    _library_film_or_404(film_id, reconcile=False)
+    stopped_local = stop_stream(film_id)
+    result = stop_playback(body.server_id if body else "", body.play_session_id if body else "")
+    result["stopped_local"] = stopped_local
+    return result
+
+
+@app.get("/api/library/films/{film_id}/stream")
+def library_film_stream(film_id: str, request: Request, _: dict = Depends(current_user)):
+    """本地直连播放：只接受索引里的文件路径，由 FileResponse 处理 Range（拖动进度）。"""
+    film = _library_film_or_404(film_id, reconcile=False)
+    if film.get("detached") and not Path(str(film.get("video_path") or "")).is_file():
+        raise HTTPException(status_code=404, detail="文件已不在原位置，请先重新扫描媒体库")
+    target = Path(str(film.get("video_path") or ""))
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="视频文件不存在或不可访问")
+    if target.suffix.lower() not in LOCAL_PLAYABLE_SUFFIXES:
+        raise HTTPException(status_code=415, detail="这不是可播放的视频文件")
+    tag = str(film.get("dvdid") or "") or film_id
+    return file_stream_response(request, target, tag=tag)
+
+
+@app.get("/api/library/films/{film_id}/gallery")
+def library_film_gallery(film_id: str, _: dict = Depends(current_user)) -> dict:
+    """影片的全部本地图片：竖版海报、横版图、剧照与目录内其它图片。"""
+    _library_film_or_404(film_id, reconcile=False)
+    return {"items": library_store.film_gallery(film_id)}
+
+
+@app.get("/api/library/films/{film_id}/asset")
+def library_film_asset(film_id: str, path: str, request: Request,
+                       _: dict = Depends(current_user)) -> Response:
+    """按文件名取影片目录/剧照目录里的图片（用于详情页图片墙）。"""
+    target = library_store.film_asset_path(film_id, path)
+    if target is None:
+        raise HTTPException(status_code=404, detail="图片不存在")
+    try:
+        data = target.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="图片不可读") from exc
+    etag = 'W/"' + hashlib.sha256(data).hexdigest() + '"'
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=300"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    lowered = target.name.lower()
+    media_type = ("image/png" if lowered.endswith(".png")
+                  else "image/webp" if lowered.endswith(".webp") else "image/jpeg")
+    return Response(content=data, media_type=media_type, headers=headers)
+
+
+@app.get("/api/library/films/{film_id}/thumbnail")
+def library_film_thumbnail(film_id: str, request: Request, _: dict = Depends(current_user)) -> Response:
+    """视频预览帧：没刮到封面的影片，用视频里的画面代替空白。
+
+    命中缓存立即返回；未命中且 ffmpeg 可用时现截一张。
+    没有 ffmpeg 或截不到时返回 404，前端保持原有占位。
+    """
+    film = _library_film_or_404(film_id, reconcile=False)
+    runtime_sec = int(film.get("runtime") or 0) * 60  # NFO 里的时长是分钟
+    video = str(film.get("video_path") or "")
+    # 剧集本身没有视频：用第一集当预览，卡片上才有画面可看
+    if not video:
+        episodes = [str(item) for item in (film.get("files") or []) if str(item)]
+        video = episodes[0] if episodes else ""
+
+    target = thumbnails.existing_thumbnail(film_id, runtime_sec)
+    if target is None and thumbnails.available():
+        # NFO 没写时长时，先探一次真实时长，截图点能更靠后（画面内容更丰富）
+        if runtime_sec <= 0:
+            runtime_sec = thumbnails.probe_duration(video)
+        target = thumbnails.capture(film_id, video, runtime_sec)
+    if target is None:
+        raise HTTPException(status_code=404, detail="暂无视频预览")
+
+    try:
+        data = target.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="预览图不可读") from exc
+    etag = 'W/"' + hashlib.sha256(data).hexdigest() + '"'
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=3600"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    return Response(content=data, media_type="image/jpeg", headers=headers)
+
+
+@app.get("/api/library/films/{film_id}/cover")
+def library_film_cover(film_id: str, request: Request, _: dict = Depends(current_user)) -> Response:
+    film = _library_film_or_404(film_id, reconcile=False)
+    cover = str(film.get("cover_path") or "")
+    # NFO 里的 <thumb> 可能直接是网络地址，重定向过去即可（Web 与安卓都跟随重定向）。
+    if cover.lower().startswith(("http://", "https://")):
+        return RedirectResponse(cover, status_code=302)
+    if not cover or not Path(cover).is_file():
+        raise HTTPException(status_code=404, detail="封面不存在")
+    try:
+        data = Path(cover).read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="封面不可读") from exc
+    etag = 'W/"' + hashlib.sha256(data).hexdigest() + '"'
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=300"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    lowered = cover.lower()
+    media_type = "image/png" if lowered.endswith(".png") else "image/webp" if lowered.endswith(".webp") else "image/jpeg"
+    return Response(content=data, media_type=media_type, headers=headers)
+
+
+@app.get("/api/library/films/{film_id}/fanart")
+def library_film_fanart(film_id: str, request: Request, _: dict = Depends(current_user)) -> Response:
+    """横版图（Backdrop / Thumb）。
+
+    按 Emby 规则：横版是 `fanart` / `backdrop` / `landscape` 等，
+    `-poster` 属于竖版 Primary，不会出现在这里。
+    预设里 `fanart.basename_pattern` 配成 `{filename}-fanart` 即可产出横版图。
+    """
+    film = _library_film_or_404(film_id, reconcile=False)
+    fanart = str(film.get("fanart_path") or "")
+    # 没有独立横版图时，退回到竖版封面（前端会按 contain 处理，不会拉伸变形）
+    if not fanart:
+        return library_film_cover(film_id, request, _)
+    if fanart.lower().startswith(("http://", "https://")):
+        return RedirectResponse(fanart, status_code=302)
+    if not Path(fanart).is_file():
+        return library_film_cover(film_id, request, _)
+    try:
+        data = Path(fanart).read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="横版图不可读") from exc
+    etag = 'W/"' + hashlib.sha256(data).hexdigest() + '"'
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=300"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    lowered = fanart.lower()
+    media_type = "image/png" if lowered.endswith(".png") else "image/webp" if lowered.endswith(".webp") else "image/jpeg"
+    return Response(content=data, media_type=media_type, headers=headers)
+
+
+def run() -> None:
+    import uvicorn
+
+    uvicorn.run(
+        "movsp.server:app",
+        host=env_compat("MOVSP_HOST", "") or network_access.effective_host(),
+        port=int(env_compat("MOVSP_PORT", "") or network_access.listen_port()),
+        reload=False,
+        proxy_headers=False,  # Preserve the socket peer for our explicit proxy allowlist.
+    )
+
+
+if __name__ == "__main__":
+    run()

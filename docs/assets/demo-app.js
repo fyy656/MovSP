@@ -1,0 +1,4821 @@
+const state = { user: null, tasks: [], taskTotal: 0, taskPage: 0, taskPageSize: 50, tasksLoading: false, presets: [], downloaders: [], mediaServers: [], pathMappings: [], autoScrapeRules: [], autoScrapeSchedules: [], downloadAutoScrapeRuns: [], crawlerSources: [], disabledBuiltInCrawlers: [], scrapers: [], scraperFilter: 'all', scraperSearch: '', scraperActive: '', scraperSourceEditable: false, activeCrawlerCodeName: '', runtime: null, activeAutoScrapeRun: null, activeAutoScrapeHistory: null, activeDownloadAutoScrapeRun: null, activeTaskDetail: null, taskDetailLogSelecting: false, taskMetadataEditing: false, pendingMetadataRefresh: null, overviewQuery: '', overviewSort: { key: 'created_at', direction: 'desc' }, overviewSelectionMode: false, overviewSelectionFeedback: new Set(), activeDownloaderId: null, activeDownloads: [], activeDownloader: null, downloadSort: { key: 'added_on', direction: 'desc' }, editingPreset: null, editingUser: null, pendingDeleteTask: null, pendingConfirm: null, selectedOverviewTasks: new Set(), selectedTaskIds: new Set(), taskSelectionMode: false, taskSelectAnchor: '', pathBrowser: { kind: 'directory', target: 'manual', currentPath: '/' }, formValues: {}, presetMode: null, presetKind: 'jav', presetKindLocked: false, logScroll: {}, logOpen: {}, taskOpen: {}, taskStatus: {}, googleCoverDialogTaskId: null, googleCoverDialogDismissed: false, privacyMode: document.documentElement.dataset.privacyMode === '1' };
+const OVERVIEW_PAGE_SIZES = [12, 24, 48, 96];
+// 其他脚本（library.js 等）需要读取当前用户，顶层 const 不会自动挂到 window
+window.JavspState = state;
+// 安卓客户端只保留媒体库、刮削与播放：?mobile=1 进入，?mobile=0 退出
+const MOBILE_APP = (() => {
+  try {
+    const flag = new URLSearchParams(location.search).get('mobile');
+    if (flag === '1') localStorage.setItem('javsp-web.mobile-app', '1');
+    else if (flag === '0') localStorage.removeItem('javsp-web.mobile-app');
+    return localStorage.getItem('javsp-web.mobile-app') === '1';
+  } catch (_) {
+    return false;
+  }
+})();
+const savedOverviewPageSize = Number(localStorage.getItem('javsp-web.overview-page-size'));
+state.overviewPage = 1;
+state.overviewPageSize = OVERVIEW_PAGE_SIZES.includes(savedOverviewPageSize) ? savedOverviewPageSize : 24;
+// Overview groups: [type, Chinese label, English cover subtitle].
+const OVERVIEW_GROUP_TYPES = [['all', '全部影片', 'ALL MOVIES'], ['actress', '演员', 'ACTRESS'], ['producer', '片商', 'STUDIO'], ['library', '媒体库', 'LIBRARY'], ['year', '年份', 'YEAR']];
+const OVERVIEW_GROUP_PAGE_SIZE = 12;
+const savedOverviewGroupBy = localStorage.getItem('javsp-web.overview-group-by');
+state.overviewGroupBy = OVERVIEW_GROUP_TYPES.some(([type]) => type === savedOverviewGroupBy) ? savedOverviewGroupBy : 'all';
+state.overviewGroup = null;
+state.overviewGroups = null;
+state.overviewGroupPage = 1;
+state.overviewGroupQuery = '';
+state.overviewLibrariesAvailable = true;
+const $ = (selector) => document.querySelector(selector);
+const FORM_SECTIONS = ['scanner', 'network', 'crawler', 'summarizer', 'translator', 'other'];
+const BUILT_IN_MEDIA_TYPE_IDS = new Set(['fc2', 'getchu', 'gyutto', 'cid', 'normal']);
+const CRAWLER_IDS = ['airav','avsox','avwiki','dl_getchu','fanza','fc2','fc2fan','fc2ppvdb','gyutto','jav321','javbus','javdb','javlib','javmenu','mgstage','njav','prestige','arzon','arzon_iv'];
+const REQUIRED_MOVIE_FIELDS = [
+  ['dvdid', '\u756a\u53f7'], ['cid', 'CID'], ['url', 'URL'], ['plot', '\u5267\u60c5'],
+  ['cover', '\u5c01\u9762'], ['big_cover', '\u9ad8\u6e05\u5c01\u9762'], ['genre', '\u7c7b\u578b'], ['score', '\u8bc4\u5206'],
+  ['title', '\u6807\u9898'], ['ori_title', '\u539f\u59cb\u6807\u9898'], ['magnet', '\u4e0b\u8f7d\u94fe\u63a5'], ['serial', '\u7cfb\u5217'],
+  ['actress', '\u6f14\u5458'], ['director', '\u5bfc\u6f14'], ['duration', '\u65f6\u957f'], ['producer', '\u5236\u4f5c\u5546'],
+  ['publisher', '\u53d1\u884c\u5546'], ['publish_date', '\u53d1\u884c\u65e5\u671f'], ['preview_pics', '\u5267\u7167'], ['preview_video', '\u9884\u544a\u7247'],
+];
+const FORM_TABS = [
+  { id: 'scanner', section: 'scanner', label: '扫描器', description: '选择要扫描的文件，跳过不需要的目录。' },
+  { id: 'network', section: 'network', label: '网络', description: '设置代理、重试次数和网络请求超时。' },
+  { id: 'crawler', section: 'crawler', label: '刮削器', description: '选择用哪些刮削器取资料；按「能做什么」自动分派，不必再区分 JAV 或普通电影。' },
+  { id: 'folder', section: 'summarizer', prefixes: ['move_files', 'existing_file_policy', 'path', 'title'], label: '文件夹整理', description: '设置输出目录、文件名、路径长度和文件移动规则。' },
+  { id: 'defaults', section: 'summarizer', prefixes: ['default'], label: '替代文本', description: '没有查到的资料，用什么文字代替。' },
+  { id: 'images', section: 'summarizer', prefixes: ['cover', 'fanart', 'extra_fanarts'], label: '图片', description: '设置封面、横版封面、裁剪和剧照下载规则。' },
+  { id: 'custom', section: 'summarizer', prefixes: ['nfo', 'censor_options_representation'], label: '自定义', description: '设置媒体库中的影片名称、分类和标签。' },
+  { id: 'translator', section: 'translator', label: '翻译器', description: '选择翻译方式和内容。' },
+  { id: 'other', section: 'other', label: '其他', description: 'JavSP 命令行选项。' },
+];
+// 高级页签：默认收起，一般情况无需修改（避免误删 fallback 分类导致预设不可用）。
+const ADVANCED_TABS = [
+  { id: 'media-types', section: 'scanner', prefixes: ['media_types'], label: '影片分类', description: '按文件名识别番号；只影响文件识别与调度分组，日常刮削无需改动。' },
+];
+
+// 「电影 / 剧集」预设只保留真正生效的设置。
+// 标题路径不经过 JavSP 引擎：整理、裁剪、剧照、番号规则全部不生效，
+// 所以这些面板不显示，避免让人以为设置坏了。
+const MEDIA_FORM_TABS = [
+  { id: 'scanner', section: 'scanner', prefixes: ['minimum_size', 'ignore_folders', 'extensions', 'strm_ignore_minimum_size'],
+    label: '扫描器', description: '决定哪些文件会被扫描。影视只按文件名/目录名取标题，不需要番号规则。' },
+  { id: 'crawler', section: 'crawler', label: '刮削器',
+    description: '按顺序调用这些刮削器取资料；有 TMDb / IMDb ID 时优先按 ID 精确匹配。' },
+  { id: 'network', section: 'network', label: '网络', description: '代理、重试与超时。' },
+];
+
+/**
+ * 影视预设里不显示的 crawler 字段。
+ *
+ * 这些都是 JavSP 引擎的番号流程专用：走标题路径时完全不会读，
+ * 留在界面上只会让用户以为改了有用（例如「FC2Fan 镜像」「JavDB 封面优先级」）。
+ */
+const MEDIA_HIDDEN_CRAWLER_FIELDS = new Set([
+  'selection',            // 番号爬虫列表（airav/avsox/javbus…）
+  'required_keys',        // 番号流程的必填校验
+  'hardworking',          // 深度抓取，站点翻页策略
+  'respect_site_avid',    // 以网站番号为准
+  'fc2fan_local_path',    // FC2 本地镜像
+  'sleep_after_scraping', // 引擎的站点限速等待
+  'use_javdb_cover',      // JavDB 封面优先级
+  'normalize_actress_name', // 演员艺名归一（JavSP 站点数据里的别名）
+]);
+
+// 影视预设的网络页签：免代理站点是 JAV 站点的镜像地址，与 TMDb 无关
+const MEDIA_HIDDEN_NETWORK_FIELDS = new Set(['proxy_free']);
+
+const PRESET_KINDS = [
+  { key: 'jav', label: 'JAV', description: '按番号刮削；使用完整 JavSP 整理流程（番号识别、分类、封面裁剪、文件整理）。' },
+  { key: 'media', label: '电影 / 剧集', description: '按标题或 TMDb/IMDb ID 刮削；不认番号，不做整理与裁剪。' },
+];
+
+const presetKindOf = (preset) => {
+  const declared = String(preset?.kind || '').toLowerCase();
+  if (PRESET_KINDS.some((item) => item.key === declared)) return declared;
+  // 老预设没有 kind：按刮削路径推断（title/hybrid → 影视）
+  const path = String(preset?.scrape_path || state?.presetPathCache?.[preset?.id] || '');
+  if (path === 'title' || path === 'hybrid') return 'media';
+  return 'jav';
+};
+
+const formTabsFor = (kind) => (kind === 'media' ? MEDIA_FORM_TABS : FORM_TABS);
+const advancedTabsFor = (kind) => (kind === 'media' ? [] : ADVANCED_TABS);
+const NAMING_RULE_VARIABLES = [
+  ['num', '番号'], ['title', '标题'], ['rawtitle', '原始标题'], ['filename', '原始文件名'], ['actress', '演员'], ['score', '评分'],
+  ['censor', '码状态'], ['serial', '系列'], ['director', '导演'], ['producer', '制作商'], ['publisher', '发行商'],
+  ['date', '发行日期'], ['year', '发行年份'], ['label', '番号前缀'], ['genre', '类型'],
+];
+const TRANSLATOR_ENGINES = {
+  google: [], bing: ['api_key'], baidu: ['app_id', 'api_key'], claude: ['api_key'], openai: ['url', 'api_key', 'model'],
+};
+const FIELD_LABELS = {
+  'scanner.ignored_id_pattern': '番号识别忽略规则', 'scanner.input_directory': '扫描目录', 'scanner.filename_extensions': '影片文件扩展名', 'scanner.ignored_folder_name_pattern': '忽略目录规则', 'scanner.minimum_size': '最小匹配文件大小', 'scanner.only_match_media_types': '仅扫描匹配影片分类', 'scanner.skip_nfo_dir': '跳过已有 NFO 的目录', 'scanner.manual': '手动确认扫描结果',
+  'network.proxy_server': '代理服务器地址', 'network.proxy_free': '网站备用地址', 'network.proxy_free.avsox': 'Avsox 免代理地址', 'network.proxy_free.javbus': 'JavBus 免代理地址', 'network.proxy_free.javdb': 'JavDB 免代理地址', 'network.proxy_free.javlib': 'JavLib 免代理地址', 'network.retry': '网络重试次数', 'network.timeout': '网络请求超时',
+  'crawler.selection.normal': '普通影片爬虫列表', 'crawler.selection.fc2': 'FC2 影片爬虫列表', 'crawler.selection.cid': 'CID 影片爬虫列表', 'crawler.selection.getchu': 'Getchu 影片爬虫列表', 'crawler.selection.gyutto': 'Gyutto 影片爬虫列表', 'crawler.required_keys': '必须取得的资料', 'crawler.hardworking': '深度抓取', 'crawler.respect_site_avid': '使用网站返回的番号', 'crawler.fc2fan_local_path': 'FC2Fan 本地镜像目录', 'crawler.sleep_after_scraping': '每部影片刮削后等待时间', 'crawler.use_javdb_cover': 'JavDB 封面优先级', 'crawler.normalize_actress_name': '统一演员艺名',
+  'summarizer.move_files': '移动文件到整理目录', 'summarizer.path.output_folder_pattern': '整理输出目录模板', 'summarizer.path.basename_pattern': '影片文件名', 'summarizer.path.length_maximum': '最大文件路径长度', 'summarizer.path.length_by_byte': '按字节计算路径长度', 'summarizer.path.max_actress_count': '路径中最多包含的演员数', 'summarizer.path.hard_link': '使用硬链接整理文件', 'summarizer.title.remove_trailing_actor_name': '移除标题末尾演员名', 'summarizer.default.title': '标题为空时显示', 'summarizer.default.actress': '演员为空时显示', 'summarizer.default.series': '系列为空时显示', 'summarizer.default.director': '导演为空时显示', 'summarizer.default.producer': '制作商为空时显示', 'summarizer.default.publisher': '发行商为空时显示', 'summarizer.nfo.basename_pattern': 'NFO 文件名', 'summarizer.nfo.title_pattern': 'NFO 影片标题模板', 'summarizer.nfo.custom_genres_fields': '自定义分类字段', 'summarizer.nfo.custom_tags_fields': '自定义标签字段', 'summarizer.censor_options_representation': '有码 / 无码显示文字', 'summarizer.cover.basename_pattern': '封面文件名', 'summarizer.cover.highres': '优先下载高清封面', 'summarizer.cover.add_label': '在封面添加水印标签', 'summarizer.cover.crop.on_id_pattern': '启用封面裁剪的番号规则', 'summarizer.cover.crop.engine': '封面裁剪识别引擎', 'summarizer.fanart.basename_pattern': '横版封面文件名', 'summarizer.extra_fanarts.enabled': '下载剧照', 'summarizer.extra_fanarts.folder_prefix': '剧照文件夹名前缀', 'summarizer.extra_fanarts.scrap_interval': '剧照请求间隔',
+  'translator.engine': '翻译引擎', 'translator.fields.title': '翻译标题', 'translator.fields.plot': '翻译剧情简介', 'translator.engine.name': '翻译引擎名称', 'translator.engine.app_id': '翻译服务应用 ID', 'translator.engine.api_key': '翻译服务 API 密钥', 'translator.engine.url': 'OpenAI 兼容接口地址', 'translator.engine.model': '翻译模型名称',
+  'other.interactive': '终端交互模式', 'other.check_update': '检查 JavSP 更新', 'other.auto_update': '自动下载新版本',
+  ignored_id_pattern: '忽略番号规则', input_directory: '输入目录', filename_extensions: '文件扩展名', ignored_folder_name_pattern: '忽略目录规则', minimum_size: '最小文件大小', skip_nfo_dir: '跳过 NFO 目录', manual: '手动确认',
+  proxy_server: '代理服务器', proxy_free: '免代理站点', retry: '重试次数', timeout: '请求超时',
+  selection: '爬虫选择', required_keys: '必需字段', hardworking: '深度抓取', respect_site_avid: '尊重站点番号', fc2fan_local_path: 'FC2 本地页面目录', sleep_after_scraping: '刮削后等待', use_javdb_cover: '使用 JavDB 封面', normalize_actress_name: '统一演员名称',
+  move_files: '移动文件', path: '路径规则', output_folder_pattern: '输出目录模板', basename_pattern: '文件名模板', length_maximum: '路径最大长度', length_by_byte: '按字节计算长度', max_actress_count: '最多演员数量', hard_link: '使用硬链接',
+  remove_trailing_actor_name: '移除标题末尾演员名', default: '缺省值', nfo: 'NFO 文件', title_pattern: '标题模板', custom_genres_fields: '自定义类型字段', custom_tags_fields: '自定义标签字段', censor_options_representation: '有码 / 无码显示文字', cover: '封面', highres: '高清封面', add_label: '添加封面标签', crop: '封面裁剪', on_id_pattern: '裁剪番号规则', fanart: '横版封面', extra_fanarts: '剧照', scrap_interval: '剧照请求间隔',
+  engine: '翻译引擎', fields: '翻译字段', title: '标题', plot: '剧情简介',
+  interactive: '交互模式', check_update: '检查更新', auto_update: '自动更新',
+};
+FIELD_LABELS['summarizer.cover.google_search_fallback'] = '封面缺失时使用 Google 搜索';
+FIELD_LABELS['scanner.media_types'] = '影片分类';
+
+FIELD_LABELS['scanner.strm_ignore_minimum_size'] = 'STRM 忽略最小文件大小';
+FIELD_LABELS['scanner.only_match_media_types'] = '仅扫描匹配影片分类';
+
+const FIELD_NOTES = {
+  input_directory: '手动刮削使用创建任务时选择的路径。',
+  ignored_id_pattern: '每条规则单独添加，支持正则表达式。',
+  filename_extensions: '例如 .mp4、.mkv，逐个添加。',
+  ignored_folder_name_pattern: '每条规则单独添加，支持正则表达式。',
+  proxy_server: '留空不使用代理。',
+  proxy_free: '按“网站名: 地址”填写。',
+  selection: '',
+  required_keys: '',
+  engine: '',
+  path: '',
+  nfo: '',
+  cover: '',
+  crop: '',
+  extra_fanarts: '',
+  fields: '',
+};
+FIELD_NOTES.media_types = '支持 YAML 或 JSON。保存后，可在“爬虫”页为各分类选择资料来源。';
+const FIELD_DESCRIPTIONS = {
+  'scanner.strm_ignore_minimum_size': 'STRM 文件通常很小。开启后，扫描它们时不检查文件大小。',
+  'scanner.only_match_media_types': '跳过无法识别分类的文件，可用于过滤广告视频。',
+  'summarizer.cover.google_search_fallback': '下载不到封面时，使用 Google 图片搜索。',
+  'scanner.ignored_id_pattern': '识别番号前，先去掉文件名中的这些内容。',
+  'scanner.input_directory': '要整理的影片目录。',
+  'scanner.filename_extensions': '只扫描这些格式的视频。',
+  'scanner.ignored_folder_name_pattern': '跳过名称符合规则的文件夹。',
+  'scanner.minimum_size': '小于此大小的视频会被跳过。请带上单位，例如 200MB 或 1GB。',
+  'network.proxy_server': '支持 HTTP、SOCKS5 和 SOCKS5H 代理。',
+  'network.proxy_free': '仅在未配置代理时生效的站点地址：JavBus、JavDB 在配置了代理后会改用官网，这里的地址就失效；Avsox 始终使用这里的地址。未配置代理时请填写可直连的镜像站，填官网地址会被反爬拦截（表现为“反爬空响应”）。',
+  'network.retry': '网络问题导致抓取失败时的重试次数。',
+  'network.timeout': '单次请求最多等待多久，例如 PT10S 表示 10 秒，PT1M 表示 1 分钟。',
+  'crawler.selection': '同一项资料有多个来源时，优先使用排在前面的来源。',
+  'crawler.required_keys': '缺少任何一项，任务都会报错。',
+  'crawler.hardworking': '尝试获取更多资料，部分网站会增加请求次数。',
+  'crawler.respect_site_avid': '以网站上的番号为准，包括大小写。',
+  'crawler.fc2fan_local_path': 'FC2Fan 已关站；如有镜像，目录内应包含类似 FC2-12345.html 的文件。',
+  'crawler.sleep_after_scraping': '每部影片处理完成后的等待时间。例如 PT5S 表示等 5 秒，PT0S 表示不等待。',
+  'crawler.use_javdb_cover': '填写 fallback：优先使用其他站点封面；yes：优先使用 JavDB 封面；no：不使用 JavDB 封面。',
+  'crawler.normalize_actress_name': '将同一演员的不同艺名合并为一个名字。',
+  'summarizer.move_files': '关闭后，资料和图片保存在视频所在文件夹。',
+  'summarizer.path.output_folder_pattern': '例如：#整理完成/{actress}/{num}。',
+  'summarizer.path.basename_pattern': '例如：{num} 或 {num} {title}。',
+  'summarizer.path.length_maximum': '路径超长时，会缩短标题。',
+  'summarizer.path.length_by_byte': '开启后，一个中文字符按多个字节计算。',
+  'summarizer.path.max_actress_count': '{actress} 中最多保留几位演员的名字。',
+  'summarizer.path.hard_link': '保留原视频，通过硬链接整理。源文件和输出目录必须在同一文件系统。',
+  'summarizer.nfo.basename_pattern': '不需要填写 .nfo 后缀。',
+  'summarizer.nfo.title_pattern': 'Emby、Jellyfin 等媒体库中显示的标题。',
+  'summarizer.nfo.custom_genres_fields': '把选中的资料写入媒体库分类。',
+  'summarizer.nfo.custom_tags_fields': '把选中的资料写入媒体库标签。',
+  'summarizer.censor_options_representation': '依次填写“无码”“有码”“未知”对应的文字。',
+  'summarizer.cover.basename_pattern': '封面文件名，不包含扩展名，可使用标题等变量。',
+  'summarizer.cover.highres': '高清图片通常更大，下载时间也更长。',
+  'summarizer.cover.add_label': '在封面图上添加水印标签，例如字幕。',
+  'summarizer.cover.crop.on_id_pattern': '只有番号匹配这些规则时才使用图像识别裁剪封面。',
+  'summarizer.cover.crop.engine': '填写识别服务配置；留空不使用图像识别。',
+  'summarizer.fanart.basename_pattern': '横版封面文件名，不包含扩展名，可使用标题等变量。',
+  'summarizer.extra_fanarts.enabled': '',
+  'summarizer.extra_fanarts.folder_prefix': '剧照文件夹是「前缀 + extrafanart」，例如填 {num}- 会得到 ABC-123-extrafanart；留空即 extrafanart。可使用与文件名相同的变量。',
+  'summarizer.extra_fanarts.scrap_interval': '两次剧照抓取请求之间的等待时长。',
+  'translator.engine': '',
+  'other.interactive': '在命令行运行 JavSP 时，是否等待键盘输入确认。网页任务无需开启。',
+  'other.check_update': '允许时会显示新版本提示和新版功能。',
+  'other.auto_update': '允许检查到新版本后自动下载。',
+  manual: '命令行扫描后，先确认文件列表。',
+  minimum_size: '小于此大小的文件不会参与匹配。',
+  skip_nfo_dir: '文件夹中已有 NFO 时跳过。',
+  retry: '网络请求失败时的重试次数。',
+  timeout: '单次请求最多等待多久，例如 PT10S 表示 10 秒。',
+  hardworking: '启用更完整的抓取流程，可能增加耗时。',
+  respect_site_avid: '优先使用网站返回的番号。',
+  sleep_after_scraping: '每部影片完成后等待的时间。',
+  move_files: '是否把相关文件移动到整理后的目录。',
+  output_folder_pattern: '整理后的目录命名模板。',
+  basename_pattern: '影片、封面等文件名模板。',
+  length_maximum: '生成路径允许的最大长度。',
+  highres: '是否尽量下载高清封面。',
+  add_label: '是否在封面上添加标签。',
+  enabled: '',
+  interactive: '是否在终端中启用交互。',
+  check_update: '是否检查 JavSP 更新。',
+  auto_update: '是否自动下载新版本。',
+  'translator.fields.title': '',
+  'translator.fields.plot': '',
+};
+
+function cloneValue(value) {
+  return value && typeof value === 'object' ? JSON.parse(JSON.stringify(value)) : value;
+}
+
+function pathValue(root, path) {
+  return path.split('.').reduce((value, key) => (value == null ? undefined : value[key]), root);
+}
+
+function setPathValue(root, path, value) {
+  const parts = path.split('.');
+  let target = root;
+  parts.slice(0, -1).forEach((part) => {
+    if (!target[part] || typeof target[part] !== 'object' || Array.isArray(target[part])) target[part] = {};
+    target = target[part];
+  });
+  target[parts[parts.length - 1]] = value;
+}
+
+function fieldDescription(path, value) {
+  const key = path.split('.').pop();
+  const parts = path.split('.');
+  while (parts.length) {
+    const description = FIELD_DESCRIPTIONS[parts.join('.')];
+    if (description !== undefined) return description;
+    parts.pop();
+  }
+  return FIELD_DESCRIPTIONS[key] || '';
+}
+
+function fieldNote(path, value) {
+  if (path === 'translator.engine') return '';
+  const key = path.split('.').pop();
+  return FIELD_NOTES[key] || '';
+}
+
+function fieldLabel(path) {
+  const key = path.split('.').pop();
+  return FIELD_LABELS[path] || FIELD_LABELS[key] || key;
+}
+
+function displayFieldValue(value) {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function normalizeMediaTypes(value) {
+  const saved = Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : [];
+  return saved.map((item) => ({
+    id: String(item.id || '').trim().toLowerCase(),
+    name: String(item.name || '').trim(),
+    priority: Number.isFinite(Number(item.priority)) ? Number(item.priority) : 0,
+    detector: ['regex', 'cid', 'fallback'].includes(item.detector) ? item.detector : (item.fallback ? 'fallback' : (item.id === 'cid' && item.identifier_kind === 'cid' && !item.pattern ? 'cid' : 'regex')),
+    identifier_kind: item.identifier_kind === 'cid' ? 'cid' : 'dvdid',
+    pattern: String(item.pattern || ''),
+    avid_format: String(item.avid_format || '{avid}'),
+    fallback: item.detector === 'fallback' || Boolean(item.fallback),
+  })).sort((left, right) => right.priority - left.priority || left.id.localeCompare(right.id));
+}
+
+function mediaTypesFromForm() {
+  return normalizeMediaTypes(pathValue(state.formValues || {}, 'scanner.media_types'));
+}
+
+function mediaTypeRuleMarkup(type) {
+  {
+    const builtIn = BUILT_IN_MEDIA_TYPE_IDS.has(type.id);
+    if (builtIn) {
+      const detector = type.detector === 'cid' ? 'CID \u5185\u7f6e\u8bc6\u522b' : (type.detector === 'fallback' ? '\u9ed8\u8ba4\u515c\u5e95' : '\u5185\u7f6e\u6587\u4ef6\u540d\u8bc6\u522b');
+      const identifier = type.identifier_kind === 'cid' ? 'CID' : 'DVDID';
+      return `<article class="media-type-rule media-type-built-in" data-media-type-rule data-built-in="true"><input data-media-type-id value="${escapeHtml(type.id)}" type="hidden"><input data-media-type-name value="${escapeHtml(type.name)}" type="hidden"><input data-media-type-priority value="${escapeHtml(type.priority)}" type="hidden"><input data-media-type-kind value="${escapeHtml(type.identifier_kind)}" type="hidden"><input data-media-type-detector value="${escapeHtml(type.detector)}" type="hidden"><input data-media-type-pattern value="${escapeHtml(type.pattern)}" type="hidden"><input data-media-type-format value="${escapeHtml(type.avid_format)}" type="hidden"><div class="media-type-rule-heading"><strong>${escapeHtml(type.name)}</strong><span>${detector} \u00b7 ${identifier}</span></div><p class="muted">${type.detector === 'fallback' ? '\u5176\u4ed6\u5f71\u7247\u5206\u7c7b\u672a\u547d\u4e2d\u65f6\u4f7f\u7528\u3002' : '\u7531\u626b\u63cf\u5668\u5185\u7f6e\u89c4\u5219\u8bc6\u522b\uff1b\u722c\u866b\u987a\u5e8f\u8bf7\u5728\u300c\u722c\u866b\u300d\u9009\u9879\u5361\u914d\u7f6e\u3002'}</p></article>`;
+    }
+    return `<article class="media-type-rule" data-media-type-rule data-built-in="false"><div class="media-type-rule-heading"><strong>\u81ea\u5b9a\u4e49\u5206\u7c7b</strong><button class="icon-button media-type-remove" type="button" data-remove-media-type title="\u5220\u9664\u5206\u7c7b" aria-label="\u5220\u9664\u5206\u7c7b">\u00d7</button></div><div class="media-type-rule-fields"><label>\u5206\u7c7b ID<input data-media-type-id maxlength="40" value="${escapeHtml(type.id)}" placeholder="my_source"></label><label>\u5206\u7c7b\u540d\u79f0<input data-media-type-name maxlength="80" value="${escapeHtml(type.name)}" placeholder="\u4f8b\u5982 My Source"></label><label>\u4f18\u5148\u7ea7<input data-media-type-priority type="number" step="1" value="${escapeHtml(type.priority)}"></label><label>\u7f16\u53f7\u7c7b\u578b<select data-media-type-kind><option value="dvdid"${type.identifier_kind === 'dvdid' ? ' selected' : ''}>DVDID</option><option value="cid"${type.identifier_kind === 'cid' ? ' selected' : ''}>CID</option></select></label><label class="media-type-rule-pattern">\u6587\u4ef6\u540d\u8bc6\u522b\u89c4\u5219<input data-media-type-pattern value="${escapeHtml(type.pattern)}" placeholder="\u5fc5\u987b\u5305\u542b (?P<avid>...)"></label><label>\u756a\u53f7\u683c\u5f0f<input data-media-type-format value="${escapeHtml(type.avid_format)}" placeholder="{avid}"></label></div><p class="muted">\u7528\u4e8e\u81ea\u5b9a\u4e49\u6587\u4ef6\u540d\u89c4\u5219\uff1b\u89c4\u5219\u547d\u4e2d\u540e\u4f1a\u751f\u6210\u6807\u51c6\u756a\u53f7\u3002</p></article>`;
+  }
+  /* Legacy editor markup retained below temporarily for source compatibility.
+  const builtIn = BUILT_IN_MEDIA_TYPE_IDS.has(type.id);
+  const patternHint = type.fallback ? '\u5179\u5e95\u5206\u7c7b\u65e0\u9700\u89c4\u5219' : '\u5fc5\u987b\u5305\u542b (?P<avid>...)';
+  return `<article class="media-type-rule" data-media-type-rule data-built-in="${builtIn}"><div class="media-type-rule-heading"><strong>${builtIn ? '\u5185\u7f6e\u5206\u7c7b' : '\u81ea\u5b9a\u4e49\u5206\u7c7b'}</strong>${builtIn ? '' : '<button class="icon-button media-type-remove" type="button" data-remove-media-type title="\u5220\u9664\u5206\u7c7b" aria-label="\u5220\u9664\u5206\u7c7b">\u00d7</button>'}</div><div class="media-type-rule-fields"><label>\u5206\u7c7b ID<input data-media-type-id maxlength="40" value="${escapeHtml(type.id)}"${builtIn ? ' readonly' : ''} placeholder="my_source"></label><label>\u5206\u7c7b\u540d\u79f0<input data-media-type-name maxlength="80" value="${escapeHtml(type.name)}" placeholder="\u4f8b\u5982 My Source"></label><label>\u4f18\u5148\u7ea7<input data-media-type-priority type="number" step="1" value="${escapeHtml(type.priority)}"></label><label>\u7f16\u53f7\u7c7b\u578b<select data-media-type-kind><option value="dvdid"${type.identifier_kind === 'dvdid' ? ' selected' : ''}>DVDID</option><option value="cid"${type.identifier_kind === 'cid' ? ' selected' : ''}>CID</option></select></label><label class="media-type-rule-pattern">\u8bc6\u522b\u89c4\u5219<input data-media-type-pattern value="${escapeHtml(type.pattern)}" placeholder="${patternHint}"${type.fallback ? ' readonly' : ''}></label><label>\u756a\u53f7\u683c\u5f0f<input data-media-type-format value="${escapeHtml(type.avid_format)}" placeholder="{avid}"></label></div><p class="muted">${type.fallback ? '\u5728\u5176\u4ed6\u89c4\u5219\u672a\u547d\u4e2d\u65f6\u4f7f\u7528\u3002' : `\u89c4\u5219\u547d\u4e2d\u540e\u4f7f\u7528 ${escapeHtml(type.avid_format || '{avid}')} \u751f\u6210\u6807\u51c6\u756a\u53f7\u3002`}</p></article>`;
+*/
+}
+
+function mediaTypesMarkup(value) {
+  const types = normalizeMediaTypes(value);
+  return `<div class="media-type-control" data-media-type-control><div class="media-type-control-heading"><div><strong>\u5f71\u7247\u5206\u7c7b</strong><span>\u626b\u63cf\u5668\u6839\u636e\u6587\u4ef6\u540d\u786e\u5b9a\u5f71\u7247\u5206\u7c7b\uff0c\u722c\u866b\u9875\u9762\u518d\u6309\u6b64\u5206\u7c7b\u9009\u62e9\u6570\u636e\u6e90\u3002</span></div><button class="button secondary" type="button" data-add-media-type>\u6dfb\u52a0\u81ea\u5b9a\u4e49\u5206\u7c7b</button></div><div class="media-type-rule-list">${types.map(mediaTypeRuleMarkup).join('')}</div></div>`;
+  return `<div class="media-type-control" data-media-type-control><div class="media-type-control-heading"><div><strong>\u5f71\u7247\u5206\u7c7b</strong><span>\u626b\u63cf\u5668\u6309\u4f18\u5148\u7ea7\u4ece\u6587\u4ef6\u540d\u8bc6\u522b\u7f16\u53f7\uff0c\u5e76\u5c06\u547d\u4e2d\u5206\u7c7b\u4ea4\u7ed9\u540c\u540d\u722c\u866b\u5217\u8868\u3002</span></div><button class="button secondary" type="button" data-add-media-type>\u6dfb\u52a0\u5206\u7c7b</button></div><div class="media-type-rule-list">${types.map(mediaTypeRuleMarkup).join('')}</div></div>`;
+}
+
+function readMediaTypesControl() {
+  const rules = [...document.querySelectorAll('[data-media-type-rule]')].map((rule) => ({
+    id: rule.querySelector('[data-media-type-id]')?.value.trim().toLowerCase() || '',
+    name: rule.querySelector('[data-media-type-name]')?.value.trim() || '',
+    priority: Number(rule.querySelector('[data-media-type-priority]')?.value || 0),
+    detector: rule.querySelector('[data-media-type-detector]')?.value || 'regex',
+    identifier_kind: rule.querySelector('[data-media-type-kind]')?.value === 'cid' ? 'cid' : 'dvdid',
+    pattern: rule.querySelector('[data-media-type-pattern]')?.value || '',
+    avid_format: rule.querySelector('[data-media-type-format]')?.value || '{avid}',
+    fallback: rule.querySelector('[data-media-type-detector]')?.value === 'fallback',
+  }));
+  return normalizeMediaTypes(rules);
+}
+
+function crawlerSelectionFromDom() {
+  // 预设里的刮削器是一份扁平的有序列表
+  return [...document.querySelectorAll('[data-crawler-value]')]
+    .map((tag) => String(tag.dataset.crawlerValue || '').trim())
+    .filter(Boolean);
+}
+
+function refreshCrawlerSelectionForMediaTypes(selection = crawlerSelectionFromDom()) {
+  const host = document.querySelector('[data-crawler-selection-control]');
+  if (host) host.innerHTML = crawlerConfigTagsMarkup(selection);
+}
+
+document.addEventListener('change', (event) => {
+  if (event.target.id === 'overview-page-size') {
+    state.overviewPageSize = Number(event.target.value) || 24;
+    state.overviewPage = 1;
+    localStorage.setItem('javsp-web.overview-page-size', String(state.overviewPageSize));
+    loadTasks();
+    return;
+  }
+  // 影片分类的规则改动不再影响刮削器选择（预设里是一份扁平列表）
+  const control = event.target.closest?.('[data-media-type-rule]');
+  if (!control) return;
+  state.formValues ||= {};
+  state.formValues.scanner ||= {};
+  state.formValues.scanner.media_types = readMediaTypesControl();
+});
+
+function configArrayTagMarkup(value) {
+  return `<span class="config-array-tag" data-array-value="${escapeHtml(value)}"><code>${escapeHtml(value)}</code><button class="config-array-remove" type="button" data-remove-config-array-tag title="\u5220\u9664 ${escapeHtml(value)}" aria-label="\u5220\u9664 ${escapeHtml(value)}">\u00d7</button></span>`;
+}
+
+function arrayConfigMarkup(path, values) {
+  const items = Array.isArray(values) ? values.map((value) => String(value).trim()).filter(Boolean) : [];
+  return `<div class="config-array" data-config-path="${escapeHtml(path)}"><div class="config-array-list">${items.map(configArrayTagMarkup).join('')}</div><div class="config-array-add"><input class="config-array-input" type="text" maxlength="256" autocomplete="off" placeholder="\u8f93\u5165\u503c"><button class="icon-button config-array-add-button" type="button" title="\u6dfb\u52a0" aria-label="\u6dfb\u52a0">+</button></div></div>`;
+}
+
+function requiredKeysMarkup(values) {
+  const selected = new Set(Array.isArray(values) ? values.map(String) : []);
+  const fields = REQUIRED_MOVIE_FIELDS.map(([name, label]) => `<label class="required-key-option"><input type="checkbox" data-required-key value="${name}"${selected.has(name) ? ' checked' : ''}><span>${escapeHtml(label)}</span><code>${name}</code></label>`).join('');
+  return `<fieldset class="required-key-list" data-config-path="crawler.required_keys">${fields}</fieldset>`;
+}
+
+function hydrateCollectionControls() {
+  document.querySelectorAll('textarea.config-field-input[data-config-path]').forEach((control) => {
+    const path = control.dataset.configPath;
+    if (path === 'scanner.media_types') return;
+    let values;
+    try { values = JSON.parse(control.value); } catch (_) { return; }
+    if (!Array.isArray(values)) return;
+    control.outerHTML = path === 'crawler.required_keys' ? requiredKeysMarkup(values) : arrayConfigMarkup(path, values);
+  });
+}
+
+function isNamingRulePath(path) {
+  return [
+    'summarizer.path.output_folder_pattern', 'summarizer.path.basename_pattern',
+    'summarizer.nfo.basename_pattern', 'summarizer.nfo.title_pattern',
+    'summarizer.cover.basename_pattern', 'summarizer.fanart.basename_pattern',
+    'summarizer.extra_fanarts.folder_prefix',
+  ].includes(path);
+}
+
+function namingRuleHelp(targetPath) {
+  const variables = NAMING_RULE_VARIABLES.map(([name, label]) => `<button type="button" class="naming-rule-variable" data-insert-naming-variable="{${name}}" data-naming-target="${escapeHtml(targetPath)}"><code>{${name}}</code><span>${escapeHtml(label)}</span></button>`).join('');
+  return `<span class="naming-rule-help" tabindex="0"><span class="naming-rule-popover"><strong>可用命名变量</strong><span class="naming-rule-variable-list">${variables}</span><small>点击变量会插入到当前模板的光标位置。</small></span></span>`;
+}
+
+function translatorEngineControl(value) {
+  const engine = value && typeof value === 'object' ? value : {};
+  const name = engine.name || '';
+  const disabled = state.formValues?.translator?.ai_enabled === true ? ' disabled' : '';
+  const options = [['', '不翻译'], ['google', 'Google 翻译'], ['bing', '必应翻译'], ['baidu', '百度翻译'], ['claude', 'Claude'], ['openai', 'OpenAI 兼容接口']]
+    .map(([key, label]) => `<option value="${key}"${name === key ? ' selected' : ''}>${label}</option>`).join('');
+  const labels = { app_id: '应用 ID', api_key: 'API 密钥', url: '接口地址', model: '模型名称' };
+  const placeholders = { url: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o-mini' };
+  const fields = (TRANSLATOR_ENGINES[name] || []).map((key) => `<label class="translator-engine-field">${labels[key]}<input class="config-field-input" data-config-path="translator.engine.${key}" value="${escapeHtml(engine[key] || '')}"${disabled}${placeholders[key] ? ` placeholder="${placeholders[key]}"` : ''}${key === 'api_key' ? ' type="password" autocomplete="off"' : ''}></label>`).join('');
+  return `<div class="translator-engine-control"><select aria-label="翻译引擎" class="config-field-input" data-translator-engine${disabled}>${options}</select>${fields ? `<div class="translator-engine-fields">${fields}</div>` : ''}${disabled ? '<small class="config-description">已停用，当前使用 AI 翻译。</small>' : ''}</div>`;
+}
+
+function translatorAiControl(enabled) {
+  const available = state.aiEnabled === true;
+  const availability = available ? '' : `<small class="form-error">${enabled ? 'AI 刮削已关闭。请在系统设置中开启，或取消 AI 翻译。' : '请先在系统设置中启用 AI 刮削。'}</small>`;
+  return `<label class="config-field config-field-wide"><span class="check-label"><input type="checkbox" class="config-field-input" data-config-path="translator.ai_enabled"${enabled ? ' checked' : ''}${available || enabled ? '' : ' disabled'}>启用 AI 翻译</span><small class="config-description">使用系统设置中的 AI 模型翻译为简体中文，不使用上方翻译引擎。</small>${availability}</label>`;
+}
+
+function pathMatchesTab(path, prefixes) {
+  if (!prefixes || !path) return true;
+  return prefixes.some((prefix) => prefix === path || prefix.startsWith(`${path}.`) || path.startsWith(`${prefix}.`));
+}
+
+function renderPresetNavigation() {
+  const tabs = $('.preset-tabs');
+  const panels = $('.preset-tab-panels');
+  if (!tabs || !panels) return;
+  const intro = $('.preset-editor-heading .muted');
+  const kind = state.presetKind || 'jav';
+  const formTabs = formTabsFor(kind);
+  const advancedTabsList = advancedTabsFor(kind);
+  if (intro) {
+    intro.textContent = kind === 'media'
+      ? '电影 / 剧集预设只显示真正生效的设置。'
+      : '选择下方分类进行设置。';
+  }
+  const basicTabs = formTabs.map((tab, index) => `<button class="preset-tab${index === 0 ? ' active' : ''}" type="button" data-preset-tab="${tab.id}">${tab.label}</button>`).join('');
+  // 高级页签折在「高级」里，默认不展开；影视预设没有高级页签
+  const advancedTabs = advancedTabsList.length
+    ? `<details class="preset-advanced"><summary>高级</summary><div class="preset-advanced-tabs">${advancedTabsList.map((tab) => `<button class="preset-tab preset-tab-advanced" type="button" data-preset-tab="${tab.id}">${tab.label}</button>`).join('')}</div><p class="muted">一般情况无需修改。仅当文件识别不出番号、或需要自定义识别规则时才调整。</p></details>`
+    : '';
+  tabs.innerHTML = basicTabs + advancedTabs;
+  panels.innerHTML = [...formTabs, ...advancedTabsList].map((tab, index) => {
+    const description = tab.description;
+    const advanced = advancedTabsList.some((item) => item.id === tab.id);
+    return `<section class="preset-tab-panel${index === 0 ? ' active' : ''}${advanced ? ' preset-tab-panel-advanced' : ''}" data-preset-panel="${tab.id}"><div class="tab-intro"><strong>${tab.label}</strong>${advanced ? ' <span class="badge">高级</span>' : ''}<span>${description}</span></div><div id="preset-fields-${tab.id}" class="config-fields"></div></section>`;
+  }).join('');
+}
+
+function renderConfigFields() {
+  if (state.formValues?.summarizer) state.formValues.summarizer.existing_file_policy ??= 'never';
+  const kind = state.presetKind || 'jav';
+  const activeTabs = [...formTabsFor(kind), ...advancedTabsFor(kind)];
+  activeTabs.forEach((tab) => {
+    const container = $(`#preset-fields-${tab.id}`);
+    if (!container) return;
+    const values = state.formValues?.[tab.section] || {};
+    const paths = [];
+    const walk = (value, path) => {
+      if (!pathMatchesTab(path, tab.prefixes)) return;
+      // 影视预设只显示标题路径真正会读的字段：
+      // 番号爬虫列表、JavDB 封面策略、FC2 镜像等留着只会误导。
+      if (kind === 'media') {
+        if (tab.section === 'crawler' && path && MEDIA_HIDDEN_CRAWLER_FIELDS.has(path)) return;
+        if (tab.section === 'network' && path && MEDIA_HIDDEN_NETWORK_FIELDS.has(path)) return;
+      }
+      if (tab.section === 'crawler' && ['ai_enabled', 'ai_fallback_only'].includes(path) && !state.aiEnabled) return;
+      if (tab.section === 'translator' && path === 'ai_enabled') return;
+      if (tab.section === 'scanner' && (path === 'input_directory' || (tab.id === 'scanner' && path === 'media_types'))) return;
+      if (tab.section === 'translator' && path === 'engine') {
+        paths.push([path, value]);
+      } else if (tab.section === 'crawler' && (path === 'selection' || path === 'scrapers')) {
+        // 刮削器只渲染一次（优先新字段 scrapers）
+        if (path === 'selection' && 'scrapers' in values) return;
+        paths.push([path, value]);
+      } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+        Object.entries(value).forEach(([key, item]) => walk(item, path ? `${path}.${key}` : key));
+      } else if (path) paths.push([path, value]);
+    };
+    walk(values, '');
+    container.innerHTML = paths.map(([path, value]) => {
+      const complex = Array.isArray(value) || (value && typeof value === 'object') || (tab.section === 'scanner' && path === 'media_types');
+      const boolean = typeof value === 'boolean';
+      const sourcePath = `${tab.section}.${path}`;
+      if (sourcePath === 'summarizer.existing_file_policy') {
+        return `<label class="config-field"><span class="config-field-name">已有影片覆盖方式</span><select class="config-field-input" data-config-path="${sourcePath}">${[['never', '从不'], ['always', '总是'], ['larger', '按文件大小'], ['newer', '仅保留最新']].map(([key, label]) => `<option value="${key}"${value === key ? ' selected' : ''}>${label}</option>`).join('')}</select><small class="config-description">按大小保留较大的影片；按时间保留修改时间较新的影片。相同则保留已有版本，源文件不删除。</small></label>`;
+      }
+      if (sourcePath === 'crawler.ai_enabled' || sourcePath === 'crawler.ai_fallback_only') {
+        const label = path === 'ai_enabled' ? '启用 AI 刮削' : '仅在爬虫失败时使用 AI';
+        const help = path === 'ai_enabled' ? '使用系统设置中接入的 AI 模型查找影片资料。' : '取消后直接使用 AI，不查询普通爬虫。';
+        return `<label class="config-field"><span class="check-label"><input type="checkbox" class="config-field-input" data-config-path="${sourcePath}"${value ? ' checked' : ''}>${label}</span><small class="config-description">${help}</small></label>`;
+      }
+      const placeholder = sourcePath === 'network.proxy_server' ? 'http://127.0.0.1:7890 或 socks5://127.0.0.1:7890' : '';
+      const inputValue = value === null || value === undefined ? '' : (sourcePath === 'scanner.media_types' && typeof value !== 'string' ? JSON.stringify(value, null, 2) : displayFieldValue(value));
+      const isScraperPicker = sourcePath === 'crawler.selection' || sourcePath === 'crawler.scrapers';
+      const control = isScraperPicker ? crawlerConfigMarkup(value) : (sourcePath === 'translator.engine' ? translatorEngineControl(value) : (boolean ? `<select class="config-field-input" data-config-path="${sourcePath}"><option value="true"${value ? ' selected' : ''}>是</option><option value="false"${value ? '' : ' selected'}>否</option></select>` : (complex ? `<textarea class="config-field-input" data-config-path="${sourcePath}" spellcheck="false">${escapeHtml(inputValue)}</textarea>` : `<input class="config-field-input" data-config-path="${sourcePath}" value="${escapeHtml(inputValue)}"${placeholder ? ` placeholder="${escapeHtml(placeholder)}"` : ''}>`)));
+      const description = fieldDescription(sourcePath, value);
+      const note = fieldNote(sourcePath, value);
+      const nativePickerAllowed = state.runtime?.local_client !== false;
+      const outputDirectoryPicker = sourcePath === 'summarizer.path.output_folder_pattern' && nativePickerAllowed
+        ? `<button class="button secondary config-directory-picker" type="button" data-select-output-directory="${sourcePath}">选择路径</button>`
+        : '';
+      const ruleControl = isNamingRulePath(sourcePath) ? `<div class="naming-rule-control">${control}${outputDirectoryPicker}${namingRuleHelp(sourcePath)}</div>` : control;
+      const heading = `<span class="config-field-name" title="${escapeHtml(sourcePath)}">${escapeHtml(fieldLabel(sourcePath))}</span>`;
+      const help = `${description ? `<small class="config-description">${escapeHtml(description)}</small>` : ''}${note ? `<em>${escapeHtml(note)}</em>` : ''}`;
+      if (sourcePath === 'network.proxy_server') {
+        return `<div class="config-field proxy-test-field">${heading}${ruleControl}${help}<div class="form-actions"><button class="button secondary" type="button" id="test-preset-proxy">测试连通性</button><span id="preset-proxy-test-message" class="form-message"></span></div><div id="preset-proxy-test-result" class="proxy-test-result hidden"></div></div>`;
+      }
+      // Complex controls include their own focusable children. Wrapping them in a
+      // label makes browsers forward empty-area clicks to the first child button.
+      const fieldTag = complex ? 'div' : 'label';
+      const wideField = sourcePath === 'scanner.media_types' ? ' config-field-wide' : '';
+      return `<${fieldTag} class="config-field${wideField}">${heading}${ruleControl}${help}</${fieldTag}>`;
+    }).join('') || '<p class="muted">暂无设置项。</p>';
+    if (tab.id === 'translator') {
+      container.insertAdjacentHTML('beforeend', translatorAiControl(values.ai_enabled === true));
+    }
+    if (tab.id === 'scanner') {
+      container.insertAdjacentHTML('beforeend', `<label class="config-field web-config-field"><span class="config-field-name">多线程刮削 <small>(MovSP)</small></span><input id="preset-task-concurrency" type="number" min="1" max="32" value="${Math.max(1, Math.min(32, Number(state.taskConcurrency) || 1))}"><small class="config-description">同时处理的影片数量，其余任务排队等待。</small></label>`);
+    }
+  });
+  hydrateCollectionControls();
+}
+
+renderPresetNavigation();
+
+function readConfigFields() {
+  const values = cloneValue(state.formValues || {});
+  document.querySelectorAll('.config-field-input').forEach((control) => {
+    if (!control.dataset.configPath) return;
+    if (control.disabled) return;
+    const path = control.dataset.configPath;
+    const previous = pathValue(state.formValues || {}, path);
+    let value = control.type === 'checkbox' ? control.checked : control.value;
+    // Keep the form's types across local re-renders (for example, switching a
+    // translation engine). Leave YAML and invalid input for server validation.
+    if (control.type !== 'checkbox') {
+      if (typeof previous === 'boolean' && ['true', 'false'].includes(value)) value = value === 'true';
+      else if (typeof previous === 'number' && value.trim() && Number.isFinite(Number(value))) value = Number(value);
+      else if (previous === null && ['', 'null', '~'].includes(value.trim())) value = null;
+      else if (previous && typeof previous === 'object') {
+        try {
+          const parsed = JSON.parse(value);
+          if (parsed && typeof parsed === 'object' && Array.isArray(parsed) === Array.isArray(previous)) value = parsed;
+        } catch (_) { /* YAML text is normalized by the server. */ }
+      }
+    }
+    setPathValue(values, path, value);
+  });
+  document.querySelectorAll('.config-array[data-config-path]').forEach((control) => {
+    const items = [...control.querySelectorAll('[data-array-value]')]
+      .map((tag) => String(tag.dataset.arrayValue || '').trim())
+      .filter(Boolean);
+    setPathValue(values, control.dataset.configPath, items);
+  });
+  const requiredKeys = [...document.querySelectorAll('[data-required-key]:checked')].map((control) => control.value);
+  if (document.querySelector('[data-config-path="crawler.required_keys"]')) {
+    setPathValue(values, 'crawler.required_keys', requiredKeys);
+  }
+  // 预设里的刮削器是一份扁平有序列表（默认空）
+  if (document.querySelector('[data-crawler-selection-control]')) {
+    setPathValue(values, 'crawler.scrapers', crawlerSelectionFromDom());
+    // 旧字段不再维护，避免保存时又写回按分类的结构
+    if (values.crawler && typeof values.crawler === 'object') delete values.crawler.selection;
+  }
+  return Object.fromEntries(FORM_SECTIONS.map((section) => [section, values[section] || {}]));
+}
+
+function proxyConnectivityResultMarkup(result) {
+  const route = result.proxy_configured ? '配置代理' : '直连出口';
+  const exit = result.reachable ? `${escapeHtml(result.ip || '未知 IP')}，地区 ${escapeHtml(result.country || '未知')}` : '无法查询出口地区';
+  const sites = (result.restricted_sites || []).join('、');
+  let compatibility = '';
+  if (sites) compatibility = result.japan_compatible ? `<p class="form-message">${escapeHtml(sites)} 的出口地区满足已知限制。</p>` : `<p class="form-error">${escapeHtml(sites)} 存在日本地区访问限制，当前${route}${result.reachable ? `为 ${escapeHtml(result.country || '未知')} 地区` : '无法确认地区'}。</p>`;
+  const hint = result.clash_mihomo_hint ? `<details open><summary>Clash/Mihomo 覆写提示</summary><pre>${escapeHtml(result.clash_mihomo_hint)}</pre></details>` : '';
+  const preflight = result.preflight_message ? `<pre class="proxy-test-preflight">${escapeHtml(result.preflight_message)}</pre>` : '';
+  return `${preflight}<p><strong>${route}：</strong>${exit}</p>${compatibility}${hint}`;
+}
+
+function crawlerConfigMarkup(selection = {}) {
+  return `<div data-crawler-selection-control>${crawlerConfigTagsMarkup(selection)}</div>`;
+}
+
+// 已启用的刮削器（供预设页挑选）。扁平列表，不按能力/分类分组。
+function enabledScraperOptions() {
+  const disabled = new Set(state.disabledBuiltInCrawlers || []);
+  const fromState = (state.scrapers || []).map((item) => ({
+    name: item.name, display_name: item.display_name || item.name,
+    type: item.type, enabled: item.enabled,
+  }));
+  const source = fromState.length ? fromState : (state.crawlerSources || []).map((item) => ({
+    name: item.name, display_name: item.display_name || item.name,
+    type: 'site', enabled: !disabled.has(item.name),
+  }));
+  return source.filter((item) => !disabled.has(item.name) && item.enabled !== false);
+}
+
+function resolveScraperName(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const options = enabledScraperOptions();
+  const exact = options.find((item) => item.name === raw || item.display_name === raw);
+  if (exact) return exact.name;
+  // 允许保留已在配置里的旧 / 自定义模块名
+  if (/^[a-z][a-z0-9_]*$/.test(raw)) return raw;
+  return '';
+}
+
+// 预设里保存的刮削器有序列表：兼容旧的「按分类分组」结构
+function presetScraperList(selection) {
+  if (Array.isArray(selection)) return selection.map((item) => String(item || '').trim()).filter(Boolean);
+  if (selection && typeof selection === 'object') {
+    const ordered = [];
+    const keys = ['normal', ...Object.keys(selection).filter((key) => key !== 'normal')];
+    keys.forEach((key) => {
+      const names = selection[key];
+      if (Array.isArray(names)) ordered.push(...names.map((item) => String(item || '').trim()).filter(Boolean));
+    });
+    return [...new Set(ordered)];
+  }
+  return [];
+}
+
+function crawlerConfigTagsMarkup(selection = {}) {
+  const disabled = new Set(state.disabledBuiltInCrawlers || []);
+  const enabled = enabledScraperOptions();
+  const nameMap = new Map(enabled.map((item) => [item.name, item]));
+  const selected = presetScraperList(selection).filter((name) => !disabled.has(name));
+  const tags = selected.map((name, index) => {
+    const item = nameMap.get(name);
+    const label = item ? item.display_name : name;
+    const up = index > 0 ? `<button class="crawler-tag-move" type="button" data-crawler-move="up" data-crawler-move-name="${escapeHtml(name)}" title="上移" aria-label="上移 ${escapeHtml(name)}">↑</button>` : '';
+    const down = index < selected.length - 1 ? `<button class="crawler-tag-move" type="button" data-crawler-move="down" data-crawler-move-name="${escapeHtml(name)}" title="下移" aria-label="下移 ${escapeHtml(name)}">↓</button>` : '';
+    return `<span class="crawler-tag" data-crawler-value="${escapeHtml(name)}" title="${escapeHtml(name)}"><span class="crawler-tag-order">${index + 1}</span><strong class="crawler-tag-label">${escapeHtml(label)}</strong><code>${escapeHtml(name)}</code>${up}${down}<button class="crawler-tag-remove" type="button" data-remove-crawler-tag title="移除 ${escapeHtml(name)}" aria-label="移除 ${escapeHtml(name)}">×</button></span>`;
+  }).join('');
+  const available = enabled.filter((item) => !selected.includes(item.name));
+  const library = available.length
+    ? `<div class="crawler-library" data-crawler-library>${available.map((item) => `<button class="crawler-pick" type="button" data-crawler-pick="${escapeHtml(item.name)}" title="添加 ${escapeHtml(item.display_name)}">＋ ${escapeHtml(item.display_name)}</button>`).join('')}</div>`
+    : '<p class="muted crawler-library-empty">所有已启用的刮削器都已加入。</p>';
+  return `<div class="crawler-flat-picker">
+    <div class="crawler-flat-selected">
+      <span class="crawler-flat-label">本预设使用的刮削器（按顺序并发执行，靠前的优先提供字段）</span>
+      <div class="crawler-config-list crawler-tag-list">${tags || '<span class="muted crawler-tag-empty">还没有添加刮削器。从下方选择，或到「刮削器管理」启用更多。</span>'}</div>
+    </div>
+    <div class="crawler-flat-add">
+      <span class="crawler-flat-label">可添加的刮削器</span>
+      ${library}
+      <div class="crawler-add"><input class="crawler-add-input" list="crawler-name-options" maxlength="80" autocomplete="off" placeholder="输入或选择刮削器名称"><button class="icon-button crawler-add-button" type="button" title="添加刮削器" aria-label="添加刮削器">＋</button><datalist id="crawler-name-options">${enabled.map((item) => `<option value="${escapeHtml(item.name)}">${escapeHtml(item.display_name)}（${escapeHtml(item.name)}）</option>`).join('')}</datalist></div>
+    </div>
+  </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// 刮削器（搭积木）管理
+// ---------------------------------------------------------------------------
+const SCRAPER_TYPE_LABELS = { site: '站点爬虫', api: 'API 刮削器', local: '本地 / 离线' };
+const SCRAPER_KIND_LABELS = { built_in: '内置', plugin: '插件', custom: '自定义' };
+// 状态逐条翻译（对齐后端 11 种 state），http_error 再按状态码细分
+const SCRAPER_STATUS_LABELS = {
+  ok: '可用',
+  not_found: '未获取到测试数据',
+  invalid_response: '数据解析失败或不完整',
+  http_error: 'HTTP 响应异常',
+  timeout: '连接超时',
+  dns_error: '域名解析失败',
+  tls_error: '证书验证失败',
+  network_error: '网络或代理连接失败',
+  request_error: '请求异常',
+  canceled: '已取消',
+  unknown: '未检测',
+};
+const SCRAPER_HTTP_HINTS = { 401: '需要认证', 403: '访问被拒绝', 407: '代理需要认证', 429: '请求过于频繁' };
+function scraperByName(name) {
+  return (state.scrapers || []).find((item) => item.name === name) || null;
+}
+function scraperDisplayName(name) {
+  const item = scraperByName(name);
+  return (item && item.display_name) || name;
+}
+function scraperStatusLabel(status) {
+  const stateName = (status && status.state) || 'unknown';
+  const code = Number(status && status.http_status) || 0;
+  if (stateName === 'http_error' && SCRAPER_HTTP_HINTS[code]) return SCRAPER_HTTP_HINTS[code];
+  return SCRAPER_STATUS_LABELS[stateName] || '未检测';
+}
+function scraperStatusTone(stateName) {
+  if (stateName === 'ok') return 'ok';
+  if (['not_found', 'invalid_response', 'http_error'].includes(stateName)) return 'warn';
+  if (['timeout', 'dns_error', 'tls_error', 'network_error', 'request_error'].includes(stateName)) return 'bad';
+  return 'idle';
+}
+function scraperStatusDot(status) {
+  const stateName = (status && status.state) || 'unknown';
+  const tone = scraperStatusTone(stateName);
+  const label = scraperStatusLabel(status);
+  return `<span class="scraper-status scraper-status-${tone}" title="${escapeHtml((status && status.message) || label)}"><i class="scraper-status-dot"></i>${escapeHtml(label)}</span>`;
+}
+
+async function loadCrawlerNames() {
+  // 预设「爬虫」页仍沿用这两个字段；这里从新的刮削器目录派生，保持向后兼容。
+  try {
+    const result = await api('/api/scrapers');
+    state.scrapers = result.scrapers || [];
+    state.crawlerSources = state.scrapers.filter((item) => item.enabled)
+      .map((item) => ({ name: item.name, display_name: item.display_name, kind: item.kind }));
+    state.disabledBuiltInCrawlers = state.scrapers.filter((item) => !item.enabled).map((item) => item.name);
+    if (state.presetMode === 'form') renderConfigFields();
+  } catch (_) { /* 手动输入仍然可用：退回旧目录接口 */
+    try {
+      const result = await api('/api/crawler-config/names');
+      state.crawlerSources = result.crawlers || [];
+      state.disabledBuiltInCrawlers = result.disabled_built_ins || [];
+      if (state.presetMode === 'form') renderConfigFields();
+    } catch (_) { /* 保留已有列表 */ }
+  }
+}
+
+function scraperCardMarkup(item) {
+  const status = item.status || { state: 'unknown', message: '' };
+  const typeLabel = SCRAPER_TYPE_LABELS[item.type] || item.type;
+  const kindLabel = SCRAPER_KIND_LABELS[item.kind] || item.kind;
+  const configured = (item.settings_schema || []).filter((field) => item.settings && item.settings[field.key]).length;
+  const needsSetup = (item.settings_schema || []).some((field) => field.required && !(item.settings && item.settings[field.key]));
+  const setupHint = needsSetup ? '<span class="scraper-needs-setup">待配置</span>' : '';
+  const disabledNote = item.enabled ? '' : '<span class="scraper-disabled-note">已停用，不会出现在预设中</span>';
+  const editSource = item.editable_source ? `<button class="button secondary small" type="button" data-scraper-source="${escapeHtml(item.name)}">源码 / 配置</button>` : '';
+  const delButton = item.kind === 'custom' ? `<button class="icon-button scraper-delete" type="button" data-scraper-delete="${escapeHtml(item.name)}" title="删除自定义刮削器" aria-label="删除 ${escapeHtml(item.name)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13m-7 4v5m4-5v5"/></svg></button>` : '';
+  const httpText = Number(status.http_status) > 0 ? `<span>HTTP ${escapeHtml(String(status.http_status))}</span>` : '';
+  const elapsedText = Number(status.elapsed_ms) > 0 ? `<span>${escapeHtml(String(status.elapsed_ms))} ms</span>` : '';
+  const checkedText = status.checked_at
+    ? `<span class="scraper-checked-at">${escapeHtml(String(status.checked_at).slice(5, 16).replace('T', ' '))}</span>` : '';
+  const meta = (httpText || elapsedText || checkedText)
+    ? `<div class="scraper-card-meta">${httpText}${elapsedText}${checkedText}</div>` : '';
+  return `<article class="scraper-card${item.enabled ? ' enabled' : ' disabled'}" data-scraper-card="${escapeHtml(item.name)}">
+    <div class="scraper-card-head">
+      <label class="switch-label" title="${item.enabled ? '停用' : '启用'} ${escapeHtml(item.display_name)}"><input type="checkbox" role="switch" data-scraper-toggle="${escapeHtml(item.name)}"${item.enabled ? ' checked' : ''}><span class="switch-track" aria-hidden="true"></span><span class="scraper-switch-text">${item.enabled ? '已启用' : '已停用'}</span></label>
+      ${scraperStatusDot(status)}${delButton}
+    </div>
+    <div class="scraper-card-title"><strong>${escapeHtml(item.display_name)}</strong><code>${escapeHtml(item.name)}</code></div>
+    <div class="scraper-card-badges"><span class="scraper-type-badge type-${escapeHtml(item.type)}">${escapeHtml(typeLabel)}</span><span class="badge">${escapeHtml(kindLabel)}</span>${setupHint}</div>
+    <p class="scraper-card-desc">${escapeHtml(item.description || '')}</p>
+    <p class="scraper-card-status" title="${escapeHtml(status.message || '')}">${escapeHtml(status.message || '尚未检测')}</p>
+    ${meta}
+    ${disabledNote}
+    <div class="scraper-card-actions">
+      <button class="button secondary small" type="button" data-scraper-edit="${escapeHtml(item.name)}">编辑信息</button>
+      ${editSource}
+      <button class="button secondary small" type="button" data-scraper-test="${escapeHtml(item.name)}">检测</button>
+      ${configured ? `<span class="scraper-config-dot" title="已填写 ${configured} 项配置">⚙ ${configured}</span>` : ''}
+    </div>
+  </article>`;
+}
+
+function scraperGridMarkup() {
+  const all = state.scrapers || [];
+  const filter = state.scraperFilter || 'all';
+  const search = String(state.scraperSearch || '').trim().toLowerCase();
+  const items = all.filter((item) => {
+    if (filter === 'enabled' && !item.enabled) return false;
+    if (filter === 'disabled' && item.enabled) return false;
+    if (['site', 'api', 'local'].includes(filter) && item.type !== filter) return false;
+    if (search && !(String(item.display_name).toLowerCase().includes(search) || String(item.name).toLowerCase().includes(search) || String(item.description || '').toLowerCase().includes(search))) return false;
+    return true;
+  });
+  const counts = { all: all.length, enabled: all.filter((i) => i.enabled).length, disabled: all.filter((i) => !i.enabled).length };
+  const filters = [['all', `全部 ${counts.all}`], ['enabled', `已启用 ${counts.enabled}`], ['disabled', `已停用 ${counts.disabled}`], ['site', '站点爬虫'], ['api', 'API'], ['local', '本地']]
+    .map(([key, label]) => `<button class="scraper-filter${filter === key ? ' active' : ''}" type="button" data-scraper-filter="${key}">${escapeHtml(label)}</button>`).join('');
+  const filtersHost = $('#scraper-filters');
+  if (filtersHost) filtersHost.innerHTML = `<div class="scraper-filter-row">${filters}<input id="scraper-search" class="scraper-search" type="search" placeholder="搜索名称或说明" value="${escapeHtml(state.scraperSearch || '')}" aria-label="搜索刮削器"></div>`;
+  const summary = $('#scraper-summary');
+  if (summary) summary.textContent = `共 ${counts.all} 个 · 已启用 ${counts.enabled}`;
+  if (!items.length) return '<p class="muted scraper-empty">没有符合条件的刮削器。</p>';
+  // 单一扁平网格：这里只负责「显示 + 连接状态」，具体用哪个在刮削预设里选
+  return `<div class="scraper-grid">${items.map(scraperCardMarkup).join('')}</div>`;
+}
+
+async function loadCrawlerConfig() {
+  const host = $('#crawler-config-content');
+  if (!host) return;
+  host.innerHTML = '<p class="muted">正在读取刮削器…</p>';
+  try {
+    const result = await api('/api/scrapers');
+    state.scrapers = result.scrapers || [];
+    state.crawlerSources = state.scrapers.filter((item) => item.enabled)
+      .map((item) => ({ name: item.name, display_name: item.display_name, kind: item.kind }));
+    state.disabledBuiltInCrawlers = state.scrapers.filter((item) => !item.enabled).map((item) => item.name);
+    host.innerHTML = scraperGridMarkup();
+  } catch (error) { host.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`; }
+}
+
+function refreshScraperGrid() {
+  const host = $('#crawler-config-content');
+  if (host) host.innerHTML = scraperGridMarkup();
+}
+
+function scraperTestPanelMarkup(name) {
+  const item = scraperByName(name);
+  const display = item ? item.display_name : name;
+  const sample = (item && item.sample) || '';
+  const hint = item && item.type === 'api'
+    ? 'API 刮削器会真实请求远端接口，请确保已填好密钥。'
+    : '使用当前网络与代理配置，用这个刮削器自带的样本真实查询一次。';
+  const sampleNote = sample
+    ? `检测样本：<code>${escapeHtml(sample)}</code>`
+    : '这个刮削器尚未声明检测样本，只能做不联网的体检。';
+  return `<div class="scraper-test-head"><div><h3>检测 · ${escapeHtml(display)}</h3><p class="muted">${escapeHtml(hint)}</p><p class="muted">${sampleNote}</p></div><button class="icon-button" type="button" data-scraper-test-close aria-label="关闭检测面板">×</button></div>
+    <div class="scraper-test-controls"><label class="scraper-test-input-label">自定义查询（留空则用上面的样本）<input id="scraper-test-input" maxlength="256" placeholder="${escapeHtml(sample || '例如 SSIS-001 或影片标题')}"></label>
+    <button class="button secondary" type="button" data-scraper-run="${escapeHtml(name)}" data-mode="test"${sample ? '' : ' disabled'}>检测可用性</button>
+    <button class="button secondary" type="button" data-scraper-run="${escapeHtml(name)}" data-mode="check">仅体检（不联网）</button>
+    <span id="scraper-test-message" class="form-message"></span></div>
+    <div id="scraper-test-result" class="crawler-test-result hidden"><details open><summary>抓取结果</summary><pre id="scraper-test-data" class="crawler-test-output"></pre></details><details id="scraper-test-output-wrap"><summary>运行输出</summary><pre id="scraper-test-output" class="crawler-test-output"></pre></details></div>`;
+}
+
+function openScraperTest(name) {
+  const panel = $('#scraper-test-panel');
+  if (!panel) return;
+  state.scraperActive = name;
+  panel.innerHTML = scraperTestPanelMarkup(name);
+  panel.classList.remove('hidden');
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function scraperSettingsMarkup(item) {
+  const schema = item.settings_schema || [];
+  if (!schema.length) return '<p class="muted">这块积木没有额外配置项。</p>';
+  const fields = schema.map((field) => {
+    const value = (item.settings || {})[field.key] || '';
+    const isSecret = field.type === 'password';
+    return `<label class="scraper-setting-field"><span>${escapeHtml(field.label)}${field.required ? ' <em>*</em>' : ''}</span><input data-scraper-setting="${escapeHtml(field.key)}" type="${isSecret ? 'password' : 'text'}" value="${escapeHtml(value)}" placeholder="${escapeHtml(field.placeholder || '')}" autocomplete="off"><small class="muted">${escapeHtml(field.help || '')}</small></label>`;
+  }).join('');
+  return `<div class="scraper-settings-fields">${fields}</div>`;
+}
+
+function openScraperMeta(name) {
+  const item = scraperByName(name);
+  if (!item) return;
+  const dialog = $('#scraper-meta-dialog');
+  $('#scraper-meta-title').textContent = `编辑 · ${item.display_name}`;
+  $('#scraper-meta-message').textContent = '';
+  $('#scraper-meta-content').innerHTML = `<p class="muted">模块名 <code>${escapeHtml(item.name)}</code> 由引擎使用，不可修改。这里只改展示信息。</p>
+    <label>展示名称<input id="scraper-meta-name" maxlength="80" value="${escapeHtml(item.display_name)}"></label>
+    <label>说明<textarea id="scraper-meta-desc" rows="3" maxlength="500">${escapeHtml(item.description || '')}</textarea></label>
+    <label>主页 / 文档<input id="scraper-meta-home" maxlength="500" value="${escapeHtml(item.homepage || '')}"></label>
+    <div class="scraper-meta-divider"><h4>专项配置</h4>${scraperSettingsMarkup(item)}</div>
+    <input type="hidden" id="scraper-meta-target" value="${escapeHtml(item.name)}">`;
+  $('#scraper-meta-save').dataset.scraperMetaName = name;
+  dialog.showModal();
+}
+
+async function openScraperSource(name) {
+  const item = scraperByName(name);
+  const dialog = $('#scraper-source-dialog');
+  $('#scraper-source-title').textContent = `${item ? item.display_name : name} · 源码与配置`;
+  $('#scraper-source-message').textContent = '';
+  $('#scraper-source-content').innerHTML = '<p class="muted">正在读取源码…</p>' + (item ? scraperSettingsMarkup(item) : '');
+  $('#scraper-source-save').dataset.scraperSourceName = name;
+  const restore = $('#scraper-source-restore');
+  restore.dataset.scraperRestoreName = name;
+  restore.hidden = true;
+  dialog.showModal();
+  try {
+    const result = await api(`/api/scrapers/${encodeURIComponent(name)}/source`);
+    const editable = result.editable;
+    $('#scraper-source-content').innerHTML = `<label class="scraper-source-label">Python 源码${editable ? '' : '（内置只读）'}<textarea id="scraper-source-code" class="code-editor" spellcheck="false"${editable ? '' : ' readonly'}>${escapeHtml(result.source || '')}</textarea></label>
+      <div class="scraper-meta-divider"><h4>专项配置</h4>${scraperSettingsMarkup(item)}</div>`;
+    restore.hidden = !result.restorable;
+    $('#scraper-source-save').disabled = !editable;
+    state.scraperSourceEditable = editable;
+  } catch (error) {
+    $('#scraper-source-content').innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`;
+    $('#scraper-source-save').disabled = true;
+  }
+}
+
+function openScraperAdd() {
+  $('#scraper-add-name').value = '';
+  $('#scraper-add-display').value = '';
+  $('#scraper-add-message').textContent = '';
+  $('#scraper-add-dialog').showModal();
+}
+
+function collectScraperSettings(scopeSelector) {
+  const values = {};
+  document.querySelectorAll(`${scopeSelector} [data-scraper-setting]`).forEach((input) => {
+    values[input.dataset.scraperSetting] = input.value;
+  });
+  return values;
+}
+
+// 开关与搜索：委托给 document，避免卡片重渲染后丢失监听。
+document.addEventListener('change', async (event) => {
+  const toggle = event.target.closest('[data-scraper-toggle]');
+  if (!toggle) return;
+  const name = toggle.dataset.scraperToggle;
+  const enabled = toggle.checked;
+  const label = toggle.closest('.switch-label')?.querySelector('.scraper-switch-text');
+  toggle.disabled = true;
+  try {
+    const response = await api(`/api/scrapers/${encodeURIComponent(name)}/enable`, { method: 'POST', body: JSON.stringify({ enabled }) });
+    state.scrapers = response.scrapers || state.scrapers;
+    refreshScraperGrid();
+  } catch (error) {
+    toggle.checked = !enabled;
+    if (label) label.textContent = enabled ? '已停用' : '已启用';
+    showToast(error.message, 'error');
+  } finally { toggle.disabled = false; }
+});
+
+document.addEventListener('input', (event) => {
+  if (event.target.id === 'scraper-search') {
+    state.scraperSearch = event.target.value;
+    refreshScraperGrid();
+    const field = $('#scraper-search');
+    if (field) { field.focus(); field.setSelectionRange(field.value.length, field.value.length); }
+  }
+});
+
+const apiRequests = new Map();
+const taskResponses = new Map();
+async function api(path, options = {}) {
+  const { timeoutMs, ...requestOptions } = options;
+  const method = String(options.method || 'GET').toUpperCase();
+  if (method === 'GET' && apiRequests.has(path)) return apiRequests.get(path);
+  const request = (async () => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs ?? (method === 'GET' ? 20000 : 90000));
+    try {
+      const cached = method === 'GET' && path.startsWith('/api/tasks?') ? taskResponses.get(path) : null;
+      const conditional = cached ? { 'If-None-Match': cached.etag } : {};
+      const response = await fetch(path, { credentials: 'include', ...requestOptions, signal: controller.signal, headers: { 'Content-Type': 'application/json', ...conditional, ...(options.headers || {}) } });
+      if (response.status === 401) { location.href = MOBILE_APP ? '/login?mobile=1' : '/login'; throw new Error('登录已过期'); }
+      if (response.status === 304 && cached) return cached.data;
+      // 服务端崩溃时返回的是纯文本（如 "Internal Server Error"），
+      // 直接 response.json() 会抛出难懂的 "Unexpected token" 错误。
+      // 先读文本再解析；环境不提供 text() 时退回 json()。
+      let data = null;
+      if (typeof response.text === 'function') {
+        const raw = await response.text();
+        try {
+          data = raw ? JSON.parse(raw) : null;
+        } catch (_) {
+          data = null;
+        }
+        if (data === null) {
+          throw new Error(response.ok
+            ? '服务端返回了无法解析的内容，请刷新后重试'
+            : `服务端出错（HTTP ${response.status}）：请查看控制台日志`);
+        }
+      } else {
+        data = await response.json();
+      }
+      if (!response.ok) throw new Error(formatApiError(data.detail, response.status));
+      if (method === 'GET' && path.startsWith('/api/tasks?')) {
+        taskResponses.set(path, { etag: response.headers.get('ETag'), data });
+        if (taskResponses.size > 20) taskResponses.delete(taskResponses.keys().next().value);
+      }
+      return data;
+    } catch (error) {
+      state.pollFailed = true;
+      if (error.name === 'AbortError') throw new Error(method === 'GET' ? '请求超时，请稍后重试' : '暂未收到处理结果。请先刷新列表确认是否已完成，再决定是否重新提交。');
+      throw error;
+    } finally { window.clearTimeout(timer); }
+  })();
+  if (method === 'GET') apiRequests.set(path, request);
+  try { return await request; }
+  finally { if (apiRequests.get(path) === request) apiRequests.delete(path); }
+}
+
+// Keep unchanged cards, images and detail sections mounted during polling.
+const renderedMarkup = new WeakMap();
+function patchChildren(container, markup) {
+  if (!container || renderedMarkup.get(container) === markup) return;
+  const template = document.createElement('template');
+  template.innerHTML = markup;
+  // Empty-state text is not in .children and must not survive the first result.
+  [...container.childNodes].filter((node) => node.nodeType !== 1).forEach((node) => node.remove());
+  const key = (node, index) => node.id || node.dataset?.taskCard || `${node.tagName}:${node.className}:${index}`;
+  const oldNodes = new Map([...container.children].map((node, index) => [key(node, index), node]));
+  const images = new Map([...container.querySelectorAll('img')].map((node) => [node.getAttribute('src'), node]));
+  const nodes = [...template.content.children].map((node, index) => {
+    const old = oldNodes.get(key(node, index));
+    if (old && old.outerHTML === node.outerHTML) return old;
+    node.querySelectorAll('img').forEach((img) => { const existing = images.get(img.getAttribute('src')); if (existing) img.replaceWith(existing); });
+    if (old?.tagName === 'DETAILS') node.open = old.open;
+    return node;
+  });
+  nodes.forEach((node, index) => { if (container.children[index] !== node) container.insertBefore(node, container.children[index] || null); });
+  while (container.children.length > nodes.length) container.lastElementChild.remove();
+  renderedMarkup.set(container, markup);
+}
+
+async function uploadTaskCover(taskId, file) {
+  const form = new FormData();
+  form.append('file', file, file.name || 'cover.jpg');
+  const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/cover/upload`, { method: 'POST', credentials: 'include', body: form });
+  if (response.status === 401) { location.href = MOBILE_APP ? '/login?mobile=1' : '/login'; throw new Error('登录已过期'); }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(formatApiError(data.detail, response.status));
+  return data;
+}
+
+function formatApiError(detail, status) {
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const labels = { name: '名称', type: '类型', url: '服务地址', external_url: '外部播放地址', api_key: 'API 密钥', libraries: '管理的媒体库', username: '用户名', password: '密码', password_confirm: '确认密码', model: '模型名称', base_url: '模型 API 地址', timeout: '请求超时', context_tokens: '最长上下文', max_output_tokens: '最大输出长度', check_interval_hours: '检查间隔', input_directory: '待处理路径', preset_id: '刮削预设', cron: '运行时间', port: '端口', source: 'Skill 内容' };
+    const messages = detail.map((item) => {
+      if (!item || typeof item !== 'object') return String(item || '');
+      const field = Array.isArray(item.loc) ? item.loc.filter((part) => part !== 'body').at(-1) : '';
+      const label = labels[field] || field || '输入内容';
+      const common = { missing: '不能为空', string_type: '请填写文字', int_type: '请填写整数', int_parsing: '请填写整数', float_type: '请填写数字', float_parsing: '请填写数字', bool_type: '请选择是否启用', bool_parsing: '请选择是否启用', list_type: '请按列表格式填写', dict_type: '请按配置项和内容填写', url_parsing: '请填写完整网址，例如 https://example.com', extra_forbidden: '不支持此设置，请刷新页面后重试' };
+      const limits = { greater_than_equal: ['不能小于', 'ge'], greater_than: ['必须大于', 'gt'], less_than_equal: ['不能大于', 'le'], less_than: ['必须小于', 'lt'], string_too_short: ['字符数不能少于', 'min_length'], string_too_long: ['字符数不能超过', 'max_length'] };
+      const limit = limits[item.type];
+      const original = String(item.msg || '').replace(/^Value error, /, '');
+      const message = common[item.type] || (limit && Number.isFinite(item.ctx?.[limit[1]]) ? `${limit[0]} ${item.ctx[limit[1]]}` : /[\u3400-\u9fff]/.test(original) ? original : '格式不正确，请检查填写的内容');
+      return `${label}${message.startsWith('不') || message.startsWith('必') ? '' : '：'}${message}`;
+    }).filter(Boolean);
+    if (messages.length) return messages.join('；');
+  }
+  if (detail && typeof detail === 'object') {
+    const message = detail.message || detail.error || detail.detail;
+    if (typeof message === 'string' && message.trim()) return message;
+    try { return JSON.stringify(detail); } catch (_) { return '请求失败'; }
+  }
+  return status === 422 ? '请检查填写的内容' : '请求失败';
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[character]));
+}
+
+function renderGoogleBrowser(taskId) {
+  const target = $('#google-cover-candidates');
+  if (!target) return;
+  const path = encodeURIComponent(`api/tasks/${taskId}/cover/browser`);
+  target.innerHTML = `<section class="google-captcha-panel"><strong>Google 要求完成验证码</strong><p class="muted">请直接在下方真实 Google 浏览器窗口中完成验证。</p><iframe class="google-browser-frame" src="/google-browser/vnc.html?autoconnect=true&resize=remote&path=${path}" title="Google 浏览器"></iframe></section>`;
+}
+
+function renderGoogleCoverLoading() {
+  const target = $('#google-cover-candidates');
+  if (!target) return;
+  target.innerHTML = '<section class="google-cover-loading" role="status"><i></i><strong>正在查询全部已配置爬虫</strong></section>';
+}
+
+function googleImageSearchUrl(task) {
+  const query = task?.progress?.metadata?.dvdid || task?.file_name || task?.name || '';
+  return `https://www.google.com/search?tbm=isch&safe=off&filter=0&hl=zh-CN&q=${encodeURIComponent(query)}`;
+}
+
+function renderGoogleClientSearch(task) {
+  const target = $('#google-cover-candidates');
+  if (!target) return;
+  const url = googleImageSearchUrl(task);
+  target.innerHTML = `<section class="google-client-search"><div class="google-client-search-heading"><strong>在本机浏览器中选择封面</strong><button class="button secondary" type="button" data-open-google-client-search="${escapeHtml(url)}">打开 Google 图片</button></div><label class="google-cover-upload">上传已选封面<input type="file" accept="image/jpeg,image/png,image/webp" data-local-cover-upload="${escapeHtml(task.id)}"></label></section>`;
+}
+
+function openGoogleClientSearch(url) {
+  const tab = window.open(url, '_blank');
+  if (tab) tab.opener = null;
+}
+
+function renderGoogleCoverCandidates(taskId, candidates) {
+  const target = $('#google-cover-candidates');
+  if (!target) return;
+  target.innerHTML = candidates.map((candidate) => `<button class="google-cover-option" type="button" data-google-cover-select="${escapeHtml(taskId)}" data-candidate-id="${escapeHtml(candidate.id)}"><img src="/api/tasks/${encodeURIComponent(taskId)}/cover/candidates/${encodeURIComponent(candidate.id)}/thumbnail" loading="lazy" alt="候选封面"><span>${escapeHtml(candidate.source || '搜索结果')}${candidate.width && candidate.height ? ` · ${candidate.width}×${candidate.height}` : ''}</span><small>${escapeHtml(candidate.title || '选择此封面')}</small></button>`).join('');
+}
+
+async function waitForCrawlerCoverCandidates(taskId) {
+  for (let attempt = 0; attempt < 90; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    if (state.googleCoverDialogDismissed || state.googleCoverDialogTaskId !== taskId) return;
+    try {
+      const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/cover/candidates`);
+      if (result.status === 'succeeded') {
+        renderGoogleCoverCandidates(taskId, result.candidates || []);
+        return;
+      }
+      if (result.status === 'failed') {
+        $('#google-cover-message').textContent = result.error || '爬虫未返回可下载封面';
+        return;
+      }
+    } catch (error) {
+      $('#google-cover-message').textContent = error.message;
+      return;
+    }
+  }
+  $('#google-cover-message').textContent = '爬虫封面搜索超时，请查看任务日志';
+}
+
+async function waitForCrawlerCoverSelection(taskId) {
+  for (let attempt = 0; attempt < 90; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/cover/candidates`);
+    if (result.status === 'selected') return;
+    if (result.status === 'failed') throw new Error(result.error || '封面下载失败');
+  }
+  throw new Error('封面下载超时，请查看任务日志');
+}
+
+$('#google-cover-dialog')?.addEventListener('close', () => {
+  state.googleCoverDialogDismissed = true;
+});
+
+function showToast(message, tone = 'success') {
+  const host = document.querySelector('dialog[open]') || document.body;
+  let container = host.querySelector(':scope > #toast-container');
+  if (!container) {
+    document.querySelectorAll('#toast-container').forEach((item) => item.remove());
+    container = document.createElement('div');
+    container.id = 'toast-container';
+    container.className = 'toast-container';
+    container.setAttribute('aria-live', 'polite');
+    host.appendChild(container);
+  }
+  const toast = document.createElement('div');
+  toast.className = `toast ${tone}`;
+  toast.textContent = message;
+  container.appendChild(toast);
+  window.setTimeout(() => { toast.classList.add('leaving'); }, 2800);
+  window.setTimeout(() => { toast.remove(); }, 3200);
+}
+
+function expandControlIcon(expanded) {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${expanded ? 'm7 15 5-5 5 5' : 'm7 9 5 5 5-5'}"/></svg>`;
+}
+
+function taskLogMarkup(task, key = task.id, className = 'task-raw-log') {
+  const entries = task.log_entries || (task.log_tail || []).map(message => ({ group: 'notes', level: 'info', message }));
+  if (!entries.length) return '<p class="muted">任务尚未输出日志。</p>';
+  const groups = { result: '任务结果', process: '处理过程', sources: '数据源', images: '图片下载', notes: '其他记录' };
+  const sourceEntries = entries.filter(entry => entry.group === 'sources');
+  const success = sourceEntries.filter(entry => entry.level === 'success').length;
+  const sourceSummary = sourceEntries.length ? ` · ${success}/${sourceEntries.length} 个数据源取得资料` : '';
+  const text = (task.log_tail || entries.map(entry => entry.message)).join('\n');
+  const content = Object.entries(groups).map(([group, label]) => {
+    const rows = entries.filter(entry => entry.group === group);
+    if (!rows.length) return '';
+    return `<section class="log-section"><h4>${label}${group === 'sources' ? `<span>${success}/${sourceEntries.length} 成功</span>` : ''}</h4>${rows.map((entry, index) => {
+      const level = ['info', 'running', 'success', 'warning', 'error', 'muted'].includes(entry.level) ? entry.level : 'info';
+      const message = `<span class="log-dot" aria-hidden="true"></span><span>${escapeHtml(entry.message)}</span>`;
+      return entry.detail ? `<details class="log-row log-${level}" data-task-details="${escapeHtml(key)}-${group}-${index}"><summary>${message}<span class="log-expand">详情</span></summary><p>${escapeHtml(entry.detail)}</p></details>` : `<div class="log-row log-${level}">${message}</div>`;
+    }).join('')}</section>`;
+  }).join('');
+  return `<details class="${className}" data-task-details="${escapeHtml(key)}"><summary>任务日志${sourceSummary}</summary><div class="task-log-wrap task-log-readable"><div class="log-toolbar"><span>进度自动更新 · 相同事件合并显示</span><button class="copy-log" type="button" data-copy-task="${escapeHtml(key)}">复制摘要</button></div><div class="task-log log-sections" data-task-log="${escapeHtml(key)}" data-copy-text="${escapeHtml(text)}">${content}</div></div></details>`;
+}
+
+function crawlerStatusClass(status) {
+  const value = String(status || '');
+  if (value.startsWith('重试')) return 'retrying';
+  if (value === '完成') return 'completed';
+  if (value === '失败') return 'failed';
+  if (value === '未找到' || value === '重复') return 'inactive';
+  return 'running';
+}
+
+function crawlerTooltip(status, detail) {
+  const info = detail || {};
+  if (status === '完成') {
+    return [
+      info.dvdid && `番号：${info.dvdid}`,
+      info.title && `标题：${info.title}`,
+      info.url && `来源：${info.url}`,
+    ].filter(Boolean).join('\n') || '查询结束，未取得影片资料。';
+  }
+  if (info.reason) return `原因：${info.reason}`;
+  if (status.startsWith('重试')) return `正在重试${info.attempt ? `（${info.attempt}/${info.total || '?'}）` : ''}`;
+  if (status === '未找到') return '该数据源未找到匹配的影片。';
+  if (status === '重复') return '该数据源返回了多个无法自动判定的结果。';
+  return '正在等待该爬虫返回结果。';
+}
+
+function progressMarkup(task) {
+  const progress = task.progress || { stages: {}, crawlers: {} };
+  const stage = (key, label) => {
+    const item = progress.stages?.[key] || { percent: 0, done: 0, total: 0 };
+    const count = item.total ? `${item.done}/${item.total}` : `${item.percent}%`;
+    return `<div class="progress-stage"><div class="progress-stage-head"><strong>${label}</strong><span>${count}</span></div><div class="progress-track"><i style="width:${Math.max(0, Math.min(100, item.percent || 0))}%"></i></div></div>`;
+  };
+  const crawlerUnits = Object.entries(progress.crawlers || {}).map(([name, status]) => `<span class="crawler-unit"><b>${escapeHtml(name)}</b><em>${escapeHtml(status)}</em></span>`).join('');
+  return `<div class="scrape-progress">${stage('concurrent', '并发任务')}${crawlerUnits ? `<div class="crawler-units">${crawlerUnits}</div>` : ''}${stage('summary', '汇总数据')}${stage('images', '下载图片')}</div>`;
+}
+
+function progressMarkup(task) {
+  const progress = task.progress || { stages: {}, crawlers: {} };
+  const circle = (key, label) => {
+    const item = progress.stages?.[key] || { percent: 0, done: 0, total: 0 };
+    const percent = Math.max(0, Math.min(100, item.percent || 0));
+    const count = item.total ? `${item.done}/${item.total}` : `${percent}%`;
+    return `<div class="wave-progress" style="--progress:${percent}%"><div class="wave-progress-content"><b>${percent}%</b><span>${label}</span><em>${count}</em></div></div>`;
+  };
+  const crawlerDetails = progress.crawler_details || {};
+  const crawlerUnits = Object.entries(progress.crawlers || {}).map(([name, status]) => `<span class="crawler-unit crawler-${crawlerStatusClass(status)}" tabindex="0"><b>${escapeHtml(name.replace('javsp.web.', ''))}</b><em>${escapeHtml(status)}</em><span class="crawler-tooltip" role="tooltip">${escapeHtml(crawlerTooltip(status, crawlerDetails[name]))}</span></span>`).join('');
+  return `<div class="scrape-progress scrape-progress-circles">${circle('concurrent', '并发任务')}${circle('summary', '汇总数据')}${circle('images', '下载图片')}<div class="crawler-units">${crawlerUnits || '<span class="muted">等待爬虫状态</span>'}</div></div>`;
+}
+
+function progressMarkup(task) {
+  const progress = task.progress || { stages: {}, crawlers: {}, metadata: {}, images: {} };
+  const stageData = (key) => progress.stages?.[key] || { percent: 0, done: 0, total: 0 };
+  const circle = (key, label) => {
+    const item = stageData(key);
+    const percent = Math.max(0, Math.min(100, Number(item.percent) || 0));
+    const count = item.total ? `${item.done}/${item.total}` : `${percent}%`;
+    return `<div class="wave-progress" style="--progress:${percent}%"><div class="wave-progress-content"><b>${percent}%</b><span>${label}</span><em>${count}</em></div></div>`;
+  };
+  const crawlerDetails = progress.crawler_details || {};
+  const crawlerUnits = Object.entries(progress.crawlers || {}).map(([name, status]) => `<span class="crawler-unit crawler-${crawlerStatusClass(status)}" tabindex="0"><b>${escapeHtml(name.replace('javsp.web.', ''))}</b><em>${escapeHtml(status)}</em><span class="crawler-tooltip" role="tooltip">${escapeHtml(crawlerTooltip(status, crawlerDetails[name]))}</span></span>`).join('');
+  const metadata = progress.metadata || {};
+  // JAV 与电影/剧集是不同的资料结构：番号、制作商、发行商只对 JAV 有意义，
+  // 电影/剧集应该看片名、演员、导演和外部 ID。
+  const isTitlePath = (progress.scrape_path || '') === 'title';
+  const metadataRows = (isTitlePath
+    ? [
+        ['标题', metadata.title],
+        ['原始标题', metadata.ori_title && metadata.ori_title !== metadata.title ? metadata.ori_title : ''],
+        ['演员', Array.isArray(metadata.actress) ? metadata.actress.join('、') : metadata.actress],
+        ['导演', metadata.director],
+        ['制作商', metadata.producer],
+        ['发行时间', metadata.publish_date],
+        ['时长', metadata.duration ? `${metadata.duration} 分钟` : ''],
+        ['TMDb', metadata.tmdb_id],
+        ['IMDb', metadata.imdb_id],
+      ]
+    : [
+        ['番号', metadata.dvdid], ['标题', metadata.title],
+        ['演员', Array.isArray(metadata.actress) ? metadata.actress.join('、') : metadata.actress],
+        ['导演', metadata.director], ['制作商', metadata.producer],
+        ['发行商', metadata.publisher], ['发行时间', metadata.publish_date],
+      ]).map(([label, value]) => `<div class="metadata-row"><dt>${label}</dt><dd>${escapeHtml(value || '-')}</dd></div>`).join('');
+  const imageInfo = progress.images || {};
+  const imageBlocks = imageCountsMarkup({ coverDone: imageInfo.cover_done, coverStatus: imageInfo.cover_status, fanartDone: imageInfo.fanart_done, fanartTotal: imageInfo.fanart_total, fanartStatus: imageInfo.fanart_status, fanartFailures: imageInfo.fanart_failures });
+  return `<div class="scrape-progress stage-panels"><section class="progress-panel progress-concurrent"><div class="progress-panel-heading"><strong>并发任务</strong></div>${circle('concurrent', '并发任务')}<div class="crawler-units">${crawlerUnits || '<span class="muted">等待爬虫状态</span>'}</div></section><section class="progress-panel progress-summary"><div class="progress-panel-heading"><strong>汇总数据</strong></div>${circle('summary', '汇总数据')}<dl class="metadata-grid">${metadataRows}</dl></section><section class="progress-panel progress-images"><div class="progress-panel-heading"><strong>下载图片</strong></div>${circle('images', '下载图片')}${imageBlocks}</section></div>`;
+}
+
+function imageCountsMarkup({ coverDone = 0, coverStatus = 'pending', fanartDone = 0, fanartTotal = 0, fanartStatus = 'pending', fanartFailures = [] }) {
+  const total = Math.max(0, Number(fanartTotal) || 0);
+  const done = Math.min(Math.max(0, Number(fanartDone) || 0), total);
+  const failures = new Set((fanartFailures || []).map((value) => Number(value)));
+  const coverLabel = coverDone ? '封面已下载' : (coverStatus === 'failed' ? '封面下载失败' : (coverStatus === 'downloading' ? '正在下载封面' : '封面未下载'));
+  const coverClass = coverDone ? 'done' : (coverStatus === 'failed' ? 'failed' : (coverStatus === 'downloading' ? 'downloading' : ''));
+  const fanartBlocks = Array.from({ length: total }, (_, index) => {
+    const current = index + 1;
+    const failed = failures.has(current);
+    const completed = current <= done && !failed;
+    const downloading = !completed && !failed && fanartStatus === 'downloading' && current === done + 1;
+    const label = completed ? `剧照 ${current} 已下载` : (failed ? `剧照 ${current} 下载失败` : (downloading ? `正在下载剧照 ${current}` : `剧照 ${current} 未下载`));
+    return `<i class="image-block ${completed ? 'done' : ''}${failed ? ' failed' : ''}${downloading ? ' downloading' : ''}" title="${label}"></i>`;
+  }).join('');
+  const fanartLabel = total ? (fanartStatus === 'failed' ? `剧照下载失败（${done}/${total}）` : `剧照 ${done}/${total}`) : '暂无剧照';
+  return `<div class="image-counts"><span class="image-kind">封面</span><i class="image-block ${coverClass}" title="${coverLabel}"></i><em class="image-state ${coverClass}">${coverLabel}</em><span class="image-kind">剧照</span>${fanartBlocks || '<em class="muted">暂无剧照</em>'}<em class="image-state ${fanartStatus === 'failed' ? 'failed' : ''}">${fanartLabel}</em></div>`;
+}
+
+function rememberLogScroll() {
+  document.querySelectorAll('[data-task-log]').forEach((log) => { state.logScroll[log.dataset.taskLog] = log.scrollTop; });
+  document.querySelectorAll('[data-task-details]').forEach((details) => { state.logOpen[details.dataset.taskDetails] = details.open; });
+}
+
+function restoreLogScroll() {
+  document.querySelectorAll('[data-task-log]').forEach((log) => { log.scrollTop = state.logScroll[log.dataset.taskLog] || 0; });
+  document.querySelectorAll('[data-task-details]').forEach((details) => { details.open = Boolean(state.logOpen[details.dataset.taskDetails]); });
+}
+
+function hasTaskDetailLogSelection() {
+  const selection = window.getSelection?.();
+  const content = $('#task-detail-content');
+  if (!selection || selection.isCollapsed || !selection.rangeCount || !content) return false;
+  return content.contains(selection.anchorNode) && content.contains(selection.focusNode);
+}
+
+function taskPageRequest() {
+  const view = document.querySelector('.view.active')?.dataset.panel;
+  if (!['overview', 'scrape'].includes(view)) return null;
+  const params = new URLSearchParams();
+  // 概览现在是使用看板：只列任务记录；媒体浏览在“媒体库”页
+  params.set('view', view === 'overview' ? 'all' : 'manual');
+  const size = view === 'overview' ? state.overviewPageSize : state.taskPageSize;
+  const page = view === 'overview' ? state.overviewPage - 1 : state.taskPage;
+  params.set('limit', size); params.set('offset', page * size);
+  if (view !== 'overview') {
+    const controls = { query: 'query', field: 'field', status: 'status', size_min: 'size-min', size_max: 'size-max' };
+    Object.entries(controls).forEach(([key, id]) => { const value = $(`#task-filter-${id}`)?.value; if (value) params.set(key, value); });
+    const from = $('#task-filter-date-from')?.value;
+    const to = $('#task-filter-date-to')?.value;
+    if (from) params.set('date_from', new Date(`${from}T00:00:00`).toISOString());
+    if (to) params.set('date_to', new Date(`${to}T23:59:59.999`).toISOString());
+  }
+  return `/api/tasks?${params}`;
+}
+
+async function loadTasks() {
+  const path = taskPageRequest();
+  if (!path) return;
+  if (state.tasksLoading) {
+    state.reloadTasks = true;
+    return state.taskRequest;
+  }
+  state.tasksLoading = true;
+  state.taskRequest = (async () => {
+    try {
+      const result = await api(path);
+      if (path !== taskPageRequest()) return;
+      const signature = JSON.stringify(result);
+      const view = document.querySelector('.view.active')?.dataset.panel;
+      state.taskMetrics = result.metrics || {};
+      state.mediaWarnings = result.warnings || [];
+      if (Array.isArray(result.groups)) {
+        state.overviewGroups = result;
+        state.overviewGroupBy = result.by || state.overviewGroupBy;
+        state.overviewLibrariesAvailable = result.libraries_available !== false;
+        state.overviewFilmCount = Number(result.all?.count || 0);
+        state.overviewGroupPage = Math.floor(result.offset / result.limit) + 1;
+        state.tasks = [];
+        state.taskTotal = 0;
+      } else {
+        state.tasks = result.items || [];
+        state.taskTotal = Number(result.total || 0);
+        if (view === 'overview' && (state.overviewGroupBy === 'all' || state.overviewGroup?.key === '__all__') && !state.overviewQuery) state.overviewFilmCount = state.taskTotal;
+      }
+      if (view === 'overview') { if (!Array.isArray(result.groups)) state.overviewPage = Math.floor(result.offset / result.limit) + 1; }
+      else state.taskPage = Math.floor(result.offset / result.limit);
+      if (state.tasksSignature !== signature || state.tasksView !== view) {
+        state.tasksSignature = signature; state.tasksView = view;
+        syncTaskExpansion(state.tasks);
+        if (view === 'overview') renderOverview();
+        if (view === 'scrape') renderTasks();
+      }
+      $('#task-load-error')?.remove();
+    } catch (error) {
+      if (!$('#task-load-error')) $('.view.active')?.insertAdjacentHTML('afterbegin', '<p id="task-load-error" class="form-error" role="status"></p>');
+      if ($('#task-load-error')) $('#task-load-error').textContent = `${error.message}，稍后自动重试。`;
+    } finally {
+      state.tasksLoading = false;
+      if (state.reloadTasks) { state.reloadTasks = false; queueMicrotask(loadTasks); }
+    }
+  })();
+  await state.taskRequest;
+  if ($('#task-detail-dialog')?.open && !state.taskMetadataEditing && !state.taskDetailLogSelecting && !hasTaskDetailLogSelection()) await openTaskDetail(state.activeTaskDetail, true);
+  if ($('#auto-scrape-run-dialog')?.open && state.activeAutoScrapeHistory) renderAutoScrapeHistory(state.activeAutoScrapeHistory);
+}
+
+function normalizeVersion(value) { return String(value || '').replace(/^[vV]+/, ''); }
+
+function compareReleaseVersions(left, right) {
+  const parse = (value) => normalizeVersion(value).match(/^(\d+)\.(\d+)\.(\d+)/);
+  const leftParts = parse(left);
+  const rightParts = parse(right);
+  if (!leftParts || !rightParts) return null;
+  for (let index = 1; index <= 3; index += 1) {
+    const difference = Number(leftParts[index]) - Number(rightParts[index]);
+    if (difference) return difference;
+  }
+  return 0;
+}
+
+async function checkForAppUpdate(runtime) {
+  const tag = $('#app-version');
+  if (!tag) return;
+  const displayVersion = normalizeVersion(runtime.version || runtime.app_version || tag.textContent);
+  const currentVersion = normalizeVersion(runtime.app_version || displayVersion);
+  tag.textContent = `v${normalizeVersion(displayVersion)}`;
+  tag.dataset.updateStatus = 'checking';
+  tag.title = '正在检查新版本';
+  try {
+    const update = await api('/api/update');
+    const result = update.result || {};
+    const latestVersion = result.target || '';
+    const comparison = result.error ? null : result.available ? -1 : result.checked_at ? 0 : (latestVersion ? compareReleaseVersions(currentVersion, latestVersion) : null);
+    if (comparison !== null && comparison < 0) {
+      tag.dataset.updateStatus = 'available';
+      tag.textContent = `v${normalizeVersion(displayVersion)} 可更新`;
+      tag.title = `发现${result.channel === 'bata' ? '体验版' : '正式版'}更新 ${latestVersion}`;
+    } else if (comparison !== null) {
+      tag.dataset.updateStatus = 'current';
+      tag.textContent = `v${normalizeVersion(displayVersion)} 已是最新`;
+      tag.title = `已是最新版本 ${latestVersion || displayVersion}`;
+    } else {
+      tag.dataset.updateStatus = 'unknown';
+      tag.title = '暂时无法确认是否有更新，请到系统设置中重新检查。';
+    }
+  } catch (_) {
+    tag.dataset.updateStatus = 'unknown';
+    tag.title = '暂时无法检查更新，请稍后重试。';
+  }
+}
+
+const UPDATE_OVERLAY_KEY = 'javsp-web.update-job';
+let updateOverlayTimer = null;
+let updateOverlayJobId = '';
+let updateOverlayStartedAt = 0;
+
+function showUpdateOverlay(message, phase = 'running') {
+  const overlay = $('#update-overlay');
+  const opening = overlay.hidden;
+  overlay.hidden = false;
+  overlay.dataset.phase = phase;
+  $('#update-overlay-title').textContent = phase === 'failed' ? '更新未完成' : phase === 'updated' ? '更新完成' : '正在更新应用';
+  $('#update-overlay-status').textContent = message;
+  $('#update-overlay-close').hidden = phase !== 'failed';
+  document.body.classList.add('update-in-progress');
+  if (phase === 'failed') $('#update-overlay-close').focus();
+  else if (opening) overlay.focus();
+}
+
+function closeUpdateOverlay() {
+  window.clearTimeout(updateOverlayTimer);
+  updateOverlayTimer = null;
+  updateOverlayJobId = '';
+  $('#update-overlay').hidden = true;
+  document.body.classList.remove('update-in-progress');
+  try { sessionStorage.removeItem(UPDATE_OVERLAY_KEY); } catch (_) { }
+  $('#update-apply-now')?.focus();
+}
+
+async function pollUpdateOverlay() {
+  if (!updateOverlayJobId) return;
+  try {
+    const payload = await api('/api/update');
+    const job = payload.job || {};
+    if (job.id === updateOverlayJobId && job.status === 'updated') {
+      updateOverlayJobId = '';
+      try { sessionStorage.removeItem(UPDATE_OVERLAY_KEY); } catch (_) { }
+      showUpdateOverlay('应用更新成功，正在刷新页面…', 'updated');
+      window.setTimeout(() => location.reload(), 1500);
+      return;
+    }
+    if (job.id === updateOverlayJobId && ['failed', 'rolled_back', 'interrupted'].includes(job.status)) {
+      updateOverlayJobId = '';
+      try { sessionStorage.removeItem(UPDATE_OVERLAY_KEY); } catch (_) { }
+      showUpdateOverlay(job.message || '应用更新失败，请检查更新状态后重试。', 'failed');
+      return;
+    }
+    showUpdateOverlay(job.id === updateOverlayJobId && job.message ? job.message : '正在确认更新状态…');
+  } catch (_) {
+    showUpdateOverlay('服务暂时不可用，正在等待更新后重新连接…');
+  }
+  if (Date.now() - updateOverlayStartedAt >= 15 * 60 * 1000) {
+    updateOverlayJobId = '';
+    try { sessionStorage.removeItem(UPDATE_OVERLAY_KEY); } catch (_) { }
+    showUpdateOverlay('长时间未能确认更新结果，请刷新页面查看状态或检查容器日志。', 'failed');
+    return;
+  }
+  updateOverlayTimer = window.setTimeout(pollUpdateOverlay, 2500);
+}
+
+function watchUpdateJob(record) {
+  updateOverlayJobId = record.id;
+  updateOverlayStartedAt = record.startedAt || Date.now();
+  try { sessionStorage.setItem(UPDATE_OVERLAY_KEY, JSON.stringify({ id: record.id, startedAt: updateOverlayStartedAt })); } catch (_) { }
+  showUpdateOverlay('正在下载并校验更新…');
+  window.clearTimeout(updateOverlayTimer);
+  updateOverlayTimer = window.setTimeout(pollUpdateOverlay, 500);
+}
+
+function restoreUpdateOverlay() {
+  try {
+    const record = JSON.parse(sessionStorage.getItem(UPDATE_OVERLAY_KEY) || 'null');
+    if (record?.id && Date.now() - record.startedAt < 15 * 60 * 1000) watchUpdateJob(record);
+    else sessionStorage.removeItem(UPDATE_OVERLAY_KEY);
+  } catch (_) { }
+}
+
+function renderUpdateStatus(payload, syncSettings = true) {
+  const settings = payload.settings || {};
+  const result = payload.result || {};
+  const capability = payload.capability || {};
+  const beta = payload.channel ? payload.channel === 'bata' : Boolean(settings.experience_program);
+  if (syncSettings) {
+    $('#update-channel-badge').textContent = beta ? '体验版' : '正式版';
+    $('#update-check-enabled').checked = settings.check_enabled !== false;
+    $('#update-auto-update').checked = Boolean(settings.auto_update);
+    $('#update-experience').checked = Boolean(settings.experience_program);
+    const runningBeta = normalizeVersion(payload.current).startsWith('bata.');
+    $('#update-experience').disabled = false;
+    if ($('#update-channel-help')) $('#update-channel-help').textContent = runningBeta
+      ? '取消勾选并保存后，将安装当前正式版。安装期间服务会短暂重启。'
+      : '体验版可能不稳定。勾选并保存后，将立即安装。';
+    $('#update-interval').value = settings.check_interval_hours || 24;
+  }
+  const job = payload.job || {};
+  const jobActive = ['scheduled', 'downloading', 'restarting'].includes(job.status);
+  const checkedStatus = result.error ? `检查失败：${result.error}` : result.available ? `可安装版本：${result.target || '新版本'}` : result.checked_at ? `当前已是最新（${result.current || ''}）` : '尚未检查';
+  const status = job.message && (jobActive || ['failed', 'rolled_back'].includes(job.status) || !result.checked_at) ? job.message : checkedStatus;
+  $('#update-status').textContent = status;
+  $('#update-capability').textContent = capability.reason || (payload.docker_available === false ? '当前部署不支持网页自动安装。' : '');
+  $('#update-apply-now').disabled = !capability.supported || !result.available || jobActive;
+}
+
+async function loadUpdateSettings(syncSettings = true) {
+  try { renderUpdateStatus(await api('/api/update'), syncSettings); } catch (error) { $('#update-settings-message').textContent = error.message; }
+}
+
+async function checkUpdateNow() {
+  const message = $('#update-settings-message');
+  const button = $('#update-check-now');
+  button.disabled = true;
+  try {
+    const result = await api('/api/update/check', { method: 'POST' });
+    const state = await api('/api/update');
+    state.result = result;
+    renderUpdateStatus(state);
+    message.textContent = result.error ? `检查失败：${result.error}` : result.available ? '发现可用更新' : '当前已是最新版本';
+  } catch (error) { message.textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function applyUpdateNow() {
+  const message = $('#update-settings-message');
+  showUpdateOverlay('正在准备更新…');
+  try {
+    const result = await api('/api/update/apply', { method: 'POST' });
+    message.textContent = result.status === 'scheduled' ? '更新已开始，服务会短暂重启' : (result.message || '当前已是最新版本');
+    if (result.status === 'scheduled') watchUpdateJob(result);
+    else closeUpdateOverlay();
+    renderUpdateStatus(await api('/api/update'));
+  } catch (error) {
+    if (!updateOverlayJobId) closeUpdateOverlay();
+    message.textContent = error.message;
+  }
+}
+
+function scheduleGitHubStarInvite() {
+  const preferenceKey = 'javsp-web.github-star-invite-disabled';
+  if (localStorage.getItem(preferenceKey) === '1') return;
+  const delay = 60_000 + Math.floor(Math.random() * 60_001);
+  const showInvite = () => {
+    if (document.hidden) {
+      window.setTimeout(showInvite, 10_000);
+      return;
+    }
+    if (document.querySelector('.github-star-invite')) return;
+    document.body.insertAdjacentHTML('beforeend', '<aside class="github-star-invite" role="status"><button class="icon-button github-star-invite-close" type="button" data-close-github-star-invite title="关闭提示" aria-label="关闭提示"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17"/></svg></button><strong>喜欢 MovSP 吗？</strong><p>如果用得顺手，欢迎在 GitHub 点个 Star。</p><div class="github-star-invite-actions"><button class="button secondary" type="button" data-disable-github-star-invite>不再提示</button><a class="button primary" href="https://github.com/fyy656/MovSP" target="_blank" rel="noopener noreferrer">前往 GitHub</a></div></aside>');
+    document.querySelector('[data-close-github-star-invite]')?.addEventListener('click', () => {
+      document.querySelector('.github-star-invite')?.remove();
+    });
+    document.querySelector('[data-disable-github-star-invite]')?.addEventListener('click', () => {
+      localStorage.setItem(preferenceKey, '1');
+      document.querySelector('.github-star-invite')?.remove();
+    });
+  };
+  window.setTimeout(showInvite, delay);
+}
+
+async function loadPathTools() {
+  try {
+    const runtime = await api('/api/runtime');
+    state.runtime = runtime; window.JavspCommunity.configure(runtime.comments_url);
+
+    const tools = $('#path-tools');
+    tools.classList.remove('hidden');
+    const nativeButtons = tools.querySelectorAll('.native-path-button');
+    // 原生选择框会弹在服务端主机上，局域网客户端不显示
+    const nativeHidden = Boolean(runtime.docker) || runtime.local_client === false;
+    nativeButtons.forEach((button) => button.classList.toggle('hidden', nativeHidden));
+    $('#docker-path-browser')?.classList.toggle('hidden', !runtime.docker);
+    $('#docker-schedule-path-browser')?.classList.toggle('hidden', !runtime.docker);
+    $('.native-schedule-path-button')?.classList.toggle('hidden', nativeHidden);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+// 会操作宿主机文件的功能（还原文件、删除图片等）只对主机上的页面开放
+function hostFileActionsAllowed() {
+  const runtime = state.runtime;
+  return Boolean(runtime) && !runtime.docker && runtime.local_client === true;
+}
+
+function clearManualFileSelection() {
+  state.manualInputFiles = [];
+  const message = $('#task-selection-message');
+  if (message) { message.textContent = ''; message.hidden = true; }
+}
+
+function setManualFileSelection(paths) {
+  clearManualFileSelection();
+  state.manualInputFiles = [...new Set(paths.filter(path => typeof path === 'string' && path))];
+  if (!state.manualInputFiles.length) return;
+  $('#input-directory').value = state.manualInputFiles[0];
+  const message = $('#task-selection-message');
+  if (message) {
+    message.textContent = '已选择 ' + state.manualInputFiles.length + ' 个文件，将作为同一批次扫描（自动合并分 P）；修改路径可取消多选。';
+    message.hidden = false;
+  }
+}
+
+async function selectNativePath(kind) {
+  try {
+    const multiple = kind === 'files';
+    const selected = await api(multiple ? '/api/path/select-multi' : '/api/path/select', { method: 'POST', body: JSON.stringify({ kind: multiple ? 'file' : kind }) });
+    if (multiple && selected.paths?.length) setManualFileSelection(selected.paths);
+    else if (!multiple && selected.path) { clearManualFileSelection(); $('#input-directory').value = selected.path; }
+  } catch (error) {
+    $('#task-message').textContent = error.message;
+  }
+}
+
+function setPathTarget(path) {
+  const target = state.pathBrowser.target === 'schedule'
+    ? $('#auto-scrape-schedule-directory')
+    : (state.pathBrowser.target === 'preset-output-directory'
+      ? document.querySelector('[data-config-path="summarizer.path.output_folder_pattern"]')
+      : $('#input-directory'));
+  if (target) {
+    if (target === $('#input-directory')) clearManualFileSelection();
+    target.value = path;
+  }
+}
+
+function renderDockerPathBrowser(data) {
+  const current = $('#path-browser-current');
+  const list = $('#path-browser-list');
+  const up = $('#path-browser-up');
+  const choose = $('#path-browser-choose');
+  if (!current || !list || !up || !choose) return;
+  state.pathBrowser.currentPath = data.path;
+  current.textContent = data.path;
+  up.disabled = !data.parent;
+  up.dataset.parentPath = data.parent || '';
+  choose.classList.toggle('hidden', !['directory', 'any'].includes(state.pathBrowser.kind));
+  const entries = data.entries || [];
+  list.innerHTML = entries.length ? entries.map((item) => {
+    const canSelect = state.pathBrowser.kind === 'any' || state.pathBrowser.kind === item.kind;
+    const selectLabel = item.kind === 'directory' ? '选此文件夹' : '选此文件';
+    const enter = item.kind === 'directory' ? `<button class="button secondary path-browser-enter" type="button" data-path-browser-enter="${escapeHtml(item.path)}" data-path-browser-kind="directory">进入</button>` : '';
+    return `<div class="path-browser-row"><span class="path-browser-entry-icon">${item.kind === 'directory' ? '文件夹' : '视频'}</span><span class="path-browser-entry-name">${escapeHtml(item.name)}</span><div class="path-browser-row-actions">${enter}${canSelect ? `<button class="button secondary path-browser-select" type="button" data-path-browser-select="${escapeHtml(item.path)}">${selectLabel}</button>` : ''}</div></div>`;
+  }).join('') : '<p class="muted path-browser-empty">此文件夹中没有可用的子目录或视频文件。</p>';
+}
+
+async function loadDockerPathBrowser(path = state.pathBrowser.currentPath) {
+  const message = $('#path-browser-message');
+  if (message) message.textContent = '';
+  try {
+    const data = await api(`/api/path/browse?path=${encodeURIComponent(path)}`);
+    renderDockerPathBrowser(data);
+  } catch (error) {
+    if (message) message.textContent = error.message;
+  }
+}
+
+async function openDockerPathBrowser(kind, target) {
+  state.pathBrowser = { kind, target, currentPath: '/' };
+  $('#path-browser-title').textContent = kind === 'directory' ? '选择容器文件夹' : (kind === 'file' ? '选择容器视频文件' : '选择容器路径');
+  $('#path-browser-subtitle').textContent = kind === 'directory' ? '进入文件夹后可选择当前目录，或继续浏览下一级。' : (kind === 'file' ? '进入文件夹后选择一个视频文件。' : '可选择文件夹，也可进入文件夹选择视频文件。');
+  $('#path-browser-dialog').showModal();
+  await loadDockerPathBrowser('/');
+}
+
+function confirmAction({ title, text, confirmLabel = '确认', danger = false, run }) {
+  state.pendingConfirm = { run };
+  $('#action-confirm-title').textContent = title;
+  $('#action-confirm-text').textContent = text;
+  $('#action-confirm-message').textContent = '';
+  const button = $('#action-confirm-button');
+  button.textContent = confirmLabel;
+  button.className = `button ${danger ? 'danger' : 'primary'}`;
+  $('#action-confirm-dialog').showModal();
+}
+
+function cancelTask(id) {
+  const task = state.tasks.find((item) => item.id === id);
+  confirmAction({
+    title: '停止任务',
+    text: `确定停止任务“${task?.name || id}”吗？`,
+    confirmLabel: '停止任务',
+    danger: true,
+    run: async () => { await api(`/api/tasks/${id}/cancel`, { method: 'POST' }); await loadTasks(); },
+  });
+}
+
+function stopTasks(ids = [], label = '') {
+  const targets = [...new Set(ids)].filter(Boolean);
+  const many = label || (targets.length ? `选中的 ${targets.length} 个任务` : '所有排队中与运行中的任务');
+  confirmAction({
+    title: '停止任务',
+    text: `确定停止${many}吗？正在运行的任务会立即中止，排队中的任务不会再开始；记录会保留为“已取消”。`,
+    confirmLabel: '停止任务',
+    danger: true,
+    run: async () => {
+      // 批量停止几百个任务需要几秒，先给个进行中的提示
+      const message = $('#action-confirm-message');
+      if (message) message.textContent = '正在停止任务…';
+      const result = await api('/api/tasks/cancel', { method: 'POST', body: JSON.stringify({ ids: targets }) });
+      targets.forEach((id) => state.selectedOverviewTasks.delete(id));
+      await loadTasks();
+      showToast(`已停止 ${result.cancelled || 0} 个任务`);
+    },
+  });
+}
+
+function stopAllTasks() {
+  stopTasks([], '所有排队中与运行中的任务');
+}
+
+async function retryTask(taskId) {
+  try {
+    await api(`/api/tasks/${encodeURIComponent(taskId)}/retry`, { method: 'POST' });
+    showToast('已重新加入刮削队列');
+    if (state.activeTaskDetail === taskId) $('#task-detail-dialog')?.close();
+    await loadTasks();
+  } catch (error) {
+    showToast(error.message || '重新刮削失败', 'danger');
+  }
+}
+
+function retryFailedTasks() {
+  confirmAction({
+    title: '重试失败任务',
+    text: '把所有状态为“失败”的任务重新加入刮削队列。已经在队列里的影片会跳过。',
+    confirmLabel: '重新刮削',
+    run: async () => {
+      try {
+        const result = await api('/api/tasks/retry-failed', { method: 'POST', body: JSON.stringify({}) });
+        const accepted = (result.accepted || []).length;
+        const skipped = (result.skipped || []).length;
+        showToast(skipped ? `已重新加入 ${accepted} 个任务，跳过 ${skipped} 个` : `已重新加入 ${accepted} 个任务`);
+        await loadTasks();
+      } catch (error) {
+        showToast(error.message || '批量重试失败', 'danger');
+      }
+    },
+  });
+}
+
+async function deleteTaskInDialog(id) {
+  const task = state.tasks.find((item) => item.id === id);
+  state.pendingDeleteTask = id;
+  $('#task-delete-text').textContent = `确定删除任务“${task?.name || id}”的刮削记录和日志吗？只删除 MovSP 记录，不删除视频、NFO、封面或剧照文件。`;
+  $('#task-delete-message').textContent = '';
+  $('#task-delete-dialog').showModal();
+}
+
+function deleteTaskRecords(ids) {
+  const records = [...new Set(ids)].filter(Boolean);
+  if (!records.length) return;
+  if (records.length === 1) {
+    deleteTaskInDialog(records[0]);
+    return;
+  }
+  confirmAction({
+    title: '删除任务记录',
+    text: `确定删除选中的 ${records.length} 条记录吗？只删除 MovSP 中的任务记录与日志，不删除视频、NFO、封面或剧照文件。运行中的任务会自动跳过。`,
+    confirmLabel: `删除 ${records.length} 条`,
+    danger: true,
+    run: async () => {
+      const result = await api('/api/tasks/delete', { method: 'POST', body: JSON.stringify({ ids: records }) });
+      records.forEach((id) => { state.selectedTaskIds.delete(id); state.selectedOverviewTasks.delete(id); });
+      await loadTasks();
+      const skipped = result.skipped?.length || 0;
+      showToast(`已删除 ${result.deleted} 条记录${skipped ? `，跳过 ${skipped} 条运行中的任务` : ''}`, skipped ? 'error' : 'success');
+    },
+  });
+}
+
+async function copyTaskLog(button) {
+  const log = button.closest('.task-log-wrap')?.querySelector('.task-log');
+  if (!log) return;
+  try {
+    await navigator.clipboard.writeText(log.dataset.copyText || log.textContent || '');
+  } catch {
+    const text = document.createElement('textarea');
+    text.value = log.dataset.copyText || log.textContent || '';
+    text.style.cssText = 'position:fixed;opacity:0';
+    (button.closest('dialog') || document.body).appendChild(text);
+    text.select();
+    document.execCommand('copy');
+    text.remove();
+  }
+  const original = button.textContent;
+  button.textContent = '已复制';
+  window.setTimeout(() => { button.textContent = original; }, 1200);
+}
+
+let purgePreviewRevision = 0;
+let purgePreviewTimer = null;
+
+function purgePayload(dryRun) {
+  const days = Number($('#purge-before').value) || 0;
+  const payload = {
+    statuses: [...document.querySelectorAll('[data-purge-status]:checked')].map((input) => input.value),
+    before: days ? new Date(Date.now() - days * 86400000).toISOString() : null,
+    include_scan: $('#purge-include-scan').checked,
+    merge_duplicates: $('#purge-merge').checked,
+    dry_run: dryRun,
+  };
+  if ($('#purge-scope').value === 'filter') {
+    const path = taskPageRequest();
+    if (path?.startsWith('/api/tasks?')) {
+      const params = new URLSearchParams(path.slice('/api/tasks?'.length));
+      ['view', 'query', 'field', 'size_min', 'size_max', 'date_from', 'date_to', 'group_by', 'group'].forEach((key) => {
+        if (params.has(key)) payload[key] = params.get(key);
+      });
+    }
+  }
+  return payload;
+}
+
+async function refreshPurgePreview() {
+  const preview = $('#purge-preview');
+  const button = $('#task-purge-confirm');
+  if (!preview || !button) return;
+  const payload = purgePayload(true);
+  if (!payload.statuses.length) {
+    preview.textContent = '请至少选择一种记录状态。';
+    button.disabled = true;
+    button.textContent = '删除记录';
+    return;
+  }
+  const revision = ++purgePreviewRevision;
+  preview.textContent = '正在统计…';
+  button.disabled = true;
+  try {
+    const result = await api('/api/tasks/purge', { method: 'POST', body: JSON.stringify(payload) });
+    if (revision !== purgePreviewRevision) return;
+    const deletable = Number(result.deletable) || 0;
+    const skipped = Number(result.skipped_running) || 0;
+    const merged = $('#purge-merge').checked;
+    const countText = merged ? `匹配 ${result.matched} 条 · 合并重复后删除 ${deletable} 条` : `匹配 ${result.matched} 条 · 可删除 ${deletable} 条`;
+    const emptyHint = deletable === 0 && $('#purge-before').value !== '0' ? ' 没有符合条件的记录，可把“时间”改为“不限时间”。' : '';
+    preview.textContent = `${countText} · 预计释放 ${formatBytes(result.bytes)}${skipped ? ` · ${skipped} 条运行中任务将跳过` : ''}${emptyHint}`;
+    button.disabled = deletable === 0;
+    button.textContent = deletable ? `删除 ${deletable} 条记录` : '没有可删除的记录';
+  } catch (error) {
+    if (revision === purgePreviewRevision) {
+      preview.textContent = error.message;
+      button.disabled = true;
+    }
+  }
+}
+
+function openTaskPurgeDialog() {
+  const dialog = $('#task-purge-dialog');
+  if (!dialog) return;
+  $('#purge-scope').value = 'all';
+  $('#purge-before').value = '30';
+  $('#purge-include-scan').checked = false;
+  $('#purge-merge').checked = false;
+  document.querySelectorAll('[data-purge-status]').forEach((input) => { input.checked = input.value !== 'failed'; });
+  $('#task-purge-message').textContent = '';
+  dialog.showModal();
+  refreshPurgePreview();
+}
+
+$('#task-purge-dialog')?.addEventListener('change', (event) => {
+  if (!event.target.closest('#task-purge-form')) return;
+  window.clearTimeout(purgePreviewTimer);
+  purgePreviewTimer = window.setTimeout(refreshPurgePreview, 180);
+});
+
+$('#task-purge-form')?.addEventListener('submit', async (event) => {
+  if (event.submitter?.id !== 'task-purge-confirm') return;
+  event.preventDefault();
+  const button = $('#task-purge-confirm');
+  const message = $('#task-purge-message');
+  button.disabled = true;
+  message.textContent = '正在删除…';
+  try {
+    const result = await api('/api/tasks/purge', { method: 'POST', body: JSON.stringify(purgePayload(false)) });
+    state.selectedTaskIds.clear();
+    state.selectedOverviewTasks.clear();
+    state.taskSelectionMode = false;
+    state.taskSelectAnchor = '';
+    $('#task-purge-dialog').close();
+    await loadTasks();
+    showToast(`已删除 ${result.deleted} 条记录，释放 ${formatBytes(result.bytes)}`);
+  } catch (error) {
+    message.textContent = error.message;
+    button.disabled = false;
+  }
+});
+
+function renderPresetList() {
+  $('#preset-list').innerHTML = state.presets.map((preset) => `<button class="preset-item ${state.editingPreset === preset.id ? 'active' : ''}" data-preset="${preset.id}"><strong>${escapeHtml(preset.name)}</strong><span>${preset.id === 'default' || preset.mode === 'form' ? '可视化表单' : 'config.yml'}${preset.id === 'default' ? ' · 内置' : ''}</span></button>`).join('');
+  document.querySelectorAll('[data-preset]').forEach((button) => button.addEventListener('click', () => editPreset(button.dataset.preset)));
+  $('#task-preset').innerHTML = state.presets.map((preset) => `<option value="${preset.id}">${escapeHtml(preset.name)}</option>`).join('');
+}
+
+async function deletePresetFromList(id) {
+  try {
+    await api(`/api/presets/${id}`, { method: 'DELETE' });
+    if (state.editingPreset === id) state.editingPreset = null;
+    await loadPresets();
+  } catch (error) { $('#preset-message').textContent = error.message; }
+}
+
+function renderPresetList() {
+  $('#preset-list').innerHTML = state.presets.map((preset) => `<div class="preset-list-row"><button class="preset-item ${state.editingPreset === preset.id ? 'active' : ''}" data-preset="${preset.id}"><strong>${escapeHtml(preset.name)}</strong><span>${preset.id === 'default' || preset.mode === 'form' ? '可视化表单' : 'config.yml'}${preset.id === 'default' ? ' · 内置' : ''}</span></button>${preset.id === 'default' ? '' : `<button class="icon-button preset-delete" type="button" data-delete-preset="${preset.id}">删除</button>`}</div>`).join('');
+  document.querySelectorAll('[data-preset]').forEach((button) => button.addEventListener('click', () => editPreset(button.dataset.preset)));
+  document.querySelectorAll('[data-delete-preset]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); deletePresetFromList(button.dataset.deletePreset); }));
+  $('#task-preset').innerHTML = state.presets.map((preset) => `<option value="${preset.id}">${escapeHtml(preset.name)}</option>`).join('');
+}
+
+function renderPresetMode() {
+  const yamlMode = state.presetMode === 'yaml';
+  $('#preset-form-panel').classList.toggle('hidden', yamlMode);
+  $('#preset-yaml-panel').classList.toggle('hidden', !yamlMode);
+  if (!yamlMode) renderConfigFields();
+}
+
+async function setPresetMode() {
+  const nextMode = $('#preset-mode').value;
+  if (state.presetMode === nextMode) { renderPresetMode(); return; }
+  const previousMode = state.presetMode;
+  try {
+    if (previousMode === 'form') {
+      state.formValues = readConfigFields();
+      const converted = await api('/api/presets/convert', { method: 'POST', body: JSON.stringify({ mode: 'form', form: state.formValues }) });
+      $('#preset-content').value = converted.content;
+    } else if (previousMode === 'yaml') {
+      const converted = await api('/api/presets/convert', { method: 'POST', body: JSON.stringify({ mode: 'yaml', content: $('#preset-content').value }) });
+      state.formValues = converted.form;
+    }
+    state.presetMode = nextMode;
+    renderPresetMode();
+  } catch (error) {
+    $('#preset-mode').value = previousMode || 'form';
+    $('#preset-message').textContent = error.message;
+  }
+}
+
+function setPresetTab(section) {
+  document.querySelectorAll('[data-preset-tab]').forEach((button) => button.classList.toggle('active', button.dataset.presetTab === section));
+  document.querySelectorAll('[data-preset-panel]').forEach((panel) => panel.classList.toggle('active', panel.dataset.presetPanel === section));
+}
+
+function editPreset(id) {
+  const preset = state.presets.find((item) => item.id === id);
+  if (!preset) return;
+  state.editingPreset = id;
+  $('#preset-editor-title').textContent = id === 'default' ? '编辑默认预设' : '编辑预设';
+  $('#preset-id').value = id;
+  $('#preset-name').value = preset.name;
+  state.taskConcurrency = preset.task_concurrency || 1;
+  const initialMode = id === 'default' ? 'form' : preset.mode;
+  $('#preset-mode').value = initialMode;
+  $('#preset-content').value = preset.content || '';
+  state.formValues = cloneValue(preset.form_values || {});
+  state.presetMode = initialMode;
+  // 预设类型决定渲染哪些面板；已存在的预设类型不可改（避免把已有的库改坏）
+  state.presetKind = presetKindOf(preset);
+  state.presetKindLocked = true;
+  renderPresetKind();
+  renderPresetNavigation();
+  renderConfigFields();
+  setPresetTab(formTabsFor(state.presetKind)[0].id);
+  renderPresetMode();
+  $('#delete-preset').disabled = id === 'default' || !!preset.redacted;
+  $('#save-preset').disabled = !!preset.redacted;
+  $('#preset-message').textContent = preset.redacted ? '密码、密钥和 Cookie 等敏感字段已隐藏；仅管理员可查看完整配置和保存预设。' : '';
+  renderPresetList();
+}
+
+function newPreset() {
+  state.editingPreset = null;
+  const defaultPreset = state.presets.find((item) => item.id === 'default');
+  state.formValues = cloneValue(defaultPreset?.form_values || {});
+  state.taskConcurrency = defaultPreset?.task_concurrency || 1;
+  state.presetMode = 'form';
+  // 新建时先选类型：JAV 走完整 JavSP 流程，影视只保留扫描 + 刮削器
+  state.presetKind = 'jav';
+  state.presetKindLocked = false;
+  $('#preset-editor-title').textContent = '新建预设';
+  $('#preset-form').reset();
+  $('#preset-id').value = '';
+  renderPresetKind();
+  renderPresetNavigation();
+  renderConfigFields();
+  setPresetTab('scanner');
+  $('#preset-mode').value = 'form';
+  renderPresetMode();
+  $('#delete-preset').disabled = true;
+  renderPresetList();
+}
+
+/** 预设类型选择器：新建时可选，编辑已有预设时锁定 */
+function renderPresetKind() {
+  const host = $('#preset-kind');
+  if (!host) return;
+  const locked = state.presetKindLocked;
+  host.innerHTML = PRESET_KINDS.map((kind) => {
+    const active = kind.key === state.presetKind;
+    return `<button class="preset-kind-option${active ? ' active' : ''}" type="button"
+      data-preset-kind="${kind.key}" aria-pressed="${active}"${locked ? ' disabled' : ''}>
+      <strong>${kind.label}</strong><span>${kind.description}</span></button>`;
+  }).join('') + (locked
+    ? '<p class="muted">预设类型创建后不可更改；如需另一类型，请新建一个预设。</p>'
+    : '');
+}
+
+/** 切换类型：影视预设的 form 只保留真正生效的字段 */
+function setPresetKind(kind) {
+  if (state.presetKindLocked) return;
+  if (!PRESET_KINDS.some((item) => item.key === kind)) return;
+  state.presetKind = kind;
+  if (kind === 'media') {
+    // 影视预设不需要 JavSP 的整理/裁剪/剧照设置，清掉避免误以为生效
+    const form = state.formValues || {};
+    const scanner = form.scanner || {};
+    const crawler = form.crawler || {};
+    state.formValues = {
+      scanner: {
+        ...(scanner.minimum_size !== undefined ? { minimum_size: scanner.minimum_size } : {}),
+        ...(scanner.ignore_folders !== undefined ? { ignore_folders: scanner.ignore_folders } : {}),
+        ...(scanner.extensions !== undefined ? { extensions: scanner.extensions } : {}),
+      },
+      crawler: { scrapers: Array.isArray(crawler.scrapers) ? crawler.scrapers : [] },
+      ...(form.network ? { network: form.network } : {}),
+    };
+  }
+  renderPresetKind();
+  renderPresetNavigation();
+  renderConfigFields();
+  setPresetTab(formTabsFor(kind)[0].id);
+}
+
+async function loadPresets() {
+  try {
+    const runtime = await api('/api/runtime');
+    state.aiEnabled = runtime.ai_enabled === true;
+    state.presets = await api('/api/presets');
+    if ($('#auto-scrape-rule-list')) renderAutoScrapeRules(state.autoScrapeRules);
+    if (!state.editingPreset || !state.presets.some((item) => item.id === state.editingPreset)) editPreset(state.presets[0]?.id);
+    else { renderPresetList(); renderConfigFields(); }
+  } catch (error) { $('#preset-message').textContent = error.message; }
+}
+
+function presetPayload() {
+  const mode = $('#preset-mode').value;
+  return {
+    name: $('#preset-name').value.trim(),
+    mode,
+    content: mode === 'yaml' ? $('#preset-content').value : '',
+    form: mode === 'form' ? readConfigFields() : {},
+    // 预设类型：决定刮削链路与设置面板；后端会据此裁剪无关字段
+    kind: state.presetKind || undefined,
+    task_concurrency: Math.max(1, Math.min(32, Number($('#preset-task-concurrency')?.value) || state.taskConcurrency || 1))
+  };
+}
+
+async function savePreset() {
+  const message = $('#preset-message');
+  try {
+    const payload = presetPayload();
+    if (!payload.name) throw new Error('请输入预设名称');
+    const path = state.editingPreset ? `/api/presets/${state.editingPreset}` : '/api/presets';
+    const saved = await api(path, { method: state.editingPreset ? 'PUT' : 'POST', body: JSON.stringify(payload) });
+    state.editingPreset = saved.id;
+    state.formValues = cloneValue(saved.form_values || state.formValues);
+    state.taskConcurrency = saved.task_concurrency || state.taskConcurrency;
+    // 保存后类型固定，不能再切换（避免把已有媒体库的刮削路径改掉）
+    if (saved.kind) state.presetKind = saved.kind;
+    state.presetKindLocked = true;
+    renderPresetKind();
+    renderConfigFields();
+    message.textContent = '预设已保存';
+    showToast(`预设“${saved.name}”已保存`, 'success');
+    await loadPresets();
+  } catch (error) { message.textContent = error.message; showToast(error.message, 'error'); }
+}
+
+$('#delete-preset').addEventListener('click', () => {
+  if (!state.editingPreset || state.editingPreset === 'default') return;
+  const presetId = state.editingPreset;
+  const presetName = $('#preset-name').value || presetId;
+  confirmAction({
+    title: '删除刮削预设',
+    text: `确定删除预设“${presetName}”吗？`,
+    confirmLabel: '确认删除',
+    danger: true,
+    run: async () => {
+      await api(`/api/presets/${presetId}`, { method: 'DELETE' });
+      state.editingPreset = null;
+      await loadPresets();
+    },
+  });
+});
+
+async function loadUsers() {
+  try {
+    const users = await api('/api/users');
+    $('#users-table').innerHTML = users.map((user) => `<div class="user-row"><strong>${escapeHtml(user.username)}</strong><span class="role">${user.role === 'admin' ? '管理员' : '操作员'}</span><span class="role">${new Date(user.created_at).toLocaleDateString()}</span><span><button class="icon-button edit-user" data-username="${escapeHtml(user.username)}" data-role="${user.role}">编辑</button> <button class="icon-button delete-user" data-username="${escapeHtml(user.username)}">删除</button></span></div>`).join('');
+    document.querySelectorAll('.edit-user').forEach((button) => button.addEventListener('click', () => editUser(button.dataset.username, button.dataset.role)));
+    document.querySelectorAll('.delete-user').forEach((button) => button.addEventListener('click', () => removeUser(button.dataset.username)));
+  } catch (error) { $('#users-table').innerHTML = `<p class="form-error">${error.message}</p>`; }
+}
+
+function editUser(username, role) {
+  state.editingUser = username;
+  $('#user-dialog-title').textContent = '编辑用户';
+  $('#user-name').value = username;
+  $('#user-role').value = role;
+  $('#user-password').value = '';
+  $('#user-password-confirm').value = '';
+  $('#user-message').textContent = '';
+  $('#user-dialog').showModal();
+}
+
+function removeUser(username) {
+  confirmAction({
+    title: '删除用户',
+    text: `确定删除用户“${username}”吗？`,
+    confirmLabel: '确认删除',
+    danger: true,
+    run: async () => { await api(`/api/users/${encodeURIComponent(username)}`, { method: 'DELETE' }); await loadUsers(); },
+  });
+}
+
+async function submitManualTask(event) {
+  event.preventDefault();
+  if (state.manualTaskSubmitting) return;
+  state.manualTaskSubmitting = true;
+  const button = $('#task-form button[type="submit"]');
+  const message = $('#task-message');
+  const payload = { input_directory: $('#input-directory').value, preset_id: $('#task-preset').value };
+  const selection = state.manualInputFiles;
+  if (selection?.length && payload.input_directory === selection[0]) payload.input_files = [...selection];
+  if (button) button.disabled = true;
+  message.textContent = '正在提交扫描…';
+  try {
+    const result = await api('/api/tasks', { method: 'POST', body: JSON.stringify(payload) });
+    message.textContent = result.scan
+      ? '扫描任务已创建，请在任务队列查看进度。'
+      : (result.count > 1 ? result.count + ' 个影片任务已加入队列' : '任务已加入队列，请在任务列表查看进度。');
+    if ($('#input-directory').value === payload.input_directory && state.manualInputFiles === selection) {
+      $('#input-directory').value = '';
+      clearManualFileSelection();
+    }
+    await loadTasks();
+  } catch (error) { message.textContent = error.message; }
+  finally { state.manualTaskSubmitting = false; if (button) button.disabled = false; }
+}
+$('#task-form').addEventListener('submit', submitManualTask);
+$('#input-directory').addEventListener('input', clearManualFileSelection);
+
+$('#refresh-tasks').addEventListener('click', loadTasks);
+document.addEventListener('click', (event) => { const button = event.target.closest('[data-task-page]'); if (button && !button.disabled) { state.taskPage = Math.max(0, Number(button.dataset.taskPage) || 0); loadTasks(); } });
+document.addEventListener('click', (event) => { const button = event.target.closest('.copy-log'); if (button) copyTaskLog(button); });
+document.addEventListener('click', (event) => { const button = event.target.closest('[data-delete-task]'); if (button && !button.disabled) { event.stopPropagation(); deleteTaskInDialog(button.dataset.deleteTask); } });
+$('#library-search-form')?.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const value = $('#library-search').value.trim();
+  if (state.overviewGroup || state.overviewGroupBy === 'all') { state.overviewQuery = value; state.overviewPage = 1; }
+  else { state.overviewGroupQuery = value; state.overviewGroupPage = 1; }
+  state.tasksSignature = '';
+  loadTasks();
+});
+$('#library-search-form')?.addEventListener('reset', () => {
+  if (state.overviewGroup || state.overviewGroupBy === 'all') { state.overviewQuery = ''; state.overviewPage = 1; }
+  else { state.overviewGroupQuery = ''; state.overviewGroupPage = 1; }
+  state.tasksSignature = '';
+  loadTasks();
+});
+document.addEventListener('click', event => { const button = event.target.closest('[data-detail-section]'); if (button) document.getElementById(button.dataset.detailSection)?.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'start' }); });
+document.addEventListener('change', (event) => {
+  if (event.target.id === 'overview-sort-key' || event.target.id === 'overview-sort-direction') {
+    state.overviewSort = { key: $('#overview-sort-key').value, direction: $('#overview-sort-direction').value };
+    state.overviewPage = 1;
+    loadTasks();
+  }
+});
+document.addEventListener('change', async (event) => {
+  const input = event.target.closest('[data-local-cover-upload]');
+  const file = input?.files?.[0];
+  if (!input || !file) return;
+  input.disabled = true;
+  $('#google-cover-message').textContent = '正在保存封面';
+  try {
+    await uploadTaskCover(input.dataset.localCoverUpload, file);
+    $('#google-cover-dialog')?.close();
+    await loadTasks();
+    showToast('封面已保存');
+  } catch (error) {
+    input.disabled = false;
+    $('#google-cover-message').textContent = error.message;
+  }
+});
+document.addEventListener('contextmenu', (event) => {
+  const card = event.target.closest('[data-overview-task]');
+  if (!card) return;
+  event.preventDefault();
+  const menu = $('#overview-context-menu');
+  const select = menu?.querySelector('[data-overview-context-select]');
+  const remove = menu?.querySelector('[data-overview-context-delete]');
+  const selecting = state.overviewSelectionMode;
+  if (select) select.textContent = selecting ? '退出选择' : '选择';
+  if (remove) {
+    remove.textContent = selecting ? '删除所选记录' : '删除任务记录';
+    remove.disabled = selecting && !state.selectedOverviewTasks.size;
+  }
+  menu.dataset.taskId = card.dataset.overviewTask;
+  menu.dataset.taskIds = card.dataset.overviewTaskIds || card.dataset.overviewTask;
+  menu.style.left = `${Math.min(event.clientX, window.innerWidth - 164)}px`;
+  menu.style.top = `${Math.min(event.clientY, window.innerHeight - 88)}px`;
+  menu.hidden = false;
+});
+document.addEventListener('click', (event) => {
+  const metadataJump = event.target.closest('[data-task-metadata]');
+  if (metadataJump) {
+    event.preventDefault();
+    const filmId = metadataJump.dataset.filmId;
+    if (filmId && window.JavspLibrary?.open) {
+      // 关联媒体库的任务统一到媒体库详情里改，改完整批刮削
+      window.JavspLibrary.open(filmId);
+      return;
+    }
+    // 没有关联影片（例如手动扫描任务）就地打开编辑
+    state.taskMetadataEditing = true;
+    openTaskDetail(metadataJump.dataset.taskMetadata);
+    return;
+  }
+  const retryButton = event.target.closest('[data-retry-task]');
+  if (retryButton) {
+    event.preventDefault();
+    retryTask(retryButton.dataset.retryTask);
+    return;
+  }
+  if (event.target.closest('#task-retry-failed')) {
+    event.preventDefault();
+    retryFailedTasks();
+    return;
+  }
+  if (event.target.closest('#overview-records-refresh')) {
+    event.preventDefault();
+    loadTasks();
+    return;
+  }
+  const pageButton = event.target.closest('[data-overview-page]');
+  if (pageButton) {
+    state.overviewPage = Math.max(1, Number(pageButton.dataset.overviewPage) || 1);
+    loadTasks();
+    return;
+  }
+  const menu = $('#overview-context-menu');
+  const select = event.target.closest('[data-overview-context-select]');
+  if (select && menu) {
+    if (state.overviewSelectionMode) {
+      state.overviewSelectionMode = false;
+      state.selectedOverviewTasks.clear();
+    } else {
+      state.overviewSelectionMode = true;
+      const ids = overviewTaskIds(menu.dataset.taskIds);
+      ids.forEach((id) => {
+        state.selectedOverviewTasks.add(id);
+        state.overviewSelectionFeedback.add(id);
+      });
+    }
+    menu.hidden = true;
+    renderOverview();
+    return;
+  }
+  const remove = event.target.closest('[data-overview-context-delete]');
+  if (remove && menu?.dataset.taskIds) {
+    if (state.overviewSelectionMode) {
+      const selectedIds = [...state.selectedOverviewTasks];
+      if (selectedIds.length) document.querySelector('#overview-delete-selected')?.click();
+    } else {
+      deleteTaskRecords(menu.dataset.taskIds.split(','));
+    }
+    menu.hidden = true;
+    return;
+  }
+  if (menu && !event.target.closest('#overview-context-menu')) menu.hidden = true;
+});
+document.addEventListener('click', (event) => {
+  if (event.target.closest('[data-edit-task-metadata]')) {
+    const current = state.tasks.find((item) => item.id === state.activeTaskDetail);
+    if (current?.library_film_id && window.JavspLibrary?.open) {
+      // 关联媒体库的任务统一到媒体库详情里改，改完可以“保存”再批量刮削
+      $('#task-detail-dialog')?.close();
+      window.JavspLibrary.open(current.library_film_id);
+      return;
+    }
+    state.taskMetadataEditing = true;
+    if (state.activeTaskDetail) openTaskDetail(state.activeTaskDetail);
+    return;
+  }
+  if (event.target.closest('[data-cancel-task-metadata]')) {
+    state.taskMetadataEditing = false;
+    if (state.activeTaskDetail) openTaskDetail(state.activeTaskDetail);
+  }
+});
+document.addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-overview-select]');
+  if (checkbox) {
+    if (checkbox.checked) state.selectedOverviewTasks.add(checkbox.dataset.overviewSelect);
+    else state.selectedOverviewTasks.delete(checkbox.dataset.overviewSelect);
+    renderOverview();
+    return;
+  }
+  if (event.target.id === 'overview-select-all') {
+    const visibleIds = [...document.querySelectorAll('[data-overview-task-ids]')].flatMap((card) => overviewTaskIds(card.dataset.overviewTaskIds));
+    if (event.target.checked) visibleIds.forEach((id) => state.selectedOverviewTasks.add(id));
+    else state.selectedOverviewTasks.clear();
+    renderOverview();
+  }
+});
+document.addEventListener('change', (event) => {
+  const box = event.target.closest('[data-task-select]');
+  if (!box) return;
+  const id = box.dataset.taskSelect;
+  const checked = box.checked;
+  if (event.shiftKey && state.taskSelectAnchor) {
+    const ids = [...document.querySelectorAll('[data-task-card]')].map((card) => card.dataset.taskCard);
+    const start = ids.indexOf(state.taskSelectAnchor);
+    const end = ids.indexOf(id);
+    if (start >= 0 && end >= 0) {
+      ids.slice(Math.min(start, end), Math.max(start, end) + 1).forEach((item) => {
+        if (checked) state.selectedTaskIds.add(item);
+        else state.selectedTaskIds.delete(item);
+      });
+    }
+  } else if (checked) {
+    state.selectedTaskIds.add(id);
+  } else {
+    state.selectedTaskIds.delete(id);
+  }
+  state.taskSelectAnchor = id;
+  renderTasks();
+});
+document.addEventListener('click', async (event) => {
+  if (event.target.closest('#task-stop-all') || event.target.closest('#overview-stop-all')) {
+    stopAllTasks();
+    return;
+  }
+  const selectMode = event.target.closest('#task-select-mode');
+  if (selectMode) {
+    state.taskSelectionMode = !state.taskSelectionMode;
+    if (!state.taskSelectionMode) {
+      state.selectedTaskIds.clear();
+      state.taskSelectAnchor = '';
+    }
+    renderTasks();
+    return;
+  }
+  const selectPage = event.target.closest('#task-select-page');
+  if (selectPage) {
+    state.taskSelectionMode = true;
+    document.querySelectorAll('[data-task-card]').forEach((card) => state.selectedTaskIds.add(card.dataset.taskCard));
+    renderTasks();
+    return;
+  }
+  const selectAll = event.target.closest('#task-select-all');
+  if (selectAll) {
+    state.taskSelectionMode = true;
+    await selectAllMatching(selectAll, state.selectedTaskIds);
+    renderTasks();
+    return;
+  }
+  if (event.target.closest('#task-selection-clear')) {
+    state.selectedTaskIds.clear();
+    state.taskSelectAnchor = '';
+    renderTasks();
+    return;
+  }
+  const deleteSelected = event.target.closest('#task-delete-selected');
+  if (deleteSelected && !deleteSelected.disabled && state.selectedTaskIds.size) {
+    deleteTaskRecords([...state.selectedTaskIds]);
+    return;
+  }
+  if (event.target.closest('#task-purge-open') || event.target.closest('[data-open-purge]')) {
+    if (state.user?.role !== 'admin') {
+      showToast('只有管理员可以清理任务记录', 'error');
+      return;
+    }
+    openTaskPurgeDialog();
+    return;
+  }
+  const stopSelected = event.target.closest('#overview-cancel-selected');
+  if (stopSelected && !stopSelected.disabled && state.selectedOverviewTasks.size) {
+    stopTasks([...state.selectedOverviewTasks]);
+    return;
+  }
+  const button = event.target.closest('#overview-delete-selected');
+  if (!button || button.disabled || !state.selectedOverviewTasks.size) return;
+  deleteTaskRecords([...state.selectedOverviewTasks]);
+});
+document.addEventListener('click', async (event) => {
+  const variable = event.target.closest('[data-insert-naming-variable]');
+  if (variable) {
+    const target = document.querySelector(`[data-config-path="${variable.dataset.namingTarget}"]`);
+    if (!target) return;
+    const token = variable.dataset.insertNamingVariable;
+    const start = Number.isInteger(target.selectionStart) ? target.selectionStart : target.value.length;
+    const end = Number.isInteger(target.selectionEnd) ? target.selectionEnd : start;
+    target.value = `${target.value.slice(0, start)}${token}${target.value.slice(end)}`;
+    target.focus();
+    target.setSelectionRange(start + token.length, start + token.length);
+    target.dispatchEvent(new Event('input', { bubbles: true }));
+    return;
+  }
+  const directoryPicker = event.target.closest('[data-select-output-directory]');
+  if (!directoryPicker) return;
+  const target = document.querySelector(`[data-config-path="${directoryPicker.dataset.selectOutputDirectory}"]`);
+  if (!target) return;
+  if (state.runtime?.docker) {
+    await openDockerPathBrowser('directory', 'preset-output-directory');
+    return;
+  }
+  try {
+    const selected = await api('/api/path/select', { method: 'POST', body: JSON.stringify({ kind: 'directory' }) });
+    if (selected.path) target.value = selected.path;
+  } catch (error) {
+    const message = $('#preset-message');
+    if (message) message.textContent = error.message;
+  }
+});
+document.addEventListener('change', (event) => {
+  const select = event.target.closest('[data-translator-engine]');
+  const aiToggle = event.target.closest('[data-config-path="translator.ai_enabled"]');
+  if ((!select && !aiToggle) || (select || aiToggle).disabled) return;
+  if (select && state.formValues?.translator?.ai_enabled) return;
+  state.formValues = readConfigFields();
+  state.formValues.translator ||= {};
+  if (select) state.formValues.translator.engine = select.value ? { name: select.value } : null;
+  renderConfigFields();
+});
+$('#task-delete-form').addEventListener('submit', async (event) => {
+  if (event.submitter?.id !== 'task-delete-confirm') return;
+  event.preventDefault();
+  try {
+    await api(`/api/tasks/${state.pendingDeleteTask}`, { method: 'DELETE' });
+    $('#task-delete-dialog').close();
+    state.selectedTaskIds.delete(state.pendingDeleteTask);
+    state.selectedOverviewTasks.delete(state.pendingDeleteTask);
+    state.pendingDeleteTask = null;
+    await loadTasks();
+  } catch (error) { $('#task-delete-message').textContent = error.message; }
+});
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-save-task-metadata]');
+  if (!button) return;
+  const editor = button.closest('#task-metadata-editor');
+  if (!editor) return;
+  const actress = String(editor.querySelector('[name="actress"]')?.value || '').split(/[\n,，、]/).map((value) => value.trim()).filter(Boolean);
+  const payload = {
+    dvdid: String(editor.querySelector('[name="dvdid"]')?.value || '').trim(),
+    title: String(editor.querySelector('[name="title"]')?.value || '').trim(),
+    actress,
+    director: String(editor.querySelector('[name="director"]')?.value || '').trim(),
+    producer: String(editor.querySelector('[name="producer"]')?.value || '').trim(),
+    publisher: String(editor.querySelector('[name="publisher"]')?.value || '').trim(),
+    publish_date: String(editor.querySelector('[name="publish_date"]')?.value || '').trim(),
+    apply_to_folder: Boolean(editor.querySelector('[name="apply_to_folder"]')?.checked),
+  };
+  button.disabled = true;
+  try {
+    await api(`/api/tasks/${encodeURIComponent(editor.dataset.taskId)}/metadata`, { method: 'PATCH', body: JSON.stringify(payload) });
+    state.taskMetadataEditing = false;
+    await loadTasks();
+    showToast(payload.apply_to_folder ? '影片资料和文件夹 NFO 已保存' : '影片资料已保存');
+    if (state.detailTask?.task_type !== 'media') requestMetadataRefresh();
+  } catch (error) {
+    button.disabled = false;
+    showToast(error.message, 'error');
+  }
+});
+$('#metadata-refresh-form')?.addEventListener('submit', async (event) => {
+  if (event.submitter?.id !== 'metadata-refresh-confirm') return;
+  event.preventDefault();
+  const button = $('#metadata-refresh-confirm');
+  button.disabled = true;
+  try {
+    if ($('#metadata-refresh-always').checked) localStorage.setItem('javsp-web.metadata-refresh-always', '1');
+    await refreshConfiguredMediaLibraries();
+    $('#metadata-refresh-dialog').close();
+  } catch (error) {
+    $('#metadata-refresh-message').textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+$('#action-confirm-form').addEventListener('submit', async (event) => {
+  if (event.submitter?.id !== 'action-confirm-button') return;
+  event.preventDefault();
+  const pending = state.pendingConfirm;
+  if (!pending) return;
+  const button = $('#action-confirm-button');
+  button.disabled = true;
+  try {
+    await pending.run();
+    state.pendingConfirm = null;
+    $('#action-confirm-dialog').close();
+  } catch (error) {
+    $('#action-confirm-message').textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+document.querySelectorAll('.native-path-button').forEach((button) => button.addEventListener('click', () => selectNativePath(button.dataset.pathKind)));
+$('#docker-path-browser')?.addEventListener('click', () => openDockerPathBrowser('any', 'manual'));
+$('#docker-schedule-path-browser')?.addEventListener('click', () => openDockerPathBrowser('directory', 'schedule'));
+$('#path-browser-up')?.addEventListener('click', () => {
+  const parent = $('#path-browser-up').dataset.parentPath;
+  if (parent) loadDockerPathBrowser(parent);
+});
+$('#path-browser-list')?.addEventListener('click', (event) => {
+  const select = event.target.closest('[data-path-browser-select]');
+  if (select) {
+    setPathTarget(select.dataset.pathBrowserSelect);
+    $('#path-browser-dialog').close();
+    return;
+  }
+  const entry = event.target.closest('[data-path-browser-enter]');
+  if (!entry) return;
+  if (entry.dataset.pathBrowserKind === 'directory') loadDockerPathBrowser(entry.dataset.pathBrowserEnter);
+  else if (state.pathBrowser.kind !== 'directory') {
+    setPathTarget(entry.dataset.pathBrowserEnter);
+    $('#path-browser-dialog').close();
+  }
+});
+$('#path-browser-choose')?.addEventListener('click', (event) => {
+  event.preventDefault();
+  if (['directory', 'any'].includes(state.pathBrowser.kind)) setPathTarget(state.pathBrowser.currentPath);
+  $('#path-browser-dialog').close();
+});
+$('#preset-mode').addEventListener('change', setPresetMode);
+// 预设页签与类型按钮都是动态重建的，用事件委托绑定，避免重建后失效
+document.addEventListener('click', (event) => {
+  const kindButton = event.target.closest('[data-preset-kind]');
+  if (kindButton) {
+    event.preventDefault();
+    setPresetKind(kindButton.dataset.presetKind);
+    return;
+  }
+  const tabButton = event.target.closest('[data-preset-tab]');
+  if (tabButton) {
+    event.preventDefault();
+    setPresetTab(tabButton.dataset.presetTab);
+  }
+});
+$('#new-preset').addEventListener('click', newPreset);
+$('#save-preset').addEventListener('click', savePreset);
+$('#add-user').addEventListener('click', () => { state.editingUser = null; $('#user-dialog-title').textContent = '添加用户'; $('#user-form').reset(); $('#user-message').textContent = ''; $('#user-dialog').showModal(); });
+$('#user-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const message = $('#user-message');
+  const password = $('#user-password').value;
+  const passwordConfirm = $('#user-password-confirm').value;
+  if (password !== passwordConfirm || (!state.editingUser && !password)) { message.textContent = password ? '两次输入的新密码不一致' : '新用户必须设置密码'; return; }
+  const payload = { username: $('#user-name').value.trim(), password: password || null, password_confirm: passwordConfirm || null, role: $('#user-role').value };
+  try {
+    if (state.editingUser) await api(`/api/users/${encodeURIComponent(state.editingUser)}`, { method: 'PUT', body: JSON.stringify(payload) });
+    else await api('/api/users', { method: 'POST', body: JSON.stringify(payload) });
+    $('#user-dialog').close();
+    await loadUsers();
+  } catch (error) { message.textContent = error.message; }
+});
+
+$('#logout').addEventListener('click', async () => { await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }); location.href = MOBILE_APP ? '/login?mobile=1' : '/login'; });
+document.querySelectorAll('.nav-item').forEach((button) => {
+  button.title = button.textContent.trim();
+  button.addEventListener('click', () => showView(button.dataset.view));
+});
+document.querySelectorAll('[data-go]').forEach((button) => button.addEventListener('click', () => showView(button.dataset.go)));
+
+function taskDisplayName(task) {
+  return task.title || task.file_name || task.name || task.id;
+}
+
+function taskDetailHeading(task) {
+  if (task.task_type === 'scan') return { title: taskDisplayName(task), subtitle: task.file_name || task.name || '' };
+  const dvdid = task.progress?.metadata?.dvdid || task.progress?.result?.dvdid || task.dvdid || '';
+  return { title: dvdid || '影片详情', subtitle: ['影片详情', task.preset_name, task.progress?.metadata?.publish_date].filter(Boolean).join(' · ') };
+}
+
+const REQUIRED_LABELS = {
+  dvdid: '番号', title: '标题', cover: '封面', big_cover: '高清封面',
+  plot: '剧情', genre: '类型', score: '评分', ori_title: '原始标题',
+  actress: '演员', director: '导演', duration: '时长', producer: '制作商',
+  publisher: '发行商', publish_date: '发行日期', serial: '系列',
+  preview_pics: '剧照', preview_video: '预告片', magnet: '下载链接',
+  cid: 'CID', url: 'URL',
+};
+
+function imageProgressSummary(task) {
+  const images = task.progress?.images || {};
+  const cover = Number(task.cover_count) > 0 ? '封面已下载' : (images.failed ? '封面失败' : '封面等待中');
+  const total = Number(images.fanart_total) || Number(task.fanart_count) || 0;
+  const done = Math.min(Number(task.fanart_count) || 0, total || Number(task.fanart_count) || 0);
+  const base = total ? `${cover} · 剧照 ${done}/${total}` : cover;
+  // 图片下载失败（资料抓到了但图没下来）：直接把原因显示在任务上
+  if (task.artwork_error) return `${base} · ${task.artwork_error}`;
+  // 预设里勾了「必须取得」却没拿到的项，直接标出来
+  const missing = Array.isArray(task.missing_required) ? task.missing_required : [];
+  if (!missing.length) return base;
+  const names = missing.map(key => REQUIRED_LABELS[key] || key).join('、');
+  return `${base} · 缺少：${names}`;
+}
+
+function syncTaskExpansion(tasks) {
+  state.taskOpen ||= {};
+  state.taskStatus ||= {};
+  (tasks || []).forEach((task) => {
+    const key = String(task.id);
+    const previous = state.taskStatus[key];
+    if (task.status === 'running' && previous !== 'running') {
+      state.taskOpen[key] = true;
+      state.taskOpen[`schedule-${key}`] = true;
+    } else if (previous === 'running' && task.status !== 'running') {
+      state.taskOpen[key] = false;
+      state.taskOpen[`schedule-${key}`] = false;
+    }
+    state.taskStatus[key] = task.status;
+  });
+}
+
+function scanTaskCard(task) {
+  const id = escapeHtml(task.id);
+  const active = ['queued', 'running'].includes(task.status);
+  const stop = taskStopButton(task);
+  const select = `<input type="checkbox" class="task-select" data-task-select="${id}" aria-label="选择任务"${state.selectedTaskIds?.has(task.id) ? ' checked' : ''}>`;
+  const labels = { queued: '等待扫描', running: '扫描中', succeeded: '扫描完成', failed: '扫描失败', cancelled: '扫描已取消' };
+  return '<article class="task-card" data-task-card="' + id + '"><div class="task-card-head"><div class="task-card-title"><strong>' + escapeHtml(taskDisplayName(task)) + '</strong><div class="task-path">路径：' + escapeHtml(task.input_directory) + '</div><p role="status">' + escapeHtml(task.scan?.message || '等待扫描') + '</p><p class="muted">发现 ' + Number(task.scan?.discovered_files || 0) + ' 个文件 · 创建 ' + Number(task.scan?.created_tasks || 0) + ' 个影片任务</p></div><div class="task-card-tools">' + select + '<span class="badge ' + escapeHtml(task.status) + '">' + (labels[task.status] || '') + '</span><button class="icon-button" type="button" data-task-detail="' + id + '">详情</button>' + stop + '<button class="task-delete" type="button" data-delete-task="' + id + '"' + (active ? ' disabled' : '') + '>删除</button></div></div></article>';
+}
+
+function taskStopButton(task) {
+  // 排队中也要能停止：任务详情对话框与定时任务运行记录此前只在“运行中”时提供入口
+  if (!task || !['queued', 'running'].includes(task.status)) return '';
+  const label = task.task_type === 'scan' ? '停止扫描' : '停止任务';
+  return `<button class="button secondary task-stop" type="button" onclick="cancelTask('${escapeHtml(task.id)}')">${label}</button>`;
+}
+
+function taskCard(task) {
+  if (task.task_type === 'scan') return scanTaskCard(task);
+  const labels = { queued: '排队中', running: '运行中', succeeded: '已完成', failed: '失败', cancelled: '已取消' };
+  const expanded = state.taskOpen?.[task.id] ?? task.status === 'running';
+  const active = ['queued', 'running'].includes(task.status);
+  const fileName = task.file_name || task.name || task.id;
+  const titleMeta = task.title ? `<span>文件：${escapeHtml(fileName)}</span>` : '';
+  const actions = '';
+  const detailButton = `<button class="icon-button" type="button" data-task-detail="${escapeHtml(task.id)}" title="查看任务详情">详情</button>`;
+  const metadataButton = `<button class="icon-button" type="button" data-task-metadata="${escapeHtml(task.id)}"${task.library_film_id ? ` data-film-id="${escapeHtml(task.library_film_id)}"` : ''} title="编辑番号等资料">资料</button>`;
+  const retryButton = ['failed', 'cancelled'].includes(task.status)
+    ? `<button class="button secondary small" type="button" data-retry-task="${escapeHtml(task.id)}" title="用当前资料重新刮削">重新刮削</button>`
+    : '';
+  const stopButton = taskStopButton(task);
+  const deleteButton = `<button class="task-delete" type="button" data-delete-task="${escapeHtml(task.id)}"${active ? ' disabled title="请先停止任务"' : ' title="删除任务"'}>删除</button>`;
+  const select = `<input type="checkbox" class="task-select" data-task-select="${escapeHtml(task.id)}" aria-label="选择任务"${state.selectedTaskIds?.has(task.id) ? ' checked' : ''}>`;
+  return `<article class="task-card task-card-collapsible" data-task-card="${escapeHtml(task.id)}"><div class="task-card-head"><div class="task-card-title"><strong>${escapeHtml(taskDisplayName(task))}</strong><div class="task-meta">${titleMeta}<span>预设：${escapeHtml(task.preset_name || task.preset_id || '默认配置')}</span><span>时间：${new Date(task.created_at).toLocaleString()}</span></div><div class="task-path">路径：${escapeHtml(task.input_directory)}</div><div class="task-image-summary">${escapeHtml(imageProgressSummary(task))}</div></div><div class="task-card-tools">${select}<span class="badge ${task.status}">${labels[task.status] || task.status}</span>${metadataButton}${detailButton}${retryButton}${stopButton}${deleteButton}<button class="task-toggle" type="button" data-task-toggle="${escapeHtml(task.id)}" aria-expanded="${expanded}" title="${expanded ? '收起任务' : '展开任务'}">${expandControlIcon(expanded)}</button></div></div><div class="task-card-body${expanded ? '' : ' hidden'}" data-task-body="${escapeHtml(task.id)}">${progressMarkup(task)}${task.error ? `<div class="form-error">${escapeHtml(task.error)}</div>` : ''}${actions}</div></article>`;
+}
+
+function rememberTaskCards() {
+  state.taskOpen ||= {};
+  document.querySelectorAll('[data-task-card]').forEach((card) => {
+    const id = card.dataset.taskCard;
+    state.taskOpen[id] = !card.querySelector('[data-task-body]')?.classList.contains('hidden');
+  });
+}
+
+function ensureTaskFilters() {
+  if ($('#task-filter-bar')) return;
+  const taskTable = $('#task-table');
+  if (!taskTable) return;
+  taskTable.insertAdjacentHTML('beforebegin', `<div id="task-filter-bar" class="task-filter-bar" aria-label="任务筛选"><select id="task-filter-field"><option value="all">全部信息</option><option value="path">路径</option><option value="title">标题</option><option value="dvdid">番号</option><option value="actress">演员</option></select><input id="task-filter-query" type="search" placeholder="搜索路径、标题、番号或演员"><select id="task-filter-status"><option value="">全部状态</option><option value="queued">排队中</option><option value="running">运行中</option><option value="succeeded">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option></select><label>大小 MB<input id="task-filter-size-min" type="number" min="0" placeholder="最小"></label><span>至</span><label><input id="task-filter-size-max" type="number" min="0" placeholder="最大"></label><label>时间<input id="task-filter-date-from" type="date"></label><span>至</span><label><input id="task-filter-date-to" type="date"></label><button id="task-filter-reset" class="button secondary" type="button">重置</button><button id="task-select-mode" class="button secondary" type="button" aria-pressed="false">批量选择</button><button id="task-purge-open" class="button secondary" type="button">清理记录</button><button id="task-retry-failed" class="button secondary" type="button" title="把所有失败的任务重新加入刮削队列">重试失败</button><button id="task-stop-all" class="button secondary" type="button" title="停止所有排队中与运行中的任务">停止全部任务</button></div><div id="task-selection-bar" class="task-selection-bar" hidden><span id="task-selection-count">已选 0 条</span><button id="task-select-page" class="button secondary" type="button">选择本页</button><button id="task-select-all" class="button secondary" type="button">选择全部</button><button id="task-selection-clear" class="button secondary" type="button">取消选择</button><button id="task-delete-selected" class="button danger" type="button" disabled>删除记录</button></div><p id="task-filter-summary" class="muted"></p><div id="task-pagination" class="overview-pagination"></div>`);
+  $('#task-filter-field')?.remove();
+  let filterTimer;
+  document.querySelectorAll('#task-filter-bar input, #task-filter-bar select').forEach((control) => control.addEventListener('input', () => { clearTimeout(filterTimer); filterTimer = setTimeout(() => { state.taskPage = 0; state.selectedTaskIds.clear(); state.taskSelectAnchor = ''; loadTasks(); }, 200); }));
+  $('#task-filter-reset').addEventListener('click', () => {
+    document.querySelectorAll('#task-filter-bar input').forEach((control) => { control.value = ''; });
+    $('#task-filter-status').value = '';
+    state.selectedTaskIds.clear();
+    state.taskSelectAnchor = '';
+    state.taskPage = 0; loadTasks();
+  });
+}
+
+function filteredTasks() { return state.tasks; }
+
+function renderTasks() {
+  ensureTaskFilters();
+  rememberLogScroll();
+  rememberTaskCards();
+  const tasks = filteredTasks();
+  $('#task-table')?.classList.toggle('selection-mode', state.taskSelectionMode);
+  patchChildren($('#task-table'), tasks.length ? tasks.map(taskCard).join('') : '<div class="task-list empty">没有符合当前筛选条件的任务</div>');
+  const manualTaskCount = state.tasks.filter((task) => !task.source || task.source === 'manual' || task.image_retry_started_at).length;
+  $('#task-filter-summary').textContent = `显示 ${tasks.length} / ${state.taskTotal || manualTaskCount} 个手动任务`;
+  const pagination = $('#task-pagination');
+  if (pagination) { const pages = Math.max(1, Math.ceil((state.taskTotal || tasks.length) / state.taskPageSize)); pagination.innerHTML = `<span>第 ${state.taskPage + 1} / ${pages} 页</span><button class="button secondary" type="button" data-task-page="${state.taskPage - 1}"${state.taskPage <= 0 ? ' disabled' : ''}>上一页</button><button class="button secondary" type="button" data-task-page="${state.taskPage + 1}"${state.taskPage + 1 >= pages ? ' disabled' : ''}>下一页</button>`; }
+  restoreLogScroll();
+  renderTaskSelectionBar();
+}
+
+function renderTaskSelectionBar() {
+  const bar = $('#task-selection-bar');
+  if (!bar) return;
+  const count = state.selectedTaskIds.size;
+  bar.hidden = !state.taskSelectionMode && !count;
+  $('#task-selection-count').textContent = `已选 ${count} 条`;
+  $('#task-delete-selected').disabled = !count;
+  const selectAll = $('#task-select-all');
+  if (selectAll) {
+    selectAll.textContent = state.taskTotal ? `选择全部 ${state.taskTotal} 条` : '选择全部';
+    selectAll.disabled = !state.taskTotal;
+  }
+  const mode = $('#task-select-mode');
+  if (mode) {
+    mode.textContent = state.taskSelectionMode ? '退出批量' : '批量选择';
+    mode.setAttribute('aria-pressed', String(state.taskSelectionMode));
+  }
+  const purge = $('#task-purge-open');
+  if (purge) purge.hidden = state.user?.role !== 'admin';
+}
+
+function taskIdsRequest() {
+  const path = taskPageRequest();
+  if (!path || !path.startsWith('/api/tasks?')) return null;
+  const params = new URLSearchParams(path.slice('/api/tasks?'.length));
+  ['limit', 'offset', 'sort', 'direction'].forEach((key) => params.delete(key));
+  return `/api/tasks/ids?${params}`;
+}
+
+async function selectAllMatching(button, target) {
+  const path = taskIdsRequest();
+  if (!path) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = '读取中…';
+  try {
+    const result = await api(path);
+    (result.ids || []).forEach((id) => target.add(id));
+    showToast(`已选择 ${Number(result.total) || (result.ids || []).length} 条记录`);
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+function formatBytes(value) {
+  const size = Number(value) || 0;
+  if (size < 1024) return `${size} B`;
+  if (size < 1048576) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1048576).toFixed(1)} MB`;
+}
+
+async function openTaskDetail(taskId, background = false) {
+  if (!taskId || (background && state.detailLoading)) return;
+  const summary = state.tasks.find((item) => item.id === taskId) || state.detailTask;
+  if (!summary) return;
+  if (state.activeTaskDetail !== taskId) window.JavspComments?.close();
+  state.activeTaskDetail = taskId;
+  const dialog = $('#task-detail-dialog');
+  if (!background) {
+    const heading = taskDetailHeading(summary);
+    $('#task-detail-title').textContent = heading.title;
+    $('#task-detail-subtitle').textContent = heading.subtitle;
+  }
+  if (!background && state.detailTask?.id !== taskId) { renderedMarkup.delete($('#task-detail-content')); $('#task-detail-content').innerHTML = '<p class="muted">正在读取任务详情与日志...</p>'; }
+  const detailRequestId = state.detailRequestId = (state.detailRequestId || 0) + 1;
+  state.detailLoading = true;
+  if (!dialog.open) dialog.showModal();
+  let task;
+  try {
+    task = await api(`/api/tasks/${encodeURIComponent(taskId)}`);
+  } catch (error) {
+    if (!background && state.activeTaskDetail === taskId) $('#task-detail-content').innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`;
+    return;
+  } finally { if (detailRequestId === state.detailRequestId) state.detailLoading = false; }
+  if (state.activeTaskDetail !== taskId || !dialog.open || detailRequestId !== state.detailRequestId || (background && (state.taskMetadataEditing || state.taskDetailLogSelecting || hasTaskDetailLogSelection()))) return;
+  state.detailTask = task;
+  const stopControl = taskStopButton(task);
+  const stopRow = stopControl ? `<div class="form-actions task-actions">${stopControl}</div>` : '';
+  document.querySelector('.film-navigation').hidden = task.task_type === 'scan';
+  const editButton = document.querySelector('#task-detail-dialog > .film-detail-shell > .panel-heading [data-edit-task-metadata]');
+  if (editButton) editButton.hidden = task.task_type === 'scan' || state.taskMetadataEditing;
+  document.querySelector('[data-detail-section="task-comments"]').hidden = !task.progress?.metadata?.dvdid || !state.runtime?.comments_url;
+  if (task.task_type === 'scan') {
+    $('#task-detail-content').innerHTML = '<p role="status">' + escapeHtml(task.scan?.message || '') + '</p><p class="muted">扫描完成后，影片任务会出现在任务队列中。停止扫描仅停止继续创建任务。</p>' + stopRow + '<pre class="task-log">' + escapeHtml((task.log_tail || []).join('\n')) + '</pre>';
+    return;
+  }
+  const metadata = task.progress?.metadata || {};
+  const posterImage = task.cover_count ? `<img class="detail-poster" src="/api/tasks/${encodeURIComponent(task.id)}/cover/0?v=${encodeURIComponent(task.updated_at || task.finished_at || '')}" alt="${escapeHtml(taskDisplayName(task))}">` : artworkPlaceholder('detail-poster detail-poster-empty', task.progress?.images?.cover_status === 'failed' ? '封面下载失败' : '封面未下载');
+  const poster = `<div class="detail-poster-wrap">${posterImage}</div>`;
+  const backdropSource = task.fanart_count ? `/api/tasks/${encodeURIComponent(task.id)}/fanart/0?v=${encodeURIComponent(task.updated_at || task.finished_at || '')}` : (task.cover_count ? `/api/tasks/${encodeURIComponent(task.id)}/cover/0?v=${encodeURIComponent(task.updated_at || task.finished_at || '')}` : '');
+  const backdrop = backdropSource ? `<span class="lc-film-backdrop" aria-hidden="true"><img src="${backdropSource}" alt=""></span>` : '';
+  const actressNames = (Array.isArray(metadata.actress) ? metadata.actress : [metadata.actress]).map((name) => String(name || '').trim()).filter(Boolean);
+  const actressChips = actressNames.length ? `<div class="lc-actress">${actressNames.map((name) => `<span>${escapeHtml(name)}</span>`).join('')}</div>` : '';
+  const facts = [['导演', metadata.director], ['制作商', metadata.producer], ['发行商', metadata.publisher], ['发行时间', metadata.publish_date]].map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHtml(value || '-')}</dd></div>`).join('');
+  const actressInput = Array.isArray(metadata.actress) ? metadata.actress.join('\n') : (metadata.actress || '');
+  const metadataEditor = state.taskMetadataEditing ? `<section id="task-metadata-editor" class="task-metadata-editor" data-task-id="${escapeHtml(task.id)}"><div class="task-metadata-editor-heading"><h3>修改影片资料</h3><button class="icon-button" type="button" data-cancel-task-metadata>取消</button></div><div class="task-metadata-fields"><label>番号<input name="dvdid" maxlength="160" value="${escapeHtml(metadata.dvdid || '')}"></label><label>标题<input name="title" maxlength="1000" value="${escapeHtml(metadata.title || '')}"></label><label>演员<textarea name="actress" rows="3" maxlength="3000">${escapeHtml(actressInput)}</textarea></label><label>导演<input name="director" maxlength="300" value="${escapeHtml(metadata.director || '')}"></label><label>制作商<input name="producer" maxlength="300" value="${escapeHtml(metadata.producer || '')}"></label><label>发行商<input name="publisher" maxlength="300" value="${escapeHtml(metadata.publisher || '')}"></label><label>发行时间<input name="publish_date" maxlength="32" placeholder="YYYY-MM-DD" value="${escapeHtml(metadata.publish_date || '')}"></label></div>${artworkEditor(task)}${task.task_type === 'media' ? '<p class="muted">资料和图片将保存到绑定媒体服务器。</p>' : '<label class="check-label task-metadata-folder"><input name="apply_to_folder" type="checkbox" checked>同步写入整理文件夹中的 NFO</label>'}<div class="detail-image-actions"><button class="button primary" type="button" data-save-task-metadata>保存资料</button></div></section>` : `<section class="lc-film-hero">${backdrop}${poster}<div class="lc-film-copy"><div class="lc-film-badges"><span class="lc-chip lc-chip-accent">${escapeHtml(metadata.dvdid || '未识别番号')}</span>${metadata.publish_date ? `<span class="lc-chip">${escapeHtml(metadata.publish_date)}</span>` : ''}${task.fanart_count ? `<span class="lc-chip">${Number(task.fanart_count)} 张剧照</span>` : ''}</div><h3 class="film-title">${escapeHtml(metadata.title || taskDisplayName(task))}</h3>${actressChips}<dl class="lc-facts">${facts}</dl><div class="lc-film-actions"><button class="button primary" type="button" data-play-task="${escapeHtml(task.id)}"><img src="/assets/play.svg" alt="">播放影片</button></div></div></section>`;
+  const imageInfo = task.progress?.images || {};
+  const expectedFanart = Math.max(Number(imageInfo.fanart_total) || 0, Number(task.fanart_count) || 0);
+  const fanartFailures = imageInfo.fanart_failures || [];
+  const fanarts = expectedFanart
+    ? Array.from({ length: Math.min(expectedFanart, 24) }, (_, index) => {
+      if (index < Number(task.fanart_count || 0)) return `<img src="/api/tasks/${encodeURIComponent(task.id)}/fanart/${index}?v=${encodeURIComponent(task.updated_at || task.finished_at || '')}" loading="lazy" alt="剧照 ${index + 1}">`;
+      const failed = fanartFailures.includes(index + 1);
+      return artworkPlaceholder('detail-fanart-empty', failed ? `剧照 ${index + 1} 下载失败` : `剧照 ${index + 1} 未下载`);
+    }).join('')
+    : '<p class="muted">暂无剧照</p>';
+  const imageCounts = imageCountsMarkup({ coverDone: task.cover_count, coverStatus: imageInfo.cover_status, fanartDone: task.fanart_count, fanartTotal: expectedFanart, fanartStatus: imageInfo.fanart_status, fanartFailures });
+  const retry = task.image_retry_available ? `<button class="button secondary" type="button" data-retry-task-images="${escapeHtml(task.id)}">重新下载封面与剧照</button>` : (task.image_retry_running ? '<button class="button secondary" type="button" disabled>正在重新下载封面与剧照</button>' : '');
+  const fileInfo = [['文件名', task.file_name || task.name], ['原始路径', task.input_directory], ['整理路径', task.progress?.output?.save_dir]].map(([name,value]) => `<div class="detail-data-row"><dt>${name}</dt><dd>${escapeHtml(value || '—')}</dd></div>`).join('');
+  const taskLog = taskLogMarkup(task, `detail-${task.id}`, 'task-detail-log');
+  const googleCover = task.task_type !== 'media' && !task.cover_count ? `<div class="google-cover-action"><button class="button secondary task-google-cover" type="button" data-google-cover-task="${escapeHtml(task.id)}">使用全部爬虫搜索封面</button></div>` : '';
+  const restore = task.restore_available && hostFileActionsAllowed()
+    ? `<button class="button danger" type="button" data-restore-task-files="${escapeHtml(task.id)}">还原文件</button>`
+    : '';
+  const heading = taskDetailHeading(task);
+  $('#task-detail-title').textContent = heading.title;
+  $('#task-detail-subtitle').textContent = heading.subtitle;
+  const identifier = String(metadata.dvdid || '').trim();
+  patchChildren($('#task-detail-content'), `${metadataEditor}${stopRow}<section id="film-stills" class="detail-fanarts"><div class="film-section-heading"><h3>影片剧照 <span>${task.fanart_count || 0}</span></h3></div><div class="detail-fanart-grid">${fanarts}</div></section><details class="film-files"><summary>文件与刮削记录</summary><dl class="film-file-data">${fileInfo}</dl><section class="detail-images"><div><h3>封面与剧照</h3>${imageCounts}</div><div class="detail-image-actions">${googleCover}${retry}${restore}</div></section>${taskLog}</details>`);
+  window.JavspComments?.open(identifier, state.runtime?.comments_url || '', task.id);
+}
+
+document.addEventListener('change', async event => {
+  const input = event.target.closest('[data-artwork-upload]');
+  if (!input || !input.files?.length || state.artworkSaving) return;
+  state.artworkSaving = true;
+  input.disabled = true;
+  try {
+    for (const file of input.files) {
+      if (file.size > 16 * 1024 * 1024) throw new Error('图片不能超过 16 MB');
+      const form = new FormData(); form.append('file', file);
+      const response = await fetch(`/api/tasks/${encodeURIComponent(state.activeTaskDetail)}/artwork/${input.dataset.artworkUpload}/${input.dataset.imageIndex}`, { method: 'PUT', credentials: 'include', body: form });
+      if (!response.ok) throw new Error((await response.json()).detail || '图片保存失败');
+    }
+    await refreshArtworkEditor();
+    showToast('图片已保存', 'success');
+  } catch (error) { showToast(error.message, 'error'); }
+  finally { state.artworkSaving = false; input.disabled = false; input.value = ''; }
+});
+
+document.addEventListener('click', async event => {
+  const button = event.target.closest('[data-artwork-delete]');
+  if (!button || state.artworkSaving) return;
+  state.artworkSaving = true; button.disabled = true;
+  try {
+    await api(`/api/tasks/${encodeURIComponent(state.activeTaskDetail)}/artwork/${button.dataset.artworkDelete}/${button.dataset.imageIndex}`, { method: 'DELETE' });
+    await refreshArtworkEditor();
+  } catch (error) { showToast(error.message, 'error'); }
+  finally { state.artworkSaving = false; button.disabled = false; }
+});
+
+function cookiecloudPayload() {
+  return {
+    enabled: $('#cookiecloud-enabled').checked,
+    server_url: $('#cookiecloud-server-url').value.trim(),
+    uuid: $('#cookiecloud-uuid').value.trim(),
+    crypto_type: $('#cookiecloud-crypto-type').value,
+    password: $('#cookiecloud-password').value,
+    clear_password: $('#cookiecloud-clear-password').checked,
+    sync_interval_minutes: Number($('#cookiecloud-sync-interval').value || 30),
+  };
+}
+
+let cookiecloudStatusTimer = null;
+
+function renderCookieCloudStatus(settings) {
+  const sync = settings.sync || {};
+  const last = sync.last_sync_at ? formatLocalDateTime(sync.last_sync_at) : '尚未同步';
+  const next = !settings.enabled ? '已停用' : sync.next_sync_at ? formatLocalDateTime(sync.next_sync_at) : '等待同步';
+  const counts = sync.last_sync_at ? `（${sync.domains} 个站点，${sync.cookies} 条 Cookie）` : '';
+  $('#cookiecloud-sync-status').textContent = `最近同步：${last}${counts}；下次：${next}${sync.last_error ? '；' + sync.last_error : ''}`;
+  $('#sync-cookiecloud').disabled = !settings.enabled;
+}
+
+function scheduleCookieCloudStatus() {
+  window.clearTimeout(cookiecloudStatusTimer);
+  cookiecloudStatusTimer = window.setTimeout(async () => {
+    if (!document.querySelector('[data-panel="settings"].active')) return;
+    try { renderCookieCloudStatus(await api('/api/cookiecloud')); } catch (_) { }
+    scheduleCookieCloudStatus();
+  }, 15000);
+}
+
+async function loadCookieCloud() {
+  const message = $('#cookiecloud-message');
+  try {
+    const settings = await api('/api/cookiecloud');
+    $('#cookiecloud-enabled').checked = Boolean(settings.enabled);
+    $('#cookiecloud-server-url').value = settings.server_url || '';
+    $('#cookiecloud-uuid').value = settings.uuid || '';
+    $('#cookiecloud-crypto-type').value = settings.crypto_type || 'auto';
+    $('#cookiecloud-password').value = '';
+    $('#cookiecloud-clear-password').checked = false;
+    $('#cookiecloud-sync-interval').value = settings.sync_interval_minutes || 30;
+    renderCookieCloudStatus(settings);
+    scheduleCookieCloudStatus();
+    message.textContent = settings.has_password ? '已保存密码' : '';
+  } catch (error) { message.textContent = error.message; }
+}
+
+async function refreshConfiguredMediaLibraries() {
+  if (state.user?.role !== 'admin') {
+    showToast('当前账户无权刷新媒体库', 'error');
+    return;
+  }
+  const servers = await api('/api/media-servers');
+  state.mediaServers = servers;
+  if (!servers.length) {
+    showToast('没有已配置的媒体服务器');
+    return;
+  }
+  const results = await Promise.allSettled(servers.map((server) => api(`/api/media-servers/${encodeURIComponent(server.id)}/sync`, { method: 'POST' })));
+  const failed = results.filter((result) => result.status === 'rejected').length;
+  showToast(failed ? `已向 ${servers.length - failed} 台媒体服务器发送刷新请求，${failed} 台失败` : `已向 ${servers.length} 台媒体服务器发送刷新请求`, failed ? 'error' : 'success');
+}
+
+function requestMetadataRefresh() {
+  if (localStorage.getItem('javsp-web.metadata-refresh-always') === '1') {
+    refreshConfiguredMediaLibraries().catch((error) => showToast(error.message, 'error'));
+    return;
+  }
+  const dialog = $('#metadata-refresh-dialog');
+  $('#metadata-refresh-always').checked = false;
+  $('#metadata-refresh-message').textContent = '';
+  if (dialog && !dialog.open) dialog.showModal();
+}
+
+function overviewTaskIds(value) {
+  return String(value || '').split(',').map((id) => id.trim()).filter(Boolean);
+}
+
+function toggleOverviewSelection(ids) {
+  if (!ids.length) return;
+  const selected = ids.every((id) => state.selectedOverviewTasks.has(id));
+  ids.forEach((id) => {
+    if (selected) state.selectedOverviewTasks.delete(id);
+    else state.selectedOverviewTasks.add(id);
+    state.overviewSelectionFeedback.add(id);
+  });
+}
+
+function overviewSelectionIcon(selected = false) {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"></rect>${selected ? '<path d="m8 12 2.7 2.7L16.5 9"></path>' : ''}</svg>`;
+}
+
+function overviewGroupType(type = state.overviewGroupBy) {
+  return OVERVIEW_GROUP_TYPES.find(([key]) => key === type) || OVERVIEW_GROUP_TYPES[1];
+}
+
+function renderOverviewChrome() {
+  const metrics = state.taskMetrics || {};
+  $('#metric-total').textContent = metrics.total || 0;
+  $('#metric-running').textContent = metrics.running || 0;
+  if ($('#metric-succeeded')) $('#metric-succeeded').textContent = metrics.succeeded || 0;
+  if ($('#metric-failed')) $('#metric-failed').textContent = metrics.failed || 0;
+  if ($('#metric-result')) $('#metric-result').textContent = ({ succeeded: '成功', failed: '失败', running: '运行中', queued: '排队中', cancelled: '已取消' }[metrics.latest_status] || '-');
+  if ($('#metric-films')) $('#metric-films').textContent = state.overviewFilmCount ?? '-';
+  const tabs = $('#overview-group-tabs');
+  if (tabs) patchChildren(tabs, OVERVIEW_GROUP_TYPES
+    .map(([type, label]) => `<button type="button" role="tab" data-overview-group-by="${type}" aria-selected="${state.overviewGroupBy === type}"${state.overviewGroupBy === type ? ' class="active"' : ''}>${label}</button>`).join(''));
+  const search = $('#library-search');
+  if (search && document.activeElement !== search) {
+    search.value = (state.overviewGroup || state.overviewGroupBy === 'all') ? state.overviewQuery : state.overviewGroupQuery;
+    search.placeholder = (state.overviewGroup || state.overviewGroupBy === 'all') ? '搜索番号、片名或演员' : `搜索${overviewGroupType()[1]}名称`;
+  }
+}
+
+function renderOverview() {
+  renderOverviewChrome();
+  const container = $('#overview-tasks');
+  if (!container) return;
+  const tasks = state.tasks || [];
+  const warnings = (state.mediaWarnings || []).map((message) => `<p class="form-error" role="status">${escapeHtml(message)}</p>`).join('');
+  const header = `<div class="lc-section-head"><h3>任务记录</h3><span>共 ${state.taskTotal || 0} 条 · 最近优先</span></div>`;
+  const list = tasks.length
+    ? `<div class="task-list">${tasks.map((task) => taskCard(task)).join('')}</div>`
+    : `<div class="library-empty lc-empty-state"><span aria-hidden="true">▤</span><h3>还没有任务记录</h3><p>到“手动刮削”创建任务，完成后的记录和日志会出现在这里。</p><button class="button primary" data-go="scrape">去创建任务</button></div>`;
+  const totalPages = Math.max(1, Math.ceil((state.taskTotal || tasks.length) / state.overviewPageSize));
+  const pagination = tasks.length
+    ? `<div class="overview-pagination"><label>每页<select id="overview-page-size">${OVERVIEW_PAGE_SIZES.map((size) => `<option value="${size}"${state.overviewPageSize === size ? ' selected' : ''}>${size}</option>`).join('')}</select></label><span>第 ${state.overviewPage} / ${totalPages} 页</span><button class="button secondary" type="button" data-overview-page="${state.overviewPage - 1}"${state.overviewPage <= 1 ? ' disabled' : ''}>上一页</button><button class="button secondary" type="button" data-overview-page="${state.overviewPage + 1}"${state.overviewPage >= totalPages ? ' disabled' : ''}>下一页</button></div>`
+    : '';
+  patchChildren(container, warnings + header + list + pagination);
+}
+
+function renderOverviewGroups() {
+  const result = state.overviewGroups;
+  const container = $('#overview-tasks');
+  if (!result) { patchChildren(container, '<p class="lc-loading">正在读取媒体库…</p>'); return; }
+  const [, label, english] = overviewGroupType(result.by);
+  if (!result.all?.count && !result.groups?.length) {
+    patchChildren(container, `<div class="library-empty lc-empty-state"><span aria-hidden="true">▤</span><h3>收藏从第一部影片开始</h3><p>添加刮削任务，完成后就能在这里按${escapeHtml(label)}浏览封面和影片资料。</p><button class="button primary" data-go="scrape">添加影片</button></div>`);
+    return;
+  }
+  const everything = { key: '__all__', name: '全部影片', count: result.all.count, covers: result.all.covers, template: 'tilted' };
+  const groups = result.by === 'all' ? [everything] : result.groups;
+  const pages = Math.max(1, Math.ceil(result.total / result.limit));
+  const cards = groups.length
+    ? `<div class="lc-library-grid">${groups.map((group) => libraryCard(group, group.key === '__all__' ? 'ALL MOVIES' : english)).join('')}</div>`
+    : `<div class="library-empty lc-empty-state"><span aria-hidden="true">⌕</span><h3>没有找到“${escapeHtml(state.overviewGroupQuery)}”</h3><p>换个${escapeHtml(label)}名称试试。</p></div>`;
+  const pagination = pages > 1 ? `<div class="overview-pagination"><span>第 ${state.overviewGroupPage} / ${pages} 页</span><button class="button secondary" type="button" data-overview-group-page="${state.overviewGroupPage - 1}"${state.overviewGroupPage <= 1 ? ' disabled' : ''}>上一页</button><button class="button secondary" type="button" data-overview-group-page="${state.overviewGroupPage + 1}"${state.overviewGroupPage >= pages ? ' disabled' : ''}>下一页</button></div>` : '';
+  patchChildren(container, `${(state.mediaWarnings || []).map(message => `<p class="form-error" role="status">${escapeHtml(message)}</p>`).join('')}<div class="lc-section-head"><h3>按${escapeHtml(label)}浏览</h3><span>${result.total} 个分类 · ${result.all.count} 部影片</span></div>${cards}${pagination}`);
+}
+
+function libraryCard(group, english) {
+  return `<button type="button" class="lc-library-card" data-overview-open-group="${escapeHtml(group.key)}" aria-label="${escapeHtml(`${group.name}，${group.count} 部影片`)}">${libraryCover(group, english)}<span class="lc-library-meta"><strong title="${escapeHtml(group.name)}">${escapeHtml(group.name)}</strong><small><i></i>${group.count} 部影片</small></span></button>`;
+}
+
+function coverHash(text) {
+  let hash = 2166136261;
+  for (const char of String(text)) { hash ^= char.codePointAt(0); hash = Math.imul(hash, 16777619); }
+  return hash >>> 0;
+}
+
+// Library covers follow LibraryCoverStudio's 1920×1080 templates, drawn with live posters.
+function libraryCover(group, english) {
+  const covers = (group.covers || []).map((cover) => `/api/tasks/${encodeURIComponent(cover.id)}/cover/0?thumbnail=true&v=${encodeURIComponent(cover.v || '')}`);
+  const seed = coverHash(`${english}:${group.key}`);
+  const pickSeed = Math.imul(seed ^ (seed >>> 15), 2246822507) >>> 13;
+  const template = group.template || (covers.length >= 5 ? ['tilted', 'upright', 'fan', 'strip'][pickSeed % 4] : covers.length ? ['stacked', 'diagonal', 'fan'][pickSeed % 3] : 'plain');
+  const pick = (count) => Array.from({ length: count }, (_, index) => covers.length ? covers[index % covers.length] : '');
+  const image = (src) => src ? `<img src="${escapeHtml(src)}" alt="" loading="lazy" decoding="async">` : '<i class="lc-blank"></i>';
+  const posters = (list, extra = '') => list.map((src, index) => `<span class="lc-poster${extra}" style="--i:${index}">${image(src)}</span>`).join('');
+  const backdrop = covers.length ? `<span class="lc-backdrop">${image(covers[0])}</span>` : '';
+  const [first, second, third, fourth, fifth] = pick(5);
+  const layers = {
+    tilted: `${backdrop}<span class="lc-tilt">${posters(pick(9))}</span>`,
+    upright: `<span class="lc-wall">${posters(pick(12))}</span>`,
+    fan: `<span class="lc-fan">${posters([fourth, second, first, third, fifth])}</span>`,
+    strip: `${backdrop}<span class="lc-strip">${posters(pick(5))}</span>`,
+    stacked: `<span class="lc-stack">${posters([first, first])}<span class="lc-poster lc-main">${image(first)}</span></span>`,
+    diagonal: `<span class="lc-diagonal">${image(first)}</span>`,
+    plain: '',
+  }[template];
+  const length = [...String(group.name || '')].length;
+  const scale = length <= 2 ? 1 : length <= 4 ? .82 : length <= 6 ? .64 : length <= 9 ? .5 : .38;
+  return `<span class="lc-cover lc-tpl-${template}" style="--hue:${seed % 360};--title-scale:${scale}">${layers}<span class="lc-cover-title"><b>${escapeHtml(group.name)}</b><em>${escapeHtml(english)}</em></span></span>`;
+}
+
+function openOverviewGroup(key) {
+  const result = state.overviewGroups;
+  const group = key === '__all__'
+    ? { key, name: '全部影片', count: result?.all?.count || 0, covers: result?.all?.covers || [], template: 'tilted' }
+    : result?.groups.find((item) => item.key === key);
+  if (!group) return;
+  state.overviewGroup = { ...group, by: result.by };
+  state.overviewPage = 1;
+  state.overviewQuery = '';
+  state.overviewSelectionMode = false;
+  state.selectedOverviewTasks.clear();
+  state.tasks = [];
+  state.taskTotal = 0;
+  state.tasksSignature = '';
+  renderOverview();
+  $('[data-panel="overview"]')?.scrollIntoView({ block: 'start' });
+  loadTasks();
+}
+
+function closeOverviewGroup(type = state.overviewGroupBy) {
+  if (type !== state.overviewGroupBy) {
+    state.overviewGroupBy = type;
+    state.overviewGroupPage = 1;
+    state.overviewGroupQuery = '';
+    state.overviewGroups = null;
+    localStorage.setItem('javsp-web.overview-group-by', type);
+  }
+  state.overviewGroup = null;
+  state.overviewPage = 1;
+  state.overviewQuery = '';
+  state.overviewSelectionMode = false;
+  state.selectedOverviewTasks.clear();
+  state.tasksSignature = '';
+  renderOverview();
+  loadTasks();
+}
+
+function overviewCoverCard(task, taskCount = 1, taskIds = [task.id]) {
+  const images = task.progress?.images || {};
+  const coverReady = Number(task.cover_count) > 0;
+  const metadata = task.progress?.metadata || {};
+  const identifier = metadata.dvdid || task.file_name || task.name || '';
+  const actress = Array.isArray(metadata.actress) ? metadata.actress.join(' / ') : (metadata.actress || '');
+  const artwork = coverReady
+    ? `<img src="/api/tasks/${encodeURIComponent(task.id)}/cover/0?thumbnail=true&amp;v=${encodeURIComponent(task.updated_at || task.finished_at || '')}" loading="lazy" alt="${escapeHtml(taskDisplayName(task))}">`
+    : artworkPlaceholder('overview-cover-placeholder', images.cover_status === 'failed' ? '封面下载失败' : '封面未下载');
+  const selected = taskIds.every((id) => state.selectedOverviewTasks.has(id));
+  const selector = state.overviewSelectionMode && task.task_type !== 'media' ? `<button class="overview-cover-select${selected ? ' selected' : ''}" type="button" data-overview-select-ids="${escapeHtml(taskIds.join(','))}" aria-pressed="${selected}" title="${selected ? '取消选择' : '选择记录'}" aria-label="${selected ? '取消选择' : '选择记录'}">${overviewSelectionIcon(selected)}</button>` : '';
+  const feedback = taskIds.some((id) => state.overviewSelectionFeedback.has(id));
+  const year = String(metadata.publish_date || '').slice(0, 4);
+  const incomplete = ['failed','cancelled'].includes(task.status);
+  const failedBadge = incomplete ? `<span class="lc-chip lc-chip-danger" title="没有成功的刮削记录；已保留部分图片，可重新刮削">${task.status === 'failed' ? '刮削失败' : '刮削已停止'}</span>` : '';
+  const badges = `${/^\d{4}$/.test(year) ? `<span class="lc-chip">${escapeHtml(year)}</span>` : ''}${failedBadge}`;
+  return `<article class="lc-film${selected ? ' selected' : ''}${state.overviewSelectionMode ? ' selecting' : ''}${feedback ? ' selection-feedback' : ''}" data-overview-task="${escapeHtml(task.id)}" data-overview-task-ids="${task.task_type === 'media' ? '' : escapeHtml(taskIds.join(','))}">${selector}<div class="lc-film-art"><button class="lc-film-cover" type="button" data-task-detail="${escapeHtml(task.id)}" aria-label="${escapeHtml(`查看 ${identifier} 详情`)}">${artwork}<span class="lc-film-badges">${badges}</span></button>${state.overviewSelectionMode ? '' : playButton(task.id)}</div><button class="lc-film-caption" type="button" data-task-detail="${escapeHtml(task.id)}"><span class="lc-film-id">${escapeHtml(identifier)}</span><span class="lc-film-title" title="${escapeHtml(taskDisplayName(task))}">${escapeHtml(taskDisplayName(task))}</span><small>${escapeHtml(actress || metadata.publish_date || '资料未齐全')}</small></button></article>`;
+}
+
+function playButton(taskId) {
+  return `<button type="button" class="library-play" data-play-task="${escapeHtml(taskId)}" title="在媒体库播放" aria-label="在媒体库播放"><img src="/assets/play.svg" alt="" aria-hidden="true"></button>`;
+}
+
+async function playTask(button) {
+  const player = window.open('about:blank', '_blank');
+  if (player) player.opener = null;
+  button.disabled = true;
+  try {
+    const result = await api(`/api/tasks/${encodeURIComponent(button.dataset.playTask)}/playback`, { timeoutMs: 90000 });
+    const links = result.links.filter(link => /^https?:\/\//i.test(link.url));
+    if (!links.length) throw new Error('未找到外部播放地址');
+    if (links.length === 1 && player) { player.location.replace(links[0].url); return; }
+    player?.close();
+    let dialog = $('#playback-dialog');
+    if (!dialog) {
+      document.body.insertAdjacentHTML('beforeend', '<dialog id="playback-dialog" class="app-dialog"><div class="panel-heading"><h2>选择媒体库</h2><button type="button" class="icon-button" data-dialog-close aria-label="关闭">×</button></div><div class="playback-options"></div></dialog>');
+      dialog = $('#playback-dialog');
+    }
+    dialog.querySelector('.playback-options').innerHTML = links.map(link => `<a class="button primary" href="${escapeHtml(link.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link.name)}</a>`).join('');
+    dialog.showModal();
+  } catch (error) { player?.close(); showToast(error.message, 'error'); }
+  finally { button.disabled = false; }
+}
+
+function artworkPlaceholder(className, label) {
+  return `<span class="${className}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5z"/><path d="m6.5 17 3.2-3.2 2.4 2.4 2-2 3.4 3.4M8.5 8.5h.01"/></svg><b>${escapeHtml(label)}</b></span>`;
+}
+
+function formatBytes(value) {
+  const number = Number(value) || 0;
+  if (!number) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const unit = Math.min(Math.floor(Math.log(number) / Math.log(1024)), units.length - 1);
+  return `${(number / (1024 ** unit)).toFixed(unit ? 1 : 0)} ${units[unit]}`;
+}
+
+function formatDownloadDate(timestamp) {
+  const value = Number(timestamp) || 0;
+  return value > 0 ? new Date(value * 1000).toLocaleString() : '未完成';
+}
+
+function formatEta(seconds) {
+  const value = Number(seconds) || 0;
+  if (value <= 0 || value >= 8640000) return '∞';
+  const units = [[86400, '天'], [3600, '时'], [60, '分']];
+  const parts = [];
+  let remaining = value;
+  units.forEach(([unit, suffix]) => {
+    const amount = Math.floor(remaining / unit);
+    if (amount && parts.length < 2) parts.push(`${amount}${suffix}`);
+    remaining %= unit;
+  });
+  return parts.length ? parts.join(' ') : `${remaining}秒`;
+}
+
+function populateDownloadFilters(downloads) {
+  [['#download-filter-category', 'category', '全部分类'], ['#download-filter-tags', 'tags', '全部标签']].forEach(([selector, key, allLabel]) => {
+    const select = $(selector);
+    if (!select) return;
+    const selected = select.value;
+    const values = [...new Set(downloads.flatMap((item) => String(item[key] || '').split(',').map((value) => value.trim()).filter(Boolean)))].sort((left, right) => left.localeCompare(right));
+    select.innerHTML = `<option value="">${allLabel}</option>${values.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join('')}`;
+    select.value = values.includes(selected) ? selected : '';
+  });
+}
+
+function filteredDownloads(downloads) {
+  const name = ($('#download-filter-name')?.value || '').trim().toLocaleLowerCase();
+  const tags = $('#download-filter-tags')?.value || '';
+  const category = $('#download-filter-category')?.value || '';
+  const sortBy = state.downloadSort?.key || 'added_on';
+  const direction = state.downloadSort?.direction === 'asc' ? 1 : -1;
+  return downloads.filter((item) => {
+    if (name && !String(item.name || '').toLocaleLowerCase().includes(name)) return false;
+    if (tags && !String(item.tags || '').split(',').map((value) => value.trim()).includes(tags)) return false;
+    return !category || item.category === category;
+  }).sort((left, right) => {
+    const a = ['name', 'tags', 'state', 'category'].includes(sortBy) ? String(left[sortBy] || '').localeCompare(String(right[sortBy] || '')) : (Number(left[sortBy]) || 0) - (Number(right[sortBy]) || 0);
+    return a * direction;
+  });
+}
+
+function renderDownloadSummary(downloads) {
+  const target = $('#download-summary');
+  if (!target) return;
+  const downloadSpeed = downloads.reduce((total, item) => total + (Number(item.download_speed) || 0), 0);
+  const uploadSpeed = downloads.reduce((total, item) => total + (Number(item.upload_speed) || 0), 0);
+  target.innerHTML = `<span>任务 ${downloads.length}</span><span>下载 ${formatBytes(downloadSpeed)}/s</span><span>上传 ${formatBytes(uploadSpeed)}/s</span>`;
+}
+
+function renderDownloadRows(downloads, active) {
+  const target = $('#download-list');
+  const filtered = filteredDownloads(downloads);
+  const summary = $('#download-filter-summary');
+  if (summary) summary.textContent = `显示 ${filtered.length} / ${downloads.length} 个已接管任务`;
+  target.classList.remove('empty');
+  const columns = [['name', '名称'], ['size', '选定大小'], ['progress', '进度'], ['state', '状态'], ['seeds', '种子'], ['peers', '用户'], ['download_speed', '下载速度'], ['upload_speed', '上传速度'], ['eta', '剩余时间'], ['ratio', '比率'], ['popularity', '流行度'], ['category', '分类'], ['tags', '标签'], ['added_on', '添加于'], ['completed_on', '完成于']];
+  const sortMark = (key) => state.downloadSort?.key === key ? `<span class="download-sort-mark">${state.downloadSort.direction === 'asc' ? '↑' : '↓'}</span>` : '';
+  const head = columns.map(([key, label]) => `<th><button class="download-column-sort" type="button" data-download-sort="${key}">${label}${sortMark(key)}</button></th>`).join('');
+  const rows = filtered.map((item) => `<tr><td class="download-name-cell" title="${escapeHtml(item.name)}"><span class="download-state-dot ${escapeHtml(String(item.state || '').toLowerCase())}"></span>${escapeHtml(item.name)}</td><td>${formatBytes(item.size)}</td><td><div class="download-progress-cell"><b>${item.progress}%</b><i><em style="width:${Math.max(0, Math.min(100, item.progress))}%"></em></i></div></td><td>${escapeHtml(item.state || '未知')}</td><td>${Number(item.seeds) || 0}</td><td>${Number(item.peers) || 0}</td><td>${formatBytes(item.download_speed)}/s</td><td>${formatBytes(item.upload_speed)}/s</td><td>${escapeHtml(formatEta(item.eta))}</td><td>${Number(item.ratio || 0).toFixed(2)}</td><td>${Number(item.popularity || 0).toFixed(2)}</td><td>${escapeHtml(item.category || '')}</td><td>${escapeHtml(item.tags || '')}</td><td>${escapeHtml(formatDownloadDate(item.added_on))}</td><td>${escapeHtml(formatDownloadDate(item.completed_on))}</td><td><button class="download-row-remove" type="button" data-remove-download="${escapeHtml(item.hash)}" data-downloader-id="${escapeHtml(active.id)}" title="删除种子但保留文件">删除</button></td></tr>`).join('');
+  target.innerHTML = `<div class="download-table-wrap"><table class="download-table"><thead><tr>${head}<th aria-label="操作"></th></tr></thead><tbody>${rows || '<tr><td class="download-table-empty" colspan="16">没有符合当前筛选条件的已接管下载任务</td></tr>'}</tbody></table></div>`;
+}
+
+function ensureDownloadFilters() {
+  const filters = document.querySelectorAll('#download-filter-bar input, #download-filter-bar select');
+  filters.forEach((control) => {
+    if (control.dataset.bound) return;
+    control.dataset.bound = 'true';
+    control.addEventListener('input', () => renderDownloadRows(state.activeDownloads || [], state.activeDownloader || {}));
+    control.addEventListener('change', () => renderDownloadRows(state.activeDownloads || [], state.activeDownloader || {}));
+  });
+  $('#download-filter-reset')?.addEventListener('click', () => {
+    document.querySelectorAll('#download-filter-bar input').forEach((control) => { control.value = ''; });
+    $('#download-filter-category').value = '';
+    $('#download-filter-tags').value = '';
+    state.downloadSort = { key: 'added_on', direction: 'desc' };
+    renderDownloadRows(state.activeDownloads || [], state.activeDownloader || {});
+  }, { once: true });
+}
+
+async function loadDownloads() {
+  const target = $('#download-list');
+  if (!target) return;
+  const clearDownloadPresentation = () => {
+    state.activeDownloads = [];
+    state.activeDownloader = null;
+    if ($('#download-summary')) $('#download-summary').innerHTML = '';
+    if ($('#download-filter-summary')) $('#download-filter-summary').textContent = '';
+  };
+  try {
+    const result = await api('/api/downloads');
+    const downloaders = result.downloaders || [];
+    renderDownloaderTabs(downloaders);
+    if (!downloaders.length) {
+      clearDownloadPresentation();
+      target.classList.add('empty');
+      target.textContent = '尚未添加下载器';
+      return;
+    }
+    if (!state.activeDownloaderId || !downloaders.some((downloader) => downloader.id === state.activeDownloaderId)) state.activeDownloaderId = downloaders[0].id;
+    const active = downloaders.find((downloader) => downloader.id === state.activeDownloaderId) || downloaders[0];
+    renderDownloaderTabs(downloaders);
+    if (active.error) {
+      clearDownloadPresentation();
+      target.classList.add('empty');
+      target.textContent = `${active.name}：${active.error}`;
+      return;
+    }
+    if (active.refreshing && !active.updated_at) {
+      clearDownloadPresentation();
+      target.classList.add('empty');
+      target.textContent = `${active.name}：正在读取下载任务…`;
+      return;
+    }
+    if (!result.takeover_enabled) {
+      clearDownloadPresentation();
+      target.classList.add('empty');
+      target.textContent = '尚未启用下载任务接管';
+      return;
+    }
+    const downloads = (active.items || []).filter((item) => item.managed);
+    state.activeDownloads = downloads;
+    state.activeDownloader = active;
+    ensureDownloadFilters();
+    populateDownloadFilters(downloads);
+    renderDownloadSummary(downloads);
+    renderDownloadRows(downloads, active);
+  } catch (error) {
+    target.classList.add('empty');
+    target.textContent = error.message;
+  }
+}
+
+function renderDownloaderTabs(downloaders) {
+  const tabs = $('#downloader-tabs');
+  if (!tabs) return;
+  tabs.innerHTML = downloaders.map((downloader) => `<button class="downloader-tab ${downloader.id === state.activeDownloaderId ? 'active' : ''}" type="button" data-download-tab="${escapeHtml(downloader.id)}" role="tab">${escapeHtml(downloader.name)}</button>`).join('');
+}
+
+function downloaderPayload() {
+  return {
+    name: $('#downloader-name').value.trim(),
+    url: $('#downloader-url').value.trim(),
+    username: $('#downloader-username').value.trim(),
+    password: $('#downloader-password').value,
+  };
+}
+
+function ensureAutoScrapeControls() {
+  const form = $('#download-management-form');
+  if (!form || $('#auto-scrape-rule-list')) return;
+  form.querySelector('.form-actions')?.insertAdjacentHTML('beforebegin', '<section class="download-auto-scrape"><div class="download-auto-scrape-heading"><div><strong>下载完成后自动刮削</strong><p>按列表顺序匹配，命中首条启用规则后执行对应预设。</p></div><button class="button secondary" id="add-auto-scrape-rule" type="button">添加规则</button></div><div id="auto-scrape-rule-list" class="auto-scrape-rule-list"></div></section>');
+}
+
+function newAutoScrapeRule() {
+  return { id: `rule-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, enabled: true, tags: '', category: '', preset_id: 'default' };
+}
+
+function normalizeAutoScrapeRules(settings) {
+  if (Array.isArray(settings.auto_scrape_rules) && settings.auto_scrape_rules.length) {
+    return settings.auto_scrape_rules.map((rule) => ({
+      id: rule.id || newAutoScrapeRule().id,
+      enabled: rule.enabled !== false,
+      tags: rule.tags || '',
+      category: rule.category || '',
+      preset_id: rule.preset_id || 'default',
+    }));
+  }
+  if (settings.auto_scrape_enabled) {
+    return [{ id: 'legacy-default', enabled: true, tags: settings.auto_scrape_tags || '', category: settings.auto_scrape_category || '', preset_id: settings.auto_scrape_preset_id || 'default' }];
+  }
+  return [];
+}
+
+function autoScrapePresetOptions(selectedId) {
+  return state.presets.map((preset) => `<option value="${escapeHtml(preset.id)}"${preset.id === selectedId ? ' selected' : ''}>${escapeHtml(preset.name)}</option>`).join('');
+}
+
+function renderAutoScrapeRules(rules = []) {
+  const target = $('#auto-scrape-rule-list');
+  if (!target) return;
+  target.innerHTML = rules.length ? rules.map((rule, index) => `<article class="auto-scrape-rule" data-auto-scrape-rule="${escapeHtml(rule.id)}"><div class="auto-scrape-rule-title"><strong>规则 ${index + 1}</strong><label class="check-label"><input data-auto-rule-enabled type="checkbox"${rule.enabled ? ' checked' : ''}>启用</label></div><div class="download-auto-scrape-fields"><label>命中标签<input data-auto-rule-tags value="${escapeHtml(rule.tags || '')}" placeholder="多个标签用逗号分隔；留空匹配全部"></label><label>命中分类<input data-auto-rule-category value="${escapeHtml(rule.category || '')}" placeholder="留空匹配全部分类"></label><label>刮削预设<select data-auto-rule-preset>${autoScrapePresetOptions(rule.preset_id || 'default')}</select></label></div><button class="icon-button auto-scrape-rule-remove" type="button" data-remove-auto-scrape-rule="${escapeHtml(rule.id)}" title="删除此自动刮削规则">删除</button></article>`).join('') : '<p class="muted auto-scrape-empty">尚未添加自动刮削规则。下载完成后不会自动创建刮削任务。</p>';
+}
+
+function readAutoScrapeRules() {
+  return Array.from(document.querySelectorAll('[data-auto-scrape-rule]')).map((row) => ({
+    id: row.dataset.autoScrapeRule,
+    enabled: row.querySelector('[data-auto-rule-enabled]').checked,
+    tags: row.querySelector('[data-auto-rule-tags]').value.trim(),
+    category: row.querySelector('[data-auto-rule-category]').value.trim(),
+    preset_id: row.querySelector('[data-auto-rule-preset]').value || 'default',
+  }));
+}
+
+function downloadManagementPayload() {
+  ensureAutoScrapeControls();
+  const auto_scrape_rules = readAutoScrapeRules();
+  return {
+    takeover_enabled: $('#download-takeover-enabled').checked,
+    takeover_tags: $('#download-takeover-tags').value.trim(),
+    takeover_category: $('#download-takeover-category').value.trim(),
+    download_limit_kib: Number($('#download-download-limit').value),
+    upload_limit_kib: Number($('#download-upload-limit').value),
+    ratio_limit: Number($('#download-ratio-limit').value),
+    seeding_time_limit: Number($('#download-seeding-time-limit').value),
+    inactive_seeding_time_limit: Number($('#download-inactive-seeding-time-limit').value),
+    auto_remove: $('#download-auto-remove').checked,
+    auto_scrape_rules,
+  };
+}
+
+async function loadDownloadManagement() {
+  try {
+    ensureAutoScrapeControls();
+    const settings = await api('/api/downloads/settings');
+    $('#download-takeover-enabled').checked = Boolean(settings.takeover_enabled);
+    $('#download-takeover-tags').value = settings.takeover_tags || '';
+    $('#download-takeover-category').value = settings.takeover_category || '';
+    $('#download-download-limit').value = settings.download_limit_kib ?? -1;
+    $('#download-upload-limit').value = settings.upload_limit_kib ?? -1;
+    $('#download-ratio-limit').value = settings.ratio_limit ?? -2;
+    $('#download-seeding-time-limit').value = settings.seeding_time_limit ?? -2;
+    $('#download-inactive-seeding-time-limit').value = settings.inactive_seeding_time_limit ?? -2;
+    $('#download-auto-remove').checked = Boolean(settings.auto_remove);
+    state.autoScrapeRules = normalizeAutoScrapeRules(settings);
+    renderAutoScrapeRules(state.autoScrapeRules);
+  } catch (error) { $('#download-management-message').textContent = error.message; }
+}
+
+function editDownloader(downloader) {
+  const form = $('#downloader-form');
+  if (!form) return;
+  $('#downloader-dialog-title').textContent = downloader?.id ? '编辑下载器' : '添加下载器';
+  $('#downloader-id').value = downloader?.id || '';
+  $('#downloader-name').value = downloader?.name || '';
+  $('#downloader-url').value = downloader?.url || '';
+  $('#downloader-username').value = downloader?.username || '';
+  $('#downloader-password').value = '';
+  $('#downloader-password').placeholder = downloader?.password_set ? '留空则保留已保存的密码' : '请输入 qBittorrent 密码';
+  $('#delete-downloader').classList.toggle('hidden', !downloader?.id);
+  $('#downloader-message').textContent = '';
+  $('#downloader-dialog').showModal();
+}
+
+function renderDownloaderList() {
+  const target = $('#downloader-list');
+  if (!target) return;
+  target.innerHTML = state.downloaders.length ? state.downloaders.map((downloader) => `<button class="downloader-item" type="button" data-downloader-edit="${escapeHtml(downloader.id)}"><strong>${escapeHtml(downloader.name)}</strong><span>${escapeHtml(downloader.url)}</span></button>`).join('') : '<div class="task-list empty">还没有下载器</div>';
+}
+
+async function loadDownloaders(selectId = null) {
+  try {
+    state.downloaders = await api('/api/downloaders');
+    renderDownloaderList();
+  } catch (error) { console.error(error); }
+}
+
+function presetName(presetId) {
+  return state.presets.find((preset) => preset.id === presetId)?.name || presetId || '默认配置';
+}
+
+function renderAutoScrapeSchedules() {
+  const target = $('#auto-scrape-schedule-list');
+  if (!target) return;
+  const schedules = state.autoScrapeSchedules;
+  target.classList.toggle('empty', !schedules.length);
+  target.innerHTML = schedules.length ? schedules.map((schedule) => `<article class="auto-scrape-schedule-row"><div class="auto-scrape-schedule-main"><div class="auto-scrape-schedule-title"><strong>${escapeHtml(schedule.name)}</strong><span class="badge ${schedule.enabled ? 'running' : ''}">${schedule.enabled ? '已启用' : '已停用'}</span></div><dl><div><dt>Cron</dt><dd><code>${escapeHtml(schedule.cron)}</code></dd></div><div><dt>文件夹</dt><dd>${escapeHtml(schedule.input_directory)}</dd></div><div><dt>预设</dt><dd>${escapeHtml(presetName(schedule.preset_id))}</dd></div><div><dt>下次执行</dt><dd>${escapeHtml(schedule.next_run_at ? schedule.next_run_at.replace('T', ' ') : '无法计算')}</dd></div></dl><p class="muted">最近结果：${escapeHtml(schedule.last_result || '尚未执行')}</p></div><div class="auto-scrape-schedule-actions"><button class="icon-button" type="button" data-edit-auto-scrape-schedule="${escapeHtml(schedule.id)}">编辑</button><button class="icon-button schedule-delete" type="button" data-delete-auto-scrape-schedule="${escapeHtml(schedule.id)}">删除</button></div></article>`).join('') : '<div class="task-list empty">还没有定时自动刮削规则</div>';
+}
+
+async function loadAutoScrapeSchedules() {
+  const target = $('#auto-scrape-schedule-list');
+  if (!target) return;
+  try {
+    state.autoScrapeSchedules = await api('/api/auto-scrape-schedules');
+    renderAutoScrapeSchedules();
+    renderAutoScrapeRunButtons();
+    await loadDownloadAutoScrapeRuns();
+    if ($('#auto-scrape-run-dialog')?.open && state.activeAutoScrapeRun) await refreshAutoScrapeRun();
+    if ($('#auto-scrape-run-dialog')?.open && state.activeAutoScrapeHistory) renderAutoScrapeHistory(state.activeAutoScrapeHistory);
+  } catch (error) {
+    target.classList.add('empty');
+    target.textContent = error.message;
+  }
+}
+
+function renderDownloadAutoScrapeRuns() {
+  const target = $('#download-auto-scrape-run-list');
+  if (!target) return;
+  const runs = state.downloadAutoScrapeRuns || [];
+  target.classList.toggle('empty', !runs.length);
+  target.innerHTML = runs.length ? runs.map((run) => `<article class="auto-scrape-history-row"><div><strong>${escapeHtml(run.download_name || run.path || '下载任务')}</strong><p class="muted">${escapeHtml(run.downloader_name || '下载器')} · ${escapeHtml(formatLocalDateTime(run.created_at) || '')}</p><p class="muted">${escapeHtml(run.path || run.download_path || '')}</p>${autoScrapeRunCountsMarkup(run)}</div><div class="auto-scrape-history-actions"><button class="icon-button" type="button" data-view-download-auto-scrape-run="${escapeHtml(run.id || '')}">查看任务日志 (${Array.isArray(run.task_ids) ? run.task_ids.length : 0})</button></div></article>`).join('') : '<div class="task-list empty">下载完成后创建的刮削任务会显示在这里。</div>';
+}
+
+async function loadDownloadAutoScrapeRuns() {
+  const target = $('#download-auto-scrape-run-list');
+  if (!target) return;
+  try {
+    state.downloadAutoScrapeRuns = await api('/api/download-auto-scrape-runs');
+    renderDownloadAutoScrapeRuns();
+    if ($('#auto-scrape-run-dialog')?.open && state.activeDownloadAutoScrapeRun) await refreshDownloadAutoScrapeRun();
+  } catch (error) {
+    target.classList.add('empty');
+    target.textContent = error.message;
+  }
+}
+
+function renderAutoScrapeRunButtons() {
+  const rows = Array.from(document.querySelectorAll('.auto-scrape-schedule-row'));
+  state.autoScrapeSchedules.forEach((schedule, index) => {
+    if (!rows[index]) return;
+    const actionArea = rows[index].querySelector('.auto-scrape-schedule-actions');
+    if (!actionArea) return;
+    actionArea.insertAdjacentHTML('afterbegin', `<button class="button secondary schedule-run-now" type="button" data-run-auto-scrape-schedule="${escapeHtml(schedule.id)}">立即运行</button>`);
+    const runCount = Array.isArray(schedule.runs) ? schedule.runs.length : 0;
+    if (runCount) actionArea.insertAdjacentHTML('afterbegin', `<button class="icon-button" type="button" data-view-auto-scrape-history="${escapeHtml(schedule.id)}">运行记录 (${runCount})</button>`);
+  });
+}
+
+function scheduleRunTaskMarkup(task) {
+  const labels = { queued: '排队中', running: '运行中', succeeded: '已完成', failed: '失败', cancelled: '已取消' };
+  const logKey = `schedule-${task.id}`;
+  const expanded = state.taskOpen?.[logKey] ?? task.status === 'running';
+  const lines = (task.log_tail || []).join('\n');
+  const log = taskLogMarkup(task, logKey);
+  const stopButton = taskStopButton(task);
+  return `<article class="task-card task-card-collapsible schedule-run-task" data-task-card="${escapeHtml(logKey)}"><div class="task-card-head"><div class="task-card-title"><strong>${escapeHtml(taskDisplayName(task))}</strong><div class="task-meta"><span>预设：${escapeHtml(task.preset_name || task.preset_id || '默认配置')}</span><span>时间：${new Date(task.created_at).toLocaleString()}</span></div><div class="task-path">路径：${escapeHtml(task.input_directory)}</div><div class="task-image-summary">${escapeHtml(imageProgressSummary(task))}</div></div><div class="task-card-tools"><span class="badge ${task.status}">${labels[task.status] || task.status}</span>${stopButton}<button class="task-toggle" type="button" data-task-toggle="${escapeHtml(logKey)}" aria-expanded="${expanded}" title="${expanded ? '收起任务' : '展开任务'}">${expandControlIcon(expanded)}</button></div></div><div class="task-card-body${expanded ? '' : ' hidden'}" data-task-body="${escapeHtml(logKey)}">${progressMarkup(task)}${task.error ? `<div class="form-error">${escapeHtml(task.error)}</div>` : ''}${log}</div></article>`;
+}
+
+async function refreshAutoScrapeRun() {
+  const active = state.activeAutoScrapeRun;
+  const dialog = $('#auto-scrape-run-dialog');
+  if (!active || !dialog?.open) return;
+  const schedule = state.autoScrapeSchedules.find((item) => item.id === active.scheduleId);
+  const run = schedule?.runs?.find((item) => item.id === active.runId);
+  if (!schedule || !run) return;
+  const dialogScroll = dialog.scrollTop;
+  const pageScroll = window.scrollY;
+  rememberLogScroll();
+  rememberTaskCards();
+  $('#auto-scrape-run-title').textContent = `${schedule.name} - 任务日志`;
+  $('#auto-scrape-run-subtitle').textContent = `${run.started_at ? run.started_at.replace('T', ' ') : ''} · ${run.result || '正在读取任务'}`;
+  const results = await Promise.all(run.task_ids.map(String).map((taskId) => api(`/api/tasks/${encodeURIComponent(taskId)}`).catch(() => null)));
+  if (!dialog.open || state.activeAutoScrapeRun?.runId !== active.runId) return;
+  const taskById = new Map(results.filter(Boolean).map((task) => [String(task.id), task]));
+  const tasks = run.task_ids.map(String).map((taskId) => taskById.get(taskId)).filter(Boolean).sort((left, right) => {
+    const byCreatedAt = Date.parse(left.created_at || '') - Date.parse(right.created_at || '');
+    return Number.isFinite(byCreatedAt) && byCreatedAt !== 0 ? byCreatedAt : String(left.id).localeCompare(String(right.id));
+  });
+  syncTaskExpansion(tasks);
+  $('#auto-scrape-run-content').innerHTML = tasks.length ? tasks.map(scheduleRunTaskMarkup).join('') : '<p class="muted">相关任务已被删除，无法查看日志。</p>';
+  restoreLogScroll();
+  window.requestAnimationFrame(() => {
+    dialog.scrollTop = dialogScroll;
+    window.scrollTo({ top: pageScroll });
+  });
+}
+
+async function openAutoScrapeRun(scheduleId, runId) {
+  state.activeDownloadAutoScrapeRun = null;
+  state.activeAutoScrapeHistory = null;
+  state.activeAutoScrapeRun = { scheduleId, runId };
+  $('#auto-scrape-run-content').innerHTML = '';
+  $('#auto-scrape-run-dialog').showModal();
+  await refreshAutoScrapeRun();
+}
+
+async function refreshDownloadAutoScrapeRun() {
+  const runId = state.activeDownloadAutoScrapeRun;
+  const dialog = $('#auto-scrape-run-dialog');
+  const run = state.downloadAutoScrapeRuns.find((item) => item.id === runId);
+  if (!run || !dialog?.open) return;
+  const taskIds = Array.isArray(run.task_ids) ? run.task_ids.map(String) : [];
+  const fetched = await Promise.all(taskIds.map((taskId) => api(`/api/tasks/${encodeURIComponent(taskId)}`).catch(() => null)));
+  if (!dialog.open || state.activeDownloadAutoScrapeRun !== runId) return;
+  const tasks = taskIds.map((taskId) => fetched.find((task) => String(task?.id) === taskId)).filter(Boolean);
+  syncTaskExpansion(tasks);
+  $('#auto-scrape-run-title').textContent = `${run.download_name || '下载任务'} - 任务日志`;
+  $('#auto-scrape-run-subtitle').textContent = `${run.downloader_name || '下载器'} · ${formatLocalDateTime(run.created_at) || ''}`;
+  $('#auto-scrape-run-content').innerHTML = tasks.length ? tasks.map(scheduleRunTaskMarkup).join('') : '<p class="muted">关联任务已删除，无法查看日志。</p>';
+}
+
+async function openDownloadAutoScrapeRun(runId) {
+  state.activeAutoScrapeRun = null;
+  state.activeAutoScrapeHistory = null;
+  state.activeDownloadAutoScrapeRun = runId;
+  $('#auto-scrape-run-content').innerHTML = '';
+  $('#auto-scrape-run-dialog').showModal();
+  await refreshDownloadAutoScrapeRun();
+}
+
+function autoScrapeRunCounts(run) {
+  if (run.counts) return run.counts;
+  const taskIds = Array.isArray(run.task_ids) ? run.task_ids.map(String) : [];
+  const taskById = new Map(state.tasks.map((task) => [String(task.id), task]));
+  const counts = { total: taskIds.length, succeeded: 0, failed: 0, running: 0, queued: 0 };
+  taskIds.forEach((taskId) => {
+    const status = taskById.get(taskId)?.status;
+    if (status === 'succeeded') counts.succeeded += 1;
+    else if (status === 'failed' || status === 'cancelled') counts.failed += 1;
+    else if (status === 'running') counts.running += 1;
+    else if (status === 'queued') counts.queued += 1;
+  });
+  return counts;
+}
+
+function autoScrapeRunCountsMarkup(run) {
+  const counts = autoScrapeRunCounts(run);
+  if (!counts.total) return '<span class="muted">没有创建任务</span>';
+  return `<div class="auto-scrape-run-counts" aria-label="任务统计"><span class="run-total">已创建 ${counts.total} 个任务</span><span class="run-success">已完成 ${counts.succeeded}</span><span class="run-failed">失败 ${counts.failed}</span><span class="run-running">运行中 ${counts.running}</span><span class="run-queued">排队中 ${counts.queued}</span></div>`;
+}
+
+function renderAutoScrapeHistory(scheduleId) {
+  const schedule = state.autoScrapeSchedules.find((item) => item.id === scheduleId);
+  if (!schedule) return;
+  const runs = Array.isArray(schedule.runs) ? schedule.runs.slice().sort((left, right) => Date.parse(right.started_at || '') - Date.parse(left.started_at || '')) : [];
+  $('#auto-scrape-run-title').textContent = `${schedule.name} - 全部运行记录`;
+  $('#auto-scrape-run-subtitle').textContent = `已保存 ${runs.length} 次定时或立即运行记录`;
+  $('#auto-scrape-run-content').innerHTML = runs.length ? `<div class="auto-scrape-history-list">${runs.map((run) => `<article class="auto-scrape-history-row"><div><strong>${escapeHtml(formatLocalDateTime(run.started_at) || run.id)}</strong><p class="muted">${escapeHtml(run.result || '正在创建任务')}</p>${autoScrapeRunCountsMarkup(run)}</div><div class="auto-scrape-history-actions">${run.task_ids?.length ? `<button class="icon-button" type="button" data-view-auto-scrape-run="${escapeHtml(schedule.id)}" data-auto-scrape-run-id="${escapeHtml(run.id)}">查看任务日志 (${run.task_ids.length})</button>` : '<span class="muted">没有可查看的任务</span>'}<button class="icon-button schedule-delete" type="button" data-delete-auto-scrape-run="${escapeHtml(schedule.id)}" data-auto-scrape-run-id="${escapeHtml(run.id)}">删除日志</button></div></article>`).join('')}</div>` : '<p class="muted">尚未运行此规则。</p>';
+}
+
+function openAutoScrapeHistory(scheduleId) {
+  state.activeDownloadAutoScrapeRun = null;
+  const schedule = state.autoScrapeSchedules.find((item) => item.id === scheduleId);
+  if (!schedule) return;
+  state.activeAutoScrapeRun = null;
+  state.activeAutoScrapeHistory = scheduleId;
+  renderAutoScrapeHistory(scheduleId);
+  $('#auto-scrape-run-dialog').showModal();
+}
+
+$('#auto-scrape-run-dialog')?.addEventListener('close', () => { state.activeAutoScrapeRun = null; state.activeAutoScrapeHistory = null; state.activeDownloadAutoScrapeRun = null; });
+
+function renderAutoScrapeSchedulePresets(selectedId = 'default') {
+  const select = $('#auto-scrape-schedule-preset');
+  if (!select) return;
+  select.innerHTML = state.presets.map((preset) => `<option value="${escapeHtml(preset.id)}"${preset.id === selectedId ? ' selected' : ''}>${escapeHtml(preset.name)}</option>`).join('');
+}
+
+function editAutoScrapeSchedule(schedule = null) {
+  $('#auto-scrape-schedule-dialog-title').textContent = schedule ? '编辑定时规则' : '添加定时规则';
+  $('#auto-scrape-schedule-id').value = schedule?.id || '';
+  $('#auto-scrape-schedule-name').value = schedule?.name || '';
+  $('#auto-scrape-schedule-cron').value = schedule?.cron || '0 2 * * *';
+  $('#auto-scrape-schedule-directory').value = schedule?.input_directory || '';
+  $('#auto-scrape-schedule-enabled').checked = schedule?.enabled !== false;
+  $('#auto-scrape-schedule-message').textContent = '';
+  renderAutoScrapeSchedulePresets(schedule?.preset_id || 'default');
+  $('#delete-auto-scrape-schedule').classList.toggle('hidden', !schedule);
+  $('.native-schedule-path-button').classList.toggle('hidden',
+    Boolean(state.runtime?.docker) || state.runtime?.local_client === false);
+  $('#docker-schedule-path-browser')?.classList.toggle('hidden', !state.runtime?.docker);
+  $('#auto-scrape-schedule-dialog').showModal();
+}
+
+function autoScrapeSchedulePayload() {
+  return {
+    name: $('#auto-scrape-schedule-name').value.trim(),
+    enabled: $('#auto-scrape-schedule-enabled').checked,
+    cron: $('#auto-scrape-schedule-cron').value.trim(),
+    input_directory: $('#auto-scrape-schedule-directory').value.trim(),
+    preset_id: $('#auto-scrape-schedule-preset').value || 'default',
+  };
+}
+
+function showView(view) {
+  document.documentElement.removeAttribute('data-initial-view');
+  document.querySelectorAll('.nav-item').forEach((button) => button.classList.toggle('active', button.dataset.view === view));
+  document.querySelectorAll('.view').forEach((panel) => panel.classList.toggle('active', panel.dataset.panel === view));
+  const title = { overview: '概览', library: '媒体库', scrape: '手动刮削', 'ai-scrape': 'AI 刮削', 'auto-scrape': '自动刮削', downloads: '下载管理', 'crawler-config': '刮削器管理', presets: '刮削预设', settings: '系统设置' }[view] || '概览';
+  $('#section-title').textContent = title;
+  $('#section-eyebrow').textContent = view === 'settings' || view === 'presets' || view === 'crawler-config' ? '配置' : '工作区';
+  if (view === 'overview' || view === 'scrape') { state.tasks = []; state.tasksSignature = ''; if (view === 'scrape') ensureTaskFilters(); loadTasks(); }
+  if (view === 'library') window.JavspLibrary?.load();
+  if (view === 'scrape') { loadPresets(); loadCrawlerNames(); loadPathTools(); }
+  if (view === 'auto-scrape') { loadPresets(); loadCrawlerNames(); loadAutoScrapeSchedules(); }
+  if (view === 'downloads') { loadDownloadManagement(); loadDownloads(); }
+  if (view === 'crawler-config') loadCrawlerConfig();
+  if (view === 'ai-scrape') window.JavspAI?.load();
+  if (view === 'settings') window.JavspAI?.loadSettings();
+  if (view === 'presets') { loadPresets(); loadCrawlerNames(); }
+  if (view === 'settings') { ensureMediaSettingsUi(); ensurePathMappingsUi(); loadUsers(); loadDownloaders(); loadMediaServers(); loadPathMappings(); loadCookieCloud(); loadUpdateSettings(); loadNetworkSettings(); }
+  localStorage.setItem('javsp-web.active-view', view);
+}
+
+function ensurePathMappingsUi() {
+  const settingsPanel = document.querySelector('[data-panel="settings"]');
+  if (!settingsPanel || $('#path-mapping-panel')) return;
+  const anchor = $('#media-server-panel');
+  const markup = '<div id="path-mapping-panel" class="panel narrow"><div class="panel-heading"><div><h2>路径映射</h2><p class="muted">仅用于下载器（qBittorrent 等）与整理后刷新媒体服务器：两套程序看到同一份文件的不同路径时在这里建立对应关系。媒体库播放按“绝对路径 → 文件名 → 番号唯一命中”匹配，<b>不需要</b>在这里配置。</p></div><button class="button secondary" id="add-path-mapping" type="button">添加映射</button></div><form id="path-mappings-form" class="stack"><div id="path-mapping-list" class="path-mapping-list"></div><div class="form-actions"><button class="button primary" type="submit">保存路径映射</button><span id="path-mapping-message" class="muted"></span></div></form></div>';
+  if (anchor) anchor.insertAdjacentHTML('afterend', markup); else settingsPanel.insertAdjacentHTML('afterbegin', markup);
+}
+
+function renderPathMappings() {
+  const target = $('#path-mapping-list');
+  if (!target) return;
+  target.innerHTML = state.pathMappings.length ? state.pathMappings.map((mapping) => `<div class="path-mapping-row" data-path-mapping="${escapeHtml(mapping.id || '')}"><label>qB 保存路径<input data-path-source value="${escapeHtml(mapping.source_path || '')}" placeholder="例如：/downloads"></label><label>MovSP 路径<input data-path-target value="${escapeHtml(mapping.target_path || '')}" placeholder="例如：/video"></label><button class="icon-button" type="button" data-remove-path-mapping title="移除映射">删除</button></div>`).join('') : '<p class="muted">尚未添加。两边路径相同时不需要设置。</p>';
+}
+
+async function loadPathMappings() {
+  ensurePathMappingsUi();
+  try { state.pathMappings = (await api('/api/path-mappings')).mappings || []; renderPathMappings(); } catch (error) { $('#path-mapping-message').textContent = error.message; }
+}
+
+function ensureMediaSettingsUi() {
+  const settingsPanel = document.querySelector('[data-panel="settings"]');
+  if (!settingsPanel) return;
+  if (!$('#media-server-panel')) {
+    settingsPanel.insertAdjacentHTML('afterbegin', '<div id="media-server-panel" class="panel narrow"><div class="panel-heading"><div><h2>媒体服务器</h2><p class="muted">连接 Emby 或 Jellyfin，按需开启整理后刷新媒体库。</p></div><button class="button primary" id="add-media-server" type="button">添加媒体服务器</button></div><div id="media-server-list" class="media-server-list"></div></div>');
+  }
+  if (!$('#media-server-dialog')) {
+    document.body.insertAdjacentHTML('beforeend', '<dialog id="media-server-dialog" class="app-dialog"><form method="dialog" id="media-server-form" class="dialog-form"><div class="dialog-heading"><h2 id="media-server-dialog-title">添加媒体服务器</h2><button class="dialog-close" type="button" data-dialog-close>关闭</button></div><input id="media-server-id" type="hidden"><div class="dialog-content"><label>名称<input id="media-server-name" maxlength="80" required></label><label>类型<select id="media-server-type"><option value="emby">Emby</option><option value="jellyfin">Jellyfin</option></select></label><label>服务地址<input id="media-server-url" type="url" placeholder="http://127.0.0.1:8096" required></label><label>外部播放地址<input id="media-server-external-url" type="url" placeholder="https://media.example.com"></label><label>API 密钥<input id="media-server-api-key" type="password" autocomplete="new-password" placeholder="留空则保留已保存密钥"></label><label class="check-label"><input id="media-server-auto-scan" type="checkbox">刮削任务完成后自动扫描媒体库</label></div><span id="media-server-message" class="form-error dialog-message"></span><div class="dialog-actions"><button class="button secondary" id="sync-media-server" type="button">同步媒体库</button><button class="button danger" id="delete-media-server" type="button">删除</button><button class="button secondary" type="button" data-dialog-close>取消</button><button class="button primary" value="default">保存</button></div></form></dialog>');
+  }
+  const mediaContent = $('#media-server-dialog')?.querySelector('.dialog-content');
+  if (mediaContent && !$('#probe-media-server')) mediaContent.insertAdjacentHTML('beforeend', '<button class="button secondary" id="probe-media-server" type="button">验证并读取媒体库</button><fieldset class="media-library-fieldset"><legend>管理的媒体库</legend><div id="media-server-libraries" class="media-library-options"><span class="muted">验证连接后选择要管理的媒体库</span></div></fieldset><label>自动扫描延迟（秒）<input id="media-server-auto-scan-delay" type="number" min="0" max="86400" step="1" value="0"></label>');
+}
+
+function renderMediaServers() {
+  const target = $('#media-server-list');
+  if (!target) return;
+  target.innerHTML = state.mediaServers.length ? state.mediaServers.map((server) => `<article class="media-server-row"><div><strong>${escapeHtml(server.name)}</strong><span>${server.type === 'jellyfin' ? 'Jellyfin' : 'Emby'} · ${escapeHtml(server.url)}</span><span>${server.api_key_set ? 'API 密钥已配置' : '未配置 API 密钥'}${server.auto_scan ? ' · 完成后自动扫描' : ''}</span></div><div class="media-server-actions"><button class="icon-button" type="button" data-edit-media-server="${escapeHtml(server.id)}">编辑</button><button class="icon-button" type="button" data-sync-media-server="${escapeHtml(server.id)}">同步媒体库</button></div></article>`).join('') : '<div class="task-list empty">还没有媒体服务器</div>';
+}
+
+async function loadMediaServers() {
+  ensureMediaSettingsUi();
+  try { state.mediaServers = await api('/api/media-servers'); renderMediaServers(); } catch (error) { const target = $('#media-server-list'); if (target) target.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`; }
+}
+
+function editMediaServer(server) {
+  ensureMediaSettingsUi();
+  server = server || {};
+  $('#media-server-dialog-title').textContent = server.id ? '编辑媒体服务器' : '添加媒体服务器';
+  $('#media-server-id').value = server.id || '';
+  $('#media-server-name').value = server.name || 'Emby';
+  $('#media-server-type').value = server.type || 'emby';
+  $('#media-server-url').value = server.url || '';
+  $('#media-server-external-url').value = server.external_url || '';
+  $('#media-server-api-key').value = '';
+  $('#media-server-auto-scan').checked = Boolean(server.auto_scan);
+  $('#media-server-auto-scan-delay').value = server.auto_scan_delay || 0;
+  renderMediaLibraryOptions(server.available_libraries || [], server.libraries || []);
+  $('#media-server-message').textContent = '';
+  $('#delete-media-server').hidden = !server.id;
+  $('#sync-media-server').hidden = !server.id;
+  $('#media-server-dialog').showModal();
+  if (server.id) probeMediaLibraries(false);
+}
+
+document.addEventListener('change', (event) => {
+  if (event.target.id !== 'media-server-type' || $('#media-server-id')?.value) return;
+  $('#media-server-name').value = event.target.value === 'jellyfin' ? 'Jellyfin' : 'Emby';
+});
+
+function mediaServerPayload() {
+  return { server_id: $('#media-server-id').value || null, name: $('#media-server-name').value.trim(), type: $('#media-server-type').value, url: $('#media-server-url').value.trim(), external_url: $('#media-server-external-url').value.trim(), api_key: $('#media-server-api-key').value, auto_scan: $('#media-server-auto-scan').checked, auto_scan_delay: Number($('#media-server-auto-scan-delay').value) || 0, libraries: selectedMediaLibraryIds() };
+}
+
+function selectedMediaLibraryIds() {
+  const inputs = Array.from(document.querySelectorAll('#media-server-libraries [data-media-library]'));
+  if (inputs.length) return inputs.filter((input) => input.checked).map((input) => input.value);
+  try { return JSON.parse($('#media-server-libraries')?.dataset.selectedLibraries || '[]'); } catch (_) { return []; }
+}
+
+function renderMediaLibraryOptions(libraries, selected = []) {
+  const target = $('#media-server-libraries');
+  if (!target) return;
+  const selectedIds = new Set(selected);
+  target.dataset.selectedLibraries = JSON.stringify([...selectedIds]);
+  target.innerHTML = libraries.length
+    ? libraries.map((library) => `<label class="media-library-option"><input type="checkbox" data-media-library value="${escapeHtml(library.id)}"${selectedIds.has(library.id) ? ' checked' : ''}><span>${escapeHtml(library.name)}</span></label>`).join('')
+    : '<span class="muted">验证连接后选择要管理的媒体库</span>';
+}
+
+async function probeMediaLibraries(showMessage = true) {
+  const button = $('#probe-media-server');
+  const message = $('#media-server-message');
+  const original = button?.textContent || '验证并读取媒体库';
+  const payload = mediaServerPayload();
+  if (!payload.name || !payload.url) {
+    if (showMessage && message) message.textContent = !payload.name ? '请填写媒体服务器名称' : '请填写服务地址';
+    return;
+  }
+  if (button) { button.disabled = true; button.textContent = '正在验证…'; }
+  if (showMessage && message) message.textContent = '正在连接媒体服务器并读取媒体库…';
+  try {
+    const result = await api('/api/media-servers/libraries', { method: 'POST', body: JSON.stringify(payload) });
+    renderMediaLibraryOptions(result.libraries || [], selectedMediaLibraryIds());
+    if (showMessage && message) message.textContent = `连接成功，读取到 ${(result.libraries || []).length} 个媒体库`;
+  } catch (error) {
+    if (showMessage && message) message.textContent = error.message;
+  } finally {
+    if (button) { button.disabled = false; button.textContent = original; }
+  }
+}
+
+document.addEventListener('click', async (event) => {
+  const testPresetProxy = event.target.closest('#test-preset-proxy');
+  if (testPresetProxy) {
+    const message = $('#preset-proxy-test-message');
+    const result = $('#preset-proxy-test-result');
+    const values = readConfigFields();
+    const original = testPresetProxy.textContent;
+    testPresetProxy.disabled = true;
+    testPresetProxy.textContent = '正在测试';
+    if (message) { message.textContent = ''; message.classList.remove('form-error'); }
+    if (result) result.classList.add('hidden');
+    try {
+      const response = await api('/api/presets/network/proxy-test', {
+        method: 'POST',
+        body: JSON.stringify({
+          proxy_server: values.network?.proxy_server || '',
+          crawler_selection: values.crawler?.selection || state.formValues?.crawler?.selection || {},
+          preset_id: state.editingPreset || 'default',
+          timeout: values.network?.timeout || '',
+        }),
+      });
+      if (message) message.textContent = response.reachable ? '连通性测试完成' : '测试完成，但未能查询出口地区';
+      if (result) { result.innerHTML = proxyConnectivityResultMarkup(response); result.classList.remove('hidden'); }
+    } catch (error) {
+      if (message) { message.textContent = error.message; message.classList.add('form-error'); }
+    } finally {
+      testPresetProxy.disabled = false;
+      testPresetProxy.textContent = original;
+    }
+    return;
+  }
+  // ---- 刮削器（搭积木）管理 ----
+  const scraperFilter = event.target.closest('[data-scraper-filter]');
+  if (scraperFilter) {
+    state.scraperFilter = scraperFilter.dataset.scraperFilter;
+    refreshScraperGrid();
+    return;
+  }
+  if (event.target.closest('#scraper-refresh')) { await loadCrawlerConfig(); return; }
+  if (event.target.closest('#scraper-add')) { openScraperAdd(); return; }
+  if (event.target.closest('#scraper-check-all')) {
+    const button = event.target.closest('#scraper-check-all');
+    const original = button.textContent;
+    button.disabled = true; button.textContent = '正在体检…';
+    const panel = $('#scraper-status-panel');
+    if (panel) { panel.classList.remove('hidden'); panel.innerHTML = '<p class="muted">正在逐块检查配置与模块…</p>'; }
+    try {
+      const response = await api('/api/scrapers/check-all', { method: 'POST', body: JSON.stringify({}) });
+      state.scrapers = response.scrapers || state.scrapers;
+      const statuses = response.status || {};
+      const states = Object.values(statuses);
+      const bad = states.filter((item) => scraperStatusTone(item.state) !== 'ok');
+      const rows = Object.entries(statuses).map(([name, item]) => `<div class="scraper-status-row"><strong>${escapeHtml(scraperDisplayName(name))}</strong>${scraperStatusDot(item)}<span>${escapeHtml(item.message || '')}</span></div>`).join('');
+      if (panel) panel.innerHTML = `<div class="scraper-status-head"><h3>统一体检结果</h3><span class="muted">共 ${states.length} 块${bad.length ? `，${bad.length} 块需要处理` : '，全部就绪'}</span><button class="icon-button" type="button" data-scraper-status-close aria-label="关闭">×</button></div><div class="scraper-status-rows">${rows || '<p class="muted">没有可体检的刮削器。</p>'}</div>`;
+      refreshScraperGrid();
+    } catch (error) {
+      if (panel) panel.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`;
+    } finally { button.disabled = false; button.textContent = original; }
+    return;
+  }
+  if (event.target.closest('[data-scraper-status-close]')) { $('#scraper-status-panel')?.classList.add('hidden'); return; }
+  const scraperEdit = event.target.closest('[data-scraper-edit]');
+  if (scraperEdit) { openScraperMeta(scraperEdit.dataset.scraperEdit); return; }
+  const scraperSource = event.target.closest('[data-scraper-source]');
+  if (scraperSource) { await openScraperSource(scraperSource.dataset.scraperSource); return; }
+  const scraperTest = event.target.closest('[data-scraper-test]');
+  if (scraperTest) { openScraperTest(scraperTest.dataset.scraperTest); return; }
+  if (event.target.closest('[data-scraper-test-close]')) { $('#scraper-test-panel')?.classList.add('hidden'); return; }
+  const scraperRun = event.target.closest('[data-scraper-run]');
+  if (scraperRun) {
+    const name = scraperRun.dataset.scraperRun;
+    const checkOnly = scraperRun.dataset.mode === 'check';
+    const input = $('#scraper-test-input');
+    const message = $('#scraper-test-message');
+    const result = $('#scraper-test-result');
+    const data = $('#scraper-test-data');
+    const output = $('#scraper-test-output');
+    const outputWrap = $('#scraper-test-output-wrap');
+    const inputValue = input?.value.trim() || '';
+    const original = scraperRun.textContent;
+    scraperRun.disabled = true; scraperRun.textContent = '运行中…';
+    if (message) { message.textContent = ''; message.classList.remove('form-error'); }
+    if (result) result.classList.add('hidden');
+    try {
+      // 留空时后端会使用这块积木自己声明的检测样本
+      const response = await api(`/api/scrapers/${encodeURIComponent(name)}/test`, { method: 'POST', body: JSON.stringify({ input_value: inputValue, check_only: checkOnly }) });
+      const status = response.status || {};
+      if (message) {
+        message.textContent = `${scraperStatusLabel(status)}：${status.message || '完成'}`;
+        message.classList.toggle('form-error', scraperStatusTone(status.state) === 'bad');
+      }
+      const payload = response.result || {};
+      if (data) data.textContent = checkOnly ? JSON.stringify(payload, null, 2) : JSON.stringify(payload.data || {}, null, 2);
+      if (output) output.textContent = payload.output || (checkOnly ? '' : '无额外输出');
+      if (outputWrap) outputWrap.classList.toggle('hidden', !payload.output);
+      if (result) result.classList.remove('hidden');
+      // 更新卡片上的状态徽标
+      const item = scraperByName(name);
+      if (item) { item.status = status; refreshScraperGrid(); }
+    } catch (error) {
+      if (message) { message.textContent = error.message; message.classList.add('form-error'); }
+    } finally { scraperRun.disabled = false; scraperRun.textContent = original; }
+    return;
+  }
+  if (event.target.closest('#scraper-meta-save')) {
+    const name = event.target.closest('#scraper-meta-save').dataset.scraperMetaName;
+    const message = $('#scraper-meta-message');
+    try {
+      const meta = {
+        display_name: $('#scraper-meta-name').value.trim(),
+        description: $('#scraper-meta-desc').value.trim(),
+        homepage: $('#scraper-meta-home').value.trim(),
+      };
+      await api(`/api/scrapers/${encodeURIComponent(name)}/meta`, { method: 'PUT', body: JSON.stringify(meta) });
+      await api(`/api/scrapers/${encodeURIComponent(name)}/settings`, { method: 'PUT', body: JSON.stringify({ settings: collectScraperSettings('#scraper-meta-content') }) });
+      await loadCrawlerConfig();
+      $('#scraper-meta-dialog').close();
+    } catch (error) { if (message) message.textContent = error.message; }
+    return;
+  }
+  if (event.target.closest('#scraper-source-save')) {
+    const name = event.target.closest('#scraper-source-save').dataset.scraperSourceName;
+    const message = $('#scraper-source-message');
+    try {
+      if (state.scraperSourceEditable) {
+        const code = $('#scraper-source-code')?.value || '';
+        await api(`/api/scrapers/${encodeURIComponent(name)}/source`, { method: 'PUT', body: JSON.stringify({ source: code }) });
+      }
+      await api(`/api/scrapers/${encodeURIComponent(name)}/settings`, { method: 'PUT', body: JSON.stringify({ settings: collectScraperSettings('#scraper-source-content') }) });
+      await loadCrawlerConfig();
+      $('#scraper-source-dialog').close();
+    } catch (error) { if (message) message.textContent = error.message; }
+    return;
+  }
+  if (event.target.closest('#scraper-source-restore')) {
+    const name = event.target.closest('#scraper-source-restore').dataset.scraperRestoreName;
+    try {
+      const response = await api(`/api/scrapers/${encodeURIComponent(name)}/restore`, { method: 'POST' });
+      const code = $('#scraper-source-code');
+      if (code) code.value = response.source || '';
+      const message = $('#scraper-source-message');
+      if (message) message.textContent = '已恢复随程序发布的原始代码，保存后生效';
+    } catch (error) { $('#scraper-source-message').textContent = error.message; }
+    return;
+  }
+  if (event.target.closest('#scraper-add-confirm')) {
+    const nameInput = $('#scraper-add-name');
+    const name = nameInput.value.trim();
+    const display = $('#scraper-add-display').value.trim();
+    const message = $('#scraper-add-message');
+    if (!/^[a-z][a-z0-9_]*$/.test(name)) { message.textContent = '名称格式不正确'; nameInput.focus(); return; }
+    try {
+      await api('/api/scrapers/custom', { method: 'POST', body: JSON.stringify({ name, display_name: display }) });
+      $('#scraper-add-dialog').close();
+      await loadCrawlerConfig();
+      await openScraperSource(name);
+    } catch (error) { message.textContent = error.message; }
+    return;
+  }
+  const scraperDelete = event.target.closest('[data-scraper-delete]');
+  if (scraperDelete) {
+    const name = scraperDelete.dataset.scraperDelete;
+    confirmAction({ title: '删除自定义积木', text: `确定删除“${scraperDisplayName(name)}”吗？其源码文件会被移除，已在预设中引用它的任务将无法加载。`, confirmLabel: '删除积木', danger: true, run: async () => { await api(`/api/scrapers/custom/${encodeURIComponent(name)}`, { method: 'DELETE' }); await loadCrawlerConfig(); } });
+    return;
+  }
+  const closeButton = event.target.closest('[data-dialog-close]');
+  if (closeButton) {
+    closeButton.closest('dialog')?.close();
+    return;
+  }
+  const viewAutoScrapeHistoryButton = event.target.closest('[data-view-auto-scrape-history]');
+  if (viewAutoScrapeHistoryButton) openAutoScrapeHistory(viewAutoScrapeHistoryButton.dataset.viewAutoScrapeHistory);
+  const runAutoScrapeScheduleButton = event.target.closest('[data-run-auto-scrape-schedule]');
+  if (runAutoScrapeScheduleButton) {
+    const scheduleId = runAutoScrapeScheduleButton.dataset.runAutoScrapeSchedule;
+    const original = runAutoScrapeScheduleButton.textContent;
+    runAutoScrapeScheduleButton.disabled = true;
+    runAutoScrapeScheduleButton.textContent = '正在创建任务';
+    api(`/api/auto-scrape-schedules/${encodeURIComponent(scheduleId)}/run`, { method: 'POST' }).then(async (result) => {
+      await Promise.all([loadAutoScrapeSchedules(), loadTasks()]);
+      return result;
+    }).catch((error) => {
+      runAutoScrapeScheduleButton.disabled = false;
+      runAutoScrapeScheduleButton.textContent = error.message;
+      window.setTimeout(() => { runAutoScrapeScheduleButton.textContent = original; }, 2200);
+    });
+  }
+  const viewAutoScrapeRunButton = event.target.closest('[data-view-auto-scrape-run]');
+  if (viewAutoScrapeRunButton) {
+    openAutoScrapeRun(viewAutoScrapeRunButton.dataset.viewAutoScrapeRun, viewAutoScrapeRunButton.dataset.autoScrapeRunId).catch((error) => {
+      const target = $('#auto-scrape-run-content');
+      if (target) target.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`;
+    });
+  }
+  const viewDownloadAutoScrapeRunButton = event.target.closest('[data-view-download-auto-scrape-run]');
+  if (viewDownloadAutoScrapeRunButton) {
+    openDownloadAutoScrapeRun(viewDownloadAutoScrapeRunButton.dataset.viewDownloadAutoScrapeRun).catch((error) => {
+      const target = $('#auto-scrape-run-content');
+      if (target) target.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`;
+    });
+    return;
+  }
+  const deleteAutoScrapeRunButton = event.target.closest('[data-delete-auto-scrape-run]');
+  if (deleteAutoScrapeRunButton) {
+    const scheduleId = deleteAutoScrapeRunButton.dataset.deleteAutoScrapeRun;
+    const runId = deleteAutoScrapeRunButton.dataset.autoScrapeRunId;
+    confirmAction({
+      title: '删除运行日志',
+      text: '仅删除这条自动刮削运行记录，不会删除关联任务、封面或媒体文件。',
+      confirmLabel: '删除日志',
+      danger: true,
+      run: async () => {
+        await api(`/api/auto-scrape-schedules/${encodeURIComponent(scheduleId)}/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' });
+        await loadAutoScrapeSchedules();
+        if ($('#auto-scrape-run-dialog')?.open) renderAutoScrapeHistory(scheduleId);
+      },
+    });
+    return;
+  }
+  const editAutoScrapeScheduleButton = event.target.closest('[data-edit-auto-scrape-schedule]');
+  if (editAutoScrapeScheduleButton) {
+    editAutoScrapeSchedule(state.autoScrapeSchedules.find((schedule) => schedule.id === editAutoScrapeScheduleButton.dataset.editAutoScrapeSchedule));
+  }
+  const deleteAutoScrapeScheduleButton = event.target.closest('[data-delete-auto-scrape-schedule]');
+  if (deleteAutoScrapeScheduleButton) {
+    const id = deleteAutoScrapeScheduleButton.dataset.deleteAutoScrapeSchedule;
+    const schedule = state.autoScrapeSchedules.find((item) => item.id === id);
+    confirmAction({
+      title: '删除定时规则',
+      text: `确定删除定时自动刮削规则“${schedule?.name || id}”吗？`,
+      confirmLabel: '确认删除',
+      danger: true,
+      run: async () => {
+        await api(`/api/auto-scrape-schedules/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        await loadAutoScrapeSchedules();
+      },
+    });
+  }
+  const addAutoScrapeRule = event.target.closest('#add-auto-scrape-rule');
+  if (addAutoScrapeRule) {
+    const message = $('#download-management-message');
+    addAutoScrapeRule.disabled = true;
+    api('/api/downloads/auto-scrape/path-check', { method: 'POST', body: JSON.stringify({ tags: '', category: '' }) }).then((result) => {
+      if (!result.ok) { message.textContent = `路径映射检查失败：${(result.issues || []).join('；')}`; return; }
+      state.autoScrapeRules = [...readAutoScrapeRules(), newAutoScrapeRule()];
+      renderAutoScrapeRules(state.autoScrapeRules);
+      message.textContent = result.message || '路径映射检查通过';
+    }).catch((error) => { message.textContent = `路径映射检查失败：${error.message}`; }).finally(() => { addAutoScrapeRule.disabled = false; });
+    return;
+  }
+  const removeAutoScrapeRule = event.target.closest('[data-remove-auto-scrape-rule]');
+  if (removeAutoScrapeRule) {
+    state.autoScrapeRules = readAutoScrapeRules().filter((rule) => rule.id !== removeAutoScrapeRule.dataset.removeAutoScrapeRule);
+    renderAutoScrapeRules(state.autoScrapeRules);
+  }
+  const addPathMapping = event.target.closest('#add-path-mapping');
+  if (addPathMapping) {
+    state.pathMappings.push({ id: `new-${Date.now()}`, source_path: '', target_path: '' });
+    renderPathMappings();
+  }
+  const removePathMapping = event.target.closest('[data-remove-path-mapping]');
+  if (removePathMapping) {
+    const row = removePathMapping.closest('[data-path-mapping]');
+    state.pathMappings = state.pathMappings.filter((mapping) => mapping.id !== row?.dataset.pathMapping);
+    renderPathMappings();
+  }
+  const addMedia = event.target.closest('#add-media-server');
+  if (addMedia) editMediaServer(null);
+  const probeMedia = event.target.closest('#probe-media-server');
+  if (probeMedia) {
+    event.preventDefault();
+    probeMediaLibraries(true);
+    return;
+  }
+  const editMedia = event.target.closest('[data-edit-media-server]');
+  if (editMedia) editMediaServer(state.mediaServers.find((server) => server.id === editMedia.dataset.editMediaServer));
+  const syncMedia = event.target.closest('[data-sync-media-server]');
+  if (syncMedia) {
+    syncMedia.disabled = true;
+    api(`/api/media-servers/${encodeURIComponent(syncMedia.dataset.syncMediaServer)}/sync`, { method: 'POST' }).then((result) => { syncMedia.textContent = result.message || '已同步'; setTimeout(() => { syncMedia.textContent = '同步媒体库'; syncMedia.disabled = false; }, 1600); }).catch((error) => { syncMedia.textContent = error.message; setTimeout(() => { syncMedia.textContent = '同步媒体库'; syncMedia.disabled = false; }, 2200); });
+  }
+  if (state.taskSelectionMode) {
+    const card = event.target.closest('[data-task-card]');
+    if (card && event.target.closest('.task-card-head') && !event.target.closest('button, input, a, summary, label')) {
+      const id = card.dataset.taskCard;
+      if (state.selectedTaskIds.has(id)) state.selectedTaskIds.delete(id);
+      else state.selectedTaskIds.add(id);
+      state.taskSelectAnchor = id;
+      renderTasks();
+      return;
+    }
+  }
+  const toggle = event.target.closest('[data-task-toggle]');
+  if (toggle) {
+    const body = document.querySelector(`[data-task-body="${toggle.dataset.taskToggle}"]`);
+    if (!body) return;
+    const expanded = body.classList.toggle('hidden');
+    state.taskOpen ||= {};
+    state.taskOpen[toggle.dataset.taskToggle] = !expanded;
+    toggle.innerHTML = expandControlIcon(!expanded);
+    toggle.setAttribute('aria-expanded', String(!expanded));
+    toggle.title = expanded ? '展开任务' : '收起任务';
+  }
+  const play = event.target.closest('[data-play-task]');
+  if (play) { event.preventDefault(); playTask(play); return; }
+  const overviewSelect = event.target.closest('[data-overview-select-ids]');
+  if (overviewSelect) {
+    toggleOverviewSelection(overviewTaskIds(overviewSelect.dataset.overviewSelectIds));
+    renderOverview();
+    return;
+  }
+  const overviewSelectionMode = event.target.closest('[data-overview-selection-mode]');
+  if (overviewSelectionMode) {
+    if (state.overviewSelectionMode) state.selectedOverviewTasks.clear();
+    state.overviewSelectionMode = !state.overviewSelectionMode;
+    renderOverview();
+    return;
+  }
+  const overviewSelectAll = event.target.closest('[data-overview-select-all]');
+  if (overviewSelectAll) {
+    const ids = [...document.querySelectorAll('[data-overview-task-ids]')].flatMap((card) => overviewTaskIds(card.dataset.overviewTaskIds));
+    const allSelected = ids.length > 0 && ids.every((id) => state.selectedOverviewTasks.has(id));
+    if (!allSelected) state.overviewSelectionMode = true;
+    ids.forEach((id) => {
+      if (allSelected) state.selectedOverviewTasks.delete(id);
+      else state.selectedOverviewTasks.add(id);
+      state.overviewSelectionFeedback.add(id);
+    });
+    renderOverview();
+    return;
+  }
+  const overviewSelectAllMatching = event.target.closest('[data-overview-select-all-matching]');
+  if (overviewSelectAllMatching) {
+    state.overviewSelectionMode = true;
+    await selectAllMatching(overviewSelectAllMatching, state.selectedOverviewTasks);
+    renderOverview();
+    return;
+  }
+  const dynamicGo = event.target.closest('#overview-tasks [data-go]');
+  if (dynamicGo) { showView(dynamicGo.dataset.go); return; }
+  const openGroup = event.target.closest('[data-overview-open-group]');
+  if (openGroup) { openOverviewGroup(openGroup.dataset.overviewOpenGroup); return; }
+  const groupType = event.target.closest('[data-overview-group-by]');
+  if (groupType) { closeOverviewGroup(groupType.dataset.overviewGroupBy); return; }
+  if (event.target.closest('[data-overview-back]')) { closeOverviewGroup(); return; }
+  const groupPage = event.target.closest('[data-overview-group-page]');
+  if (groupPage && !groupPage.disabled) {
+    state.overviewGroupPage = Math.max(1, Number(groupPage.dataset.overviewGroupPage) || 1);
+    state.tasksSignature = '';
+    loadTasks();
+    return;
+  }
+  const detail = event.target.closest('[data-task-detail]');
+  if (detail) {
+    const overviewCard = detail.closest('[data-overview-task]');
+    if (state.overviewSelectionMode && overviewCard && overviewCard.dataset.overviewTaskIds) {
+      toggleOverviewSelection(overviewTaskIds(overviewCard.dataset.overviewTaskIds));
+      renderOverview();
+      return;
+    }
+    openTaskDetail(detail.dataset.taskDetail);
+  }
+  const retryImages = event.target.closest('[data-retry-task-images]');
+  if (retryImages) {
+    retryImages.disabled = true;
+    retryImages.textContent = '正在重新下载封面与剧照';
+    api(`/api/tasks/${encodeURIComponent(retryImages.dataset.retryTaskImages)}/images/retry`, { method: 'POST' }).then(async () => {
+      state.taskOpen ||= {};
+      state.taskOpen[retryImages.dataset.retryTaskImages] = true;
+      await loadTasks();
+      $('#task-detail-dialog')?.close();
+      showView('scrape');
+      showToast('已开始重新下载封面与剧照，正在显示任务日志');
+    }).catch((error) => {
+      retryImages.disabled = false;
+      retryImages.textContent = error.message;
+    });
+  }
+  const googleCover = event.target.closest('[data-google-cover-task]');
+  if (googleCover) {
+    const taskId = googleCover.dataset.googleCoverTask;
+    const currentTask = state.tasks.find((task) => task.id === taskId);
+    const dialog = $('#google-cover-dialog');
+    if (!currentTask) return;
+    state.googleCoverDialogTaskId = taskId;
+    state.googleCoverDialogDismissed = false;
+    renderGoogleCoverLoading();
+    $('#google-cover-message').textContent = '';
+    if (dialog && !dialog.open) dialog.showModal();
+    try {
+      await api(`/api/tasks/${encodeURIComponent(taskId)}/cover/search`, { method: 'POST' });
+      waitForCrawlerCoverCandidates(taskId);
+    } catch (error) {
+      $('#google-cover-message').textContent = error.message;
+    }
+  }
+  const openGoogleSearch = event.target.closest('[data-open-google-client-search]');
+  if (openGoogleSearch) openGoogleClientSearch(openGoogleSearch.dataset.openGoogleClientSearch);
+  const coverOption = event.target.closest('[data-google-cover-select]');
+  if (coverOption) {
+    coverOption.disabled = true;
+    try {
+      await api(`/api/tasks/${encodeURIComponent(coverOption.dataset.googleCoverSelect)}/cover/select`, { method: 'POST', body: JSON.stringify({ candidate_id: coverOption.dataset.candidateId }) });
+      await waitForCrawlerCoverSelection(coverOption.dataset.googleCoverSelect);
+      $('#google-cover-dialog')?.close();
+      await loadTasks();
+    } catch (error) { coverOption.disabled = false; $('#google-cover-message').textContent = error.message; }
+  }
+  const addMediaType = event.target.closest('[data-add-media-type]');
+  if (addMediaType) {
+    const types = readMediaTypesControl();
+    const index = types.filter((item) => !BUILT_IN_MEDIA_TYPE_IDS.has(item.id)).length + 1;
+    const id = `custom_${index}`;
+    types.push({ id, name: '\u65b0\u5f71\u7247\u5206\u7c7b', priority: 50, identifier_kind: 'dvdid', pattern: '(?P<avid>[A-Z]{2,10}-\\d{2,8})', avid_format: '{avid}' });
+    state.formValues ||= {};
+    state.formValues.scanner ||= {};
+    state.formValues.scanner.media_types = types;
+    addMediaType.closest('[data-media-type-control]')?.replaceWith(document.createRange().createContextualFragment(mediaTypesMarkup(types)));
+    refreshCrawlerSelectionForMediaTypes();
+    return;
+  }
+  const removeMediaType = event.target.closest('[data-remove-media-type]');
+  if (removeMediaType) {
+    const rule = removeMediaType.closest('[data-media-type-rule]');
+    const id = rule?.querySelector('[data-media-type-id]')?.value.trim().toLowerCase();
+    if (!id || BUILT_IN_MEDIA_TYPE_IDS.has(id)) return;
+    const selection = crawlerSelectionFromDom();
+    delete selection[id];
+    const types = readMediaTypesControl().filter((item) => item.id !== id);
+    state.formValues ||= {};
+    state.formValues.scanner ||= {};
+    state.formValues.scanner.media_types = types;
+    rule.closest('[data-media-type-control]')?.replaceWith(document.createRange().createContextualFragment(mediaTypesMarkup(types)));
+    refreshCrawlerSelectionForMediaTypes(selection);
+    return;
+  }
+  const arrayAdd = event.target.closest('.config-array-add-button');
+  if (arrayAdd) {
+    const control = arrayAdd.closest('.config-array');
+    const input = control?.querySelector('.config-array-input');
+    const value = input?.value.trim();
+    if (!control || !input || !value) return;
+    const duplicate = [...control.querySelectorAll('[data-array-value]')].some((tag) => tag.dataset.arrayValue === value);
+    if (duplicate) { input.setCustomValidity('\u8be5\u503c\u5df2\u6dfb\u52a0'); input.reportValidity(); return; }
+    input.setCustomValidity('');
+    control.querySelector('.config-array-list')?.insertAdjacentHTML('beforeend', configArrayTagMarkup(value));
+    input.value = '';
+    return;
+  }
+  const arrayRemove = event.target.closest('button[data-remove-config-array-tag]');
+  if (arrayRemove?.parentElement?.matches('.config-array-tag')) {
+    event.preventDefault();
+    event.stopPropagation();
+    arrayRemove.parentElement.remove();
+    return;
+  }
+  // 预设里的刮削器：一份扁平的有序列表，整块重渲染以保持序号正确
+  const scraperSelectionHost = () => document.querySelector('[data-crawler-selection-control]');
+  function currentScraperList() {
+    return [...document.querySelectorAll('[data-crawler-value]')]
+      .map((tag) => String(tag.dataset.crawlerValue || '').trim()).filter(Boolean);
+  }
+  function rerenderScraperSelection(list) {
+    const host = scraperSelectionHost();
+    if (host) host.innerHTML = crawlerConfigTagsMarkup(list);
+  }
+  const crawlerPick = event.target.closest('[data-crawler-pick]');
+  if (crawlerPick) {
+    const name = resolveScraperName(crawlerPick.dataset.crawlerPick);
+    const list = currentScraperList();
+    if (name && !list.includes(name)) { list.push(name); rerenderScraperSelection(list); }
+    return;
+  }
+  const crawlerAdd = event.target.closest('.crawler-add-button');
+  if (crawlerAdd) {
+    const input = crawlerAdd.closest('.crawler-flat-add')?.querySelector('.crawler-add-input')
+      || crawlerAdd.closest('.crawler-add')?.querySelector('.crawler-add-input');
+    if (input) {
+      const name = resolveScraperName(input.value);
+      if (!name) { input.setCustomValidity('请选择已启用的刮削器，或输入有效的模块名'); input.reportValidity(); return; }
+      const list = currentScraperList();
+      if (list.includes(name)) { input.setCustomValidity('该刮削器已添加'); input.reportValidity(); return; }
+      input.setCustomValidity('');
+      list.push(name);
+      rerenderScraperSelection(list);
+      return;
+    }
+  }
+  const crawlerTagRemove = event.target.closest('button[data-remove-crawler-tag]');
+  if (crawlerTagRemove?.parentElement?.matches('.crawler-tag')) {
+    event.preventDefault();
+    event.stopPropagation();
+    const name = crawlerTagRemove.parentElement.dataset.crawlerValue;
+    const list = currentScraperList().filter((item) => item !== name);
+    rerenderScraperSelection(list);
+    return;
+  }
+  // 扁平列表里用左右键调整顺序
+  const crawlerMove = event.target.closest('[data-crawler-move]');
+  if (crawlerMove) {
+    const name = crawlerMove.dataset.crawlerMoveName;
+    const direction = crawlerMove.dataset.crawlerMove;
+    const list = currentScraperList();
+    const index = list.indexOf(name);
+    const target = direction === 'up' ? index - 1 : index + 1;
+    if (index >= 0 && target >= 0 && target < list.length) {
+      [list[index], list[target]] = [list[target], list[index]];
+      rerenderScraperSelection(list);
+    }
+    return;
+  }
+  const restoreFiles = event.target.closest('[data-restore-task-files]');
+  if (restoreFiles) {
+    const task = state.tasks.find((item) => item.id === restoreFiles.dataset.restoreTaskFiles);
+    confirmAction({
+      title: '还原原始文件',
+      text: `将把“${taskDisplayName(task || {})}”移回原始位置，并删除本次刮削生成的 NFO、封面与剧照。此操作不可撤销。`,
+      confirmLabel: '确认还原',
+      danger: true,
+      run: async () => {
+        await api(`/api/tasks/${encodeURIComponent(restoreFiles.dataset.restoreTaskFiles)}/restore`, { method: 'POST' });
+        $('#task-detail-dialog')?.close();
+        await loadTasks();
+        showToast('已还原原始文件并移除刮削产物');
+      },
+    });
+  }
+  const downloadTab = event.target.closest('[data-download-tab]');
+  if (downloadTab) {
+    state.activeDownloaderId = downloadTab.dataset.downloadTab;
+    loadDownloads();
+  }
+  const downloadSort = event.target.closest('[data-download-sort]');
+  if (downloadSort) {
+    const key = downloadSort.dataset.downloadSort;
+    state.downloadSort = state.downloadSort?.key === key ? { key, direction: state.downloadSort.direction === 'asc' ? 'desc' : 'asc' } : { key, direction: ['name', 'tags', 'state', 'category'].includes(key) ? 'asc' : 'desc' };
+    renderDownloadRows(state.activeDownloads || [], state.activeDownloader || {});
+  }
+  const downloaderEdit = event.target.closest('[data-downloader-edit]');
+  if (downloaderEdit) editDownloader(state.downloaders.find((downloader) => downloader.id === downloaderEdit.dataset.downloaderEdit));
+  const removeDownload = event.target.closest('[data-remove-download]');
+  if (removeDownload) {
+    const { downloaderId, removeDownload: torrentHash } = removeDownload.dataset;
+    confirmAction({
+      title: '删除下载任务',
+      text: '确定删除该 qBittorrent 种子记录并保留文件吗？',
+      confirmLabel: '确认删除',
+      danger: true,
+      run: async () => {
+        await api(`/api/downloads/${encodeURIComponent(downloaderId)}/${encodeURIComponent(torrentHash)}`, { method: 'DELETE' });
+        await loadDownloads();
+      },
+    });
+  }
+});
+
+$('#refresh-downloads').addEventListener('click', loadDownloads);
+$('#cookiecloud-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const message = $('#cookiecloud-message');
+  try {
+    const saved = await api('/api/cookiecloud', { method: 'PUT', body: JSON.stringify(cookiecloudPayload()) });
+    $('#cookiecloud-password').value = '';
+    $('#cookiecloud-clear-password').checked = false;
+    message.textContent = saved.has_password ? 'CookieCloud 配置已保存' : 'CookieCloud 配置已保存；尚未设置密码';
+    renderCookieCloudStatus(saved);
+  } catch (error) { message.textContent = error.message; }
+});
+$('#test-cookiecloud').addEventListener('click', async () => {
+  const button = $('#test-cookiecloud');
+  const message = $('#cookiecloud-message');
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = '正在测试';
+  try {
+    const result = await api('/api/cookiecloud/test', { method: 'POST', body: JSON.stringify(cookiecloudPayload()) });
+    message.textContent = `连接成功：${result.domains} 个站点，${result.cookies} 条 Cookie。测试不会保存配置；保存后可立即同步。`;
+  } catch (error) { message.textContent = error.message; }
+  finally { button.disabled = false; button.textContent = original; }
+});
+$('#sync-cookiecloud').addEventListener('click', async () => {
+  const button = $('#sync-cookiecloud');
+  const message = $('#cookiecloud-message');
+  button.disabled = true;
+  message.textContent = '正在按已保存的配置同步…';
+  try {
+    const result = await api('/api/cookiecloud/sync', { method: 'POST' });
+    renderCookieCloudStatus({ enabled: true, sync: result.sync });
+    message.textContent = '同步完成，爬虫和 AI 将使用这次同步的登录信息。';
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    button.disabled = false;
+    try { renderCookieCloudStatus(await api('/api/cookiecloud')); } catch (_) { }
+  }
+});
+$('#download-management-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const message = $('#download-management-message');
+  try {
+    const payload = downloadManagementPayload();
+    const saved = await api('/api/downloads/settings', { method: 'PUT', body: JSON.stringify(payload) });
+    state.autoScrapeRules = normalizeAutoScrapeRules(saved);
+    renderAutoScrapeRules(state.autoScrapeRules);
+    message.textContent = saved.limit_apply_errors?.length ? `策略已保存；部分任务的限速设置未能更新：${saved.limit_apply_errors.join('；')}` : `策略已保存，已为 ${saved.limit_applied_count || 0} 个任务更新上传和下载限速`;
+    await loadDownloads();
+  } catch (error) { message.textContent = error.message; }
+});
+$('#add-downloader').addEventListener('click', () => editDownloader(null));
+$('#add-auto-scrape-schedule').addEventListener('click', async () => {
+  await loadPresets();
+  editAutoScrapeSchedule();
+});
+['#close-auto-scrape-schedule', '#cancel-auto-scrape-schedule'].forEach((selector) => {
+  $(selector)?.addEventListener('click', () => $('#auto-scrape-schedule-dialog').close());
+});
+$('.native-schedule-path-button').addEventListener('click', async () => {
+  const message = $('#auto-scrape-schedule-message');
+  try {
+    const selected = await api('/api/path/select', { method: 'POST', body: JSON.stringify({ kind: 'directory' }) });
+    if (selected.path) $('#auto-scrape-schedule-directory').value = selected.path;
+  } catch (error) { message.textContent = error.message; }
+});
+$('#auto-scrape-schedule-form').addEventListener('submit', async (event) => {
+  if (event.submitter?.value !== 'default') return;
+  event.preventDefault();
+  const id = $('#auto-scrape-schedule-id').value;
+  const message = $('#auto-scrape-schedule-message');
+  try {
+    const saved = await api(id ? `/api/auto-scrape-schedules/${encodeURIComponent(id)}` : '/api/auto-scrape-schedules', { method: id ? 'PUT' : 'POST', body: JSON.stringify(autoScrapeSchedulePayload()) });
+    state.autoScrapeSchedules = id ? state.autoScrapeSchedules.map((schedule) => schedule.id === id ? saved : schedule) : [...state.autoScrapeSchedules, saved];
+    renderAutoScrapeSchedules();
+    renderAutoScrapeRunButtons();
+    $('#auto-scrape-schedule-dialog').close();
+  } catch (error) { message.textContent = error.message; }
+});
+$('#delete-auto-scrape-schedule').addEventListener('click', () => {
+  const id = $('#auto-scrape-schedule-id').value;
+  if (!id) return;
+  const schedule = state.autoScrapeSchedules.find((item) => item.id === id);
+  $('#auto-scrape-schedule-dialog').close();
+  confirmAction({
+    title: '删除定时规则',
+    text: `确定删除定时自动刮削规则“${schedule?.name || id}”吗？`,
+    confirmLabel: '确认删除',
+    danger: true,
+    run: async () => {
+      await api(`/api/auto-scrape-schedules/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await loadAutoScrapeSchedules();
+    },
+  });
+});
+$('#downloader-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const message = $('#downloader-message');
+  const downloaderId = $('#downloader-id').value;
+  try {
+    const result = await api(downloaderId ? `/api/downloaders/${encodeURIComponent(downloaderId)}` : '/api/downloaders', { method: downloaderId ? 'PUT' : 'POST', body: JSON.stringify(downloaderPayload()) });
+    message.textContent = '下载器已保存';
+    await loadDownloaders(result.id);
+    $('#downloader-dialog').close();
+  } catch (error) { message.textContent = error.message; }
+});
+$('#test-downloader').addEventListener('click', async () => {
+  const message = $('#downloader-message');
+  const downloaderId = $('#downloader-id').value;
+  try {
+    const result = await api(downloaderId ? `/api/downloaders/${encodeURIComponent(downloaderId)}/test` : '/api/downloaders/test', { method: 'POST', body: JSON.stringify(downloaderPayload()) });
+    message.textContent = `连接成功，qBittorrent ${result.version}`;
+  } catch (error) { message.textContent = error.message; }
+});
+$('#delete-downloader').addEventListener('click', () => {
+  const downloaderId = $('#downloader-id').value;
+  if (!downloaderId) return;
+  confirmAction({
+    title: '删除下载器',
+    text: '确定删除该下载器连接吗？',
+    confirmLabel: '确认删除',
+    danger: true,
+    run: async () => {
+      await api(`/api/downloaders/${encodeURIComponent(downloaderId)}`, { method: 'DELETE' });
+      $('#downloader-dialog').close();
+      await loadDownloaders();
+    },
+  });
+});
+
+ensureMediaSettingsUi();
+
+$('#update-settings-form')?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const message = $('#update-settings-message');
+  try {
+    const settings = await api('/api/update/settings', { method: 'PUT', body: JSON.stringify({
+      check_enabled: $('#update-check-enabled').checked,
+      auto_update: $('#update-auto-update').checked,
+      experience_program: $('#update-experience').checked,
+      check_interval_hours: Number($('#update-interval').value || 24),
+    }) });
+    renderUpdateStatus(settings);
+    const selectedBeta = Boolean(settings.settings?.experience_program);
+    const planStatus = selectedBeta ? '已加入体验计划' : '已退出体验计划';
+    const targetChannel = selectedBeta ? '体验版' : '正式版';
+    if (settings.activation_error) {
+      message.textContent = `${planStatus}，但安装${targetChannel}失败：${settings.activation_error}`;
+    } else if (settings.activation) {
+      message.textContent = settings.activation.status === 'scheduled' ? `${planStatus}，正在下载并安装${targetChannel}` : `${planStatus}，当前已是所选渠道的最新版本`;
+      if (settings.activation.status === 'scheduled') watchUpdateJob(settings.activation);
+    } else {
+      message.textContent = '更新设置已保存';
+      await checkUpdateNow();
+    }
+  } catch (error) { message.textContent = error.message; }
+});
+$('#update-experience')?.addEventListener('change', () => $('#update-settings-form').requestSubmit());
+$('#update-check-now')?.addEventListener('click', checkUpdateNow);
+$('#update-apply-now')?.addEventListener('click', applyUpdateNow);
+$('#update-overlay-close')?.addEventListener('click', closeUpdateOverlay);
+
+// ---------------------------------------------------------------- 局域网访问
+function renderLanAddresses(data) {
+  const box = $('#lan-addresses');
+  const enabled = data.settings?.lan_access === true;
+  const addresses = data.addresses || [];
+  box.innerHTML = '';
+  if (!enabled || !addresses.length) { box.hidden = true; return; }
+  box.hidden = false;
+  const title = document.createElement('p');
+  title.className = 'muted';
+  title.textContent = '局域网访问地址（同一网络下的设备可用）：';
+  box.appendChild(title);
+  addresses.forEach((address) => {
+    const row = document.createElement('div');
+    row.className = 'lan-address-row';
+    const text = document.createElement('code');
+    text.textContent = address;
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'button secondary';
+    copy.textContent = '复制';
+    copy.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(address); copy.textContent = '已复制'; }
+      catch (_) { copy.textContent = '复制失败'; }
+      window.setTimeout(() => { copy.textContent = '复制'; }, 2000);
+    });
+    row.append(text, copy);
+    box.appendChild(row);
+  });
+}
+
+async function loadNetworkSettings() {
+  try {
+    const data = await api('/api/network/settings');
+    $('#lan-access-enabled').checked = data.settings?.lan_access === true;
+    $('#lan-status-badge').textContent = data.settings?.lan_access ? '局域网已开启' : '仅本机';
+    $('#lan-firewall-status').textContent = data.firewall?.message || '';
+    renderLanAddresses(data);
+  } catch (error) { $('#network-settings-message').textContent = error.message; }
+}
+
+$('#network-settings-form')?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const message = $('#network-settings-message');
+  try {
+    const result = await api('/api/network/settings', { method: 'PUT', body: JSON.stringify({ lan_access: $('#lan-access-enabled').checked }) });
+    $('#lan-status-badge').textContent = result.settings.lan_access ? '局域网已开启' : '仅本机';
+    $('#lan-firewall-status').textContent = result.firewall?.message || '';
+    if (result.firewall?.error) { message.textContent = `已保存，但防火墙规则添加失败：${result.firewall.error}`; return; }
+    message.textContent = result.settings.lan_access ? '已开启局域网访问，重启程序后生效' : '已关闭局域网访问';
+    const data = await api('/api/network/settings');
+    renderLanAddresses(data);
+  } catch (error) { message.textContent = error.message; }
+});
+
+document.addEventListener('submit', async (event) => {
+  if (event.target.id === 'path-mappings-form') {
+    event.preventDefault();
+    const message = $('#path-mapping-message');
+    const mappings = Array.from(document.querySelectorAll('[data-path-mapping]')).map((row) => ({ source_path: row.querySelector('[data-path-source]').value.trim(), target_path: row.querySelector('[data-path-target]').value.trim() }));
+    if (mappings.some((mapping) => !mapping.source_path || !mapping.target_path)) { message.textContent = '请完整填写每条路径映射'; return; }
+    try {
+      state.pathMappings = (await api('/api/path-mappings', { method: 'PUT', body: JSON.stringify({ mappings }) })).mappings || [];
+      renderPathMappings();
+      message.textContent = '路径映射已保存';
+    } catch (error) { message.textContent = error.message; }
+    return;
+  }
+  if (event.target.id !== 'media-server-form') return;
+  event.preventDefault();
+  const id = $('#media-server-id').value;
+  const message = $('#media-server-message');
+  try {
+    const result = await api(id ? `/api/media-servers/${encodeURIComponent(id)}` : '/api/media-servers', { method: id ? 'PUT' : 'POST', body: JSON.stringify(mediaServerPayload()) });
+    state.mediaServers = id ? state.mediaServers.map((server) => server.id === id ? result : server) : [...state.mediaServers, result];
+    renderMediaServers();
+    $('#media-server-dialog').close();
+  } catch (error) { message.textContent = error.message; }
+});
+
+document.addEventListener('click', (event) => {
+  const syncButton = event.target.closest('#media-server-dialog #sync-media-server');
+  if (!syncButton) return;
+  const id = $('#media-server-id').value;
+  if (!id) return;
+  const message = $('#media-server-message');
+  const original = syncButton.textContent;
+  syncButton.disabled = true;
+  syncButton.textContent = '正在同步…';
+  api(`/api/media-servers/${encodeURIComponent(id)}/sync`, { method: 'POST' }).then((result) => { message.textContent = result.message || '媒体库扫描已启动'; }).catch((error) => { message.textContent = error.message; }).finally(() => { syncButton.disabled = false; syncButton.textContent = original; });
+});
+
+document.addEventListener('click', (event) => {
+  const deleteButton = event.target.closest('#media-server-dialog #delete-media-server');
+  if (!deleteButton) return;
+  const id = $('#media-server-id').value;
+  if (!id) return;
+  const server = state.mediaServers.find((item) => item.id === id);
+  $('#media-server-dialog').close();
+  confirmAction({ title: '删除媒体服务器', text: `确定删除媒体服务器“${server?.name || id}”吗？`, confirmLabel: '确认删除', danger: true, run: async () => { await api(`/api/media-servers/${encodeURIComponent(id)}`, { method: 'DELETE' }); await loadMediaServers(); } });
+});
+
+function setSidebarCollapsed(collapsed) {
+  const shell = document.querySelector('.app-shell');
+  const toggle = $('#sidebar-toggle');
+  if (!shell || !toggle) return;
+  shell.classList.toggle('sidebar-collapsed', collapsed);
+  toggle.title = collapsed ? '展开侧边栏' : '收起侧边栏';
+  toggle.setAttribute('aria-label', toggle.title);
+  toggle.querySelector('span').textContent = collapsed ? '>' : '<';
+  localStorage.setItem('javsp-web.sidebar-collapsed', collapsed ? '1' : '0');
+}
+
+const sidebarToggle = $('#sidebar-toggle');
+if (sidebarToggle) {
+  sidebarToggle.addEventListener('click', () => setSidebarCollapsed(!document.querySelector('.app-shell').classList.contains('sidebar-collapsed')));
+  setSidebarCollapsed(localStorage.getItem('javsp-web.sidebar-collapsed') === '1');
+}
+
+const downloadPolicyToggle = $('#download-policy-toggle');
+const downloadPolicyContent = $('#download-policy-content');
+if (downloadPolicyToggle && downloadPolicyContent) {
+  const setDownloadPolicyExpanded = (expanded) => {
+    downloadPolicyContent.classList.toggle('hidden', !expanded);
+    downloadPolicyToggle.textContent = expanded ? '收起策略' : '展开策略';
+    downloadPolicyToggle.setAttribute('aria-expanded', String(expanded));
+    localStorage.setItem('javsp-web.download-policy-open', expanded ? '1' : '0');
+  };
+  setDownloadPolicyExpanded(localStorage.getItem('javsp-web.download-policy-open') === '1');
+  downloadPolicyToggle.addEventListener('click', () => setDownloadPolicyExpanded(downloadPolicyContent.classList.contains('hidden')));
+}
+
+(async () => {
+  try {
+    const savedView = localStorage.getItem('javsp-web.active-view');
+    state.user = await api('/api/auth/me');
+    if (!MOBILE_APP) restoreUpdateOverlay();
+    $('#current-user').textContent = state.user.username;
+    if (!MOBILE_APP) {
+      try { await window.JavspCommunity.init(); } catch (_) { /* Profile failure must not block scraping. */ }
+    }
+    if (state.user.role !== 'admin') { $('#settings-nav').remove(); $('#auto-scrape-nav').remove(); $('#crawler-config-nav').remove(); $('#ai-scrape-nav').remove(); }
+    if (MOBILE_APP) {
+      showView('library');
+    } else if (savedView && document.querySelector(`[data-panel="${savedView}"]`) && (state.user.role === 'admin' || !['settings', 'auto-scrape', 'crawler-config', 'ai-scrape'].includes(savedView))) {
+      showView(savedView);
+    } else {
+      showView('overview');
+    }
+    api('/api/runtime').then((runtime) => {
+      state.runtime = runtime;
+      if (!MOBILE_APP) {
+        window.JavspCommunity.configure(runtime.comments_url);
+        checkForAppUpdate(runtime);
+      }
+    }).catch(console.error);
+    if (!MOBILE_APP) scheduleGitHubStarInvite();
+  } catch (error) { return; }
+  let refreshTimer = null;
+  let polling = false;
+  let failures = 0;
+  const poll = async () => {
+    if (document.hidden || polling) return;
+    polling = true; state.pollFailed = false;
+    try {
+      const view = document.querySelector('.view.active')?.dataset.panel;
+      const work = [];
+      if (['overview', 'scrape'].includes(view)) work.push(loadTasks());
+      else if ($('#task-detail-dialog')?.open && !state.taskMetadataEditing) work.push(openTaskDetail(state.activeTaskDetail, true));
+      if (view === 'downloads') work.push(loadDownloads());
+      if (view === 'auto-scrape') work.push(loadAutoScrapeSchedules());
+      if (view === 'settings') work.push(loadUpdateSettings(false));
+      await Promise.allSettled(work);
+      failures = state.pollFailed ? Math.min(failures + 1, 4) : 0;
+    } finally {
+      polling = false;
+      if (!document.hidden) refreshTimer = setTimeout(poll, Math.min(60000, 5000 * 2 ** failures));
+    }
+  };
+  document.addEventListener('visibilitychange', () => { clearTimeout(refreshTimer); if (!document.hidden) poll(); });
+  if (!document.hidden) refreshTimer = setTimeout(poll, 5000);
+
+})();
+
+window.JavspComments = (() => {
+  let current = null;
+  const target = () => $('#task-comments');
+  const esc = (value) => escapeHtml(value ?? '');
+  const date = (value) => new Date(Number(value) * 1000).toLocaleString();
+  const commentHelp = '<div class="comment-label-row"><label for="film-comment-body">评论内容</label><details class="comment-help"><summary aria-label="评论格式和时间标签说明">?</summary><div class="comment-help-content"><p>评论和回复最多 300 字符，举报原因最多 300 字符。</p><p>支持 Markdown：<code>**粗体**</code>、<code>*斜体*</code>、<code>~~删除线~~</code>、列表、引用、代码和链接。</p><p>输入 <code>30:15</code> 或 <code>1:02:03</code> 可生成时间标签，点击可从对应位置播放当前影片。</p><p>代码和链接中的时间保持原样；不执行 HTML，也不加载远程图片。播放时需绑定媒体库并登录播放器。</p></div></details></div>';
+  const replyQuote = (item) => !item.reply_to_id ? '' : `<blockquote class="comment-reply-quote">${item.reply_to ? `<strong>回复 ${esc(item.reply_to.nickname)}</strong><span>${esc(item.reply_to.body)}</span>` : '<span class="muted">原评论已不可见</span>'}</blockquote>`;
+  const selectReply = (active, item) => {
+    active.replyTo = item ? { id: item.id, nickname: item.nickname } : null;
+    const section = target();
+    section.querySelector('.comment-reply-context').hidden = !item;
+    section.querySelector('.comment-reply-label').textContent = item ? `正在回复 ${item.nickname || '匿名用户'}` : '';
+    section.querySelector('.comment-form button[type="submit"]').textContent = item ? '发表回复' : '发表评论';
+  };
+  const request = async (active, path, options = {}) => {
+    const controller = new AbortController();
+    active.requests.add(controller);
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(active.base + path, {
+        ...options, credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal,
+        headers: { Accept: 'application/json', ...window.JavspCommunity.headers(), ...(options.body ? { 'Content-Type': 'application/json' } : {}) },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) { const error = new Error(data.detail || '评论服务暂时不可用，请稍后重试。'); error.status = response.status; throw error; }
+      return data;
+    } catch (error) {
+      if (error.name === 'AbortError') throw new Error('连接超时，请重试。');
+      if (error instanceof TypeError) throw new Error('无法连接评论服务，请检查网络后重试。');
+      throw error;
+    } finally { clearTimeout(timeout); active.requests.delete(controller); }
+  };
+  const render = (active) => {
+    const section = target();
+    section.querySelector('.comments-list').innerHTML = active.items.length
+      ? active.items.map((item) => `<article class="comment-item"><div class="comment-item-head">${window.JavspCommunity.avatar(item.avatar_id, item.nickname)}<strong>${esc(item.nickname || '匿名用户')}</strong><time>${esc(date(item.created_at))}</time></div>${replyQuote(item)}<div class="comment-markdown">${window.JavspCommentMarkdown?.render(item.body) ?? esc(item.body)}</div><div class="comment-actions"><button class="comment-like" type="button" data-comment-like="${esc(item.id)}" aria-pressed="${Boolean(item.liked)}">${item.liked ? '已赞' : '点赞'} · ${Number(item.likes) || 0}</button><button class="comment-reply" type="button" data-comment-reply="${esc(item.id)}">回复</button><button class="comment-report" type="button" data-comment-report="${esc(item.id)}">举报</button></div></article>`).join('')
+      : '<p class="muted">还没有评论，欢迎留下第一条。</p>';
+    section.querySelector('.comments-status').textContent = active.cursor ? `已显示 ${active.items.length} 条` : `${active.items.length} 条评论`;
+    section.querySelector('[data-comment-more]').hidden = !active.cursor;
+  };
+  const load = async (more = false) => {
+    const active = current;
+    if (!active?.base || active.loading) return;
+    active.loading = true;
+    const section = target();
+    const message = section.querySelector('.comments-load-message');
+    const moreButton = section.querySelector('[data-comment-more]');
+    const refreshButton = section.querySelector('[data-comment-refresh]');
+    message.textContent = '';
+    moreButton.disabled = refreshButton.disabled = true;
+    try {
+      const query = more && active.cursor ? `?limit=20&before=${encodeURIComponent(active.cursor)}` : '?limit=20';
+      const data = await request(active, `/api/threads/${encodeURIComponent(active.identifier)}/comments${query}`);
+      if (active !== current) return;
+      const items = more ? [...active.items, ...(data.items || [])] : (data.items || []);
+      active.items = [...new Map(items.map(item => [item.id, item])).values()];
+      active.cursor = data.next_cursor || null;
+      render(active);
+    } catch (error) {
+      if (active !== current) return;
+      message.textContent = error.message;
+      if (!active.items.length) section.querySelector('.comments-list').innerHTML = '';
+      section.querySelector('.comments-status').textContent = '读取失败';
+      refreshButton.textContent = '重试';
+    } finally {
+      active.loading = false;
+      moreButton.disabled = refreshButton.disabled = false;
+    }
+  };
+  const close = () => {
+    current?.requests.forEach(controller => controller.abort());
+    current = null;
+    const section = target();
+    if (section) { section.hidden = true; section.innerHTML = ''; }
+  };
+  const open = (identifier, baseUrl, taskId = '') => {
+    const section = target();
+    if (!section) return;
+    const name = String(identifier || '').trim();
+    const base = String(baseUrl || '').replace(/\/+$/, '');
+    window.JavspCommunity.configure(base);
+    if (current?.identifier === name && current?.base === base) { current.taskId = taskId; return; }
+    close();
+    if (!name || !base) return;
+    current = { identifier: name, base, taskId, items: [], cursor: null, loading: false, posting: false, replyTo: null, requests: new Set() };
+    section.hidden = false;
+    section.innerHTML = `<div class="comments-heading"><div><h3>影片评论</h3><p class="muted">分享你的观影感受。请勿发布广告或联系方式。</p></div><button type="button" class="button secondary" data-comment-refresh>刷新评论</button></div><span class="comments-status muted" role="status">正在读取…</span><div class="comments-list"></div><p class="comments-load-message form-error" role="status"></p><button type="button" class="button secondary comments-more" data-comment-more hidden>加载更多</button><form class="comment-form"><div class="comment-author"><span data-comment-avatar>${window.JavspCommunity.avatar(window.JavspCommunity.identity().avatar_id)}</span><span data-comment-author>${esc(window.JavspCommunity.identity().nickname || '匿名用户')}</span><button type="button" class="comment-profile-link" data-open-profile>个人中心</button></div><div class="comment-reply-context" hidden><span class="comment-reply-label" role="status"></span><button type="button" class="comment-profile-link" data-comment-reply-cancel>取消回复</button></div>${commentHelp}<textarea id="film-comment-body" name="body" maxlength="600" rows="3" required placeholder="写下你对这部影片的看法"></textarea><div class="comment-form-actions"><button class="button primary" type="submit">发表评论</button><span class="comment-form-message muted" role="status"></span></div></form>`;
+    load();
+  };
+  document.addEventListener('submit', async (event) => {
+    const form = event.target.closest('#task-comments form');
+    if (!form) return;
+    event.preventDefault();
+    const active = current;
+    if (!active) return;
+    const button = form.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    const message = form.querySelector('.comment-form-message');
+    const body = form.elements.body.value.trim();
+    if (!body) { message.textContent = '请先填写评论内容。'; return; }
+    if ([...body].length > 300) { message.textContent = '评论和回复不能超过 300 字符。'; return; }
+    if ([...body].length > 300) { message.textContent = '评论和回复不能超过 300 字符。'; return; }
+    const replyToId = active.replyTo?.id;
+    active.posting = true;
+    button.disabled = true;
+    message.textContent = '正在提交…';
+    try {
+      await window.JavspCommunity.requireIdentity();
+      message.textContent = '正在提交…';
+      const data = await window.JavspCommunity.withChallenge('comment', (turnstile_token) => {
+        if (active !== current) return Promise.reject(new Error('评论窗口已关闭'));
+        const payload = { ...window.JavspCommunity.identity(), body, website: '' };
+        if (replyToId) payload.reply_to_id = replyToId;
+        if (turnstile_token) payload.turnstile_token = turnstile_token;
+        return request(active, `/api/threads/${encodeURIComponent(active.identifier)}/comments`, { method: 'POST', body: JSON.stringify(payload) });
+      });
+      if (active !== current) return;
+      form.elements.body.value = '';
+      selectReply(active, null);
+      message.textContent = data.comment?.status === 'pending' ? '评论已提交，审核后会显示在这里。' : '评论已发布。';
+      if (data.comment?.status !== 'pending') await load();
+    } catch (error) { if (active === current) message.textContent = error.message; }
+    finally { active.posting = false; button.disabled = false; }
+  });
+  document.addEventListener('click', async (event) => {
+    if (event.target.closest('#task-comments [data-comment-more]')) { await load(true); return; }
+    if (event.target.closest('#task-comments [data-comment-refresh]')) { await load(); return; }
+    if (event.target.closest('#task-comments [data-comment-reply-cancel]')) {
+      if (current && !current.posting) selectReply(current, null);
+      return;
+    }
+    const reply = event.target.closest('#task-comments [data-comment-reply]');
+    if (reply && current && !current.posting) {
+      const item = current.items.find(item => String(item.id) === reply.dataset.commentReply);
+      if (item) { selectReply(current, item); target().querySelector('textarea[name="body"]').focus(); }
+      return;
+    }
+    const timestamp = event.target.closest('#task-comments [data-comment-time]');
+    if (timestamp && current) {
+      const seconds = Number(timestamp.dataset.commentTime);
+      try {
+        const data = await api(`/api/tasks/${encodeURIComponent(current.taskId)}/playback/sessions`, { timeoutMs: 30000 });
+        const sessions = (data.sessions || []).filter(item => item.session_id);
+        if (sessions.length === 1) {
+          await api(`/api/tasks/${encodeURIComponent(current.taskId)}/playback/seek`, { method: 'POST', timeoutMs: 30000, body: JSON.stringify({ server_id: sessions[0].server_id, session_id: sessions[0].session_id, seconds }) });
+          showToast(`已在 ${sessions[0].client || sessions[0].device_name || '媒体播放器'} 跳转到 ${timestamp.textContent}`);
+        } else if (!sessions.length) {
+          showToast('请先登录并打开 Jellyfin/Emby 播放器页面，再刷新后重试。');
+        } else {
+          const labels = sessions.map((item, index) => `${index + 1}. ${item.client || item.device_name || '媒体播放器'}${item.user_name ? `（${item.user_name}）` : ''}`).join('\n');
+          const choice = window.prompt(`选择要跳转的播放器：\n${labels}`);
+          const index = Number(choice) - 1;
+          if (!Number.isInteger(index) || !sessions[index]) { showToast('播放器序号无效。', 'error'); return; }
+          await api(`/api/tasks/${encodeURIComponent(current.taskId)}/playback/seek`, { method: 'POST', timeoutMs: 30000, body: JSON.stringify({ server_id: sessions[index].server_id, session_id: sessions[index].session_id, seconds }) });
+          showToast(`已在 ${sessions[index].client || sessions[index].device_name || '媒体播放器'} 跳转到 ${timestamp.textContent}`);
+        }
+      } catch (error) { showToast(error.message, 'error'); }
+      return;
+    }
+    const like = event.target.closest('#task-comments [data-comment-like]');
+    if (like && current && !like.disabled) {
+      const active = current;
+      const liked = like.getAttribute('aria-pressed') !== 'true';
+      like.disabled = true;
+      try {
+        await window.JavspCommunity.requireIdentity();
+        const data = await window.JavspCommunity.withChallenge('like', (turnstile_token) => {
+          if (active !== current) return Promise.reject(new Error('评论窗口已关闭'));
+          const payload = { liked }; if (turnstile_token) payload.turnstile_token = turnstile_token;
+          return request(active, `/api/comments/${encodeURIComponent(like.dataset.commentLike)}/like`, { method: 'POST', body: JSON.stringify(payload) });
+        });
+        if (active !== current) return;
+        like.setAttribute('aria-pressed', String(data.liked));
+        like.textContent = `${data.liked ? '已赞' : '点赞'} · ${data.likes}`;
+      } catch (error) { if (active === current) window.alert(error.message); }
+      finally { like.disabled = false; }
+      return;
+    }
+    const button = event.target.closest('#task-comments [data-comment-report]');
+    const active = current;
+    if (!button || !active || button.disabled) return;
+    const reason = window.prompt('请简要说明举报原因（最多 300 字）');
+    if (!reason?.trim()) return;
+    if ([...reason.trim()].length > 300) { window.alert('举报原因不能超过 300 字。'); return; }
+    button.disabled = true;
+    try {
+      await window.JavspCommunity.withChallenge('report', (turnstile_token) => {
+        if (active !== current) return Promise.reject(new Error('评论窗口已关闭'));
+        const payload = { reason: reason.trim() }; if (turnstile_token) payload.turnstile_token = turnstile_token;
+        return request(active, `/api/comments/${encodeURIComponent(button.dataset.commentReport)}/reports`, { method: 'POST', body: JSON.stringify(payload) });
+      });
+      if (active === current) button.textContent = '已举报';
+    } catch (error) { button.disabled = false; if (active === current) window.alert(error.message); }
+  });
+  return { open, close };
+})();
+
+function formatLocalDateTime(value) {
+  const date = value ? new Date(value) : null;
+  return date && !Number.isNaN(date.getTime()) ? date.toLocaleString() : '';
+}
+
+const privacyMode = $('#privacy-mode');
+if (privacyMode) {
+  privacyMode.checked = state.privacyMode;
+  privacyMode.addEventListener('change', () => {
+    state.privacyMode = privacyMode.checked;
+    document.documentElement.dataset.privacyMode = state.privacyMode ? '1' : '0';
+    try { localStorage.setItem('javsp-web.privacy-mode', state.privacyMode ? '1' : '0'); } catch (_) {}
+  });
+}
+
+$('#task-detail-dialog')?.addEventListener('close', () => { state.activeTaskDetail = null; state.taskMetadataEditing = false; window.JavspComments?.close(); });
+
+document.addEventListener('pointerdown', (event) => {
+  state.taskDetailLogSelecting = Boolean(event.target.closest('#task-detail-content .task-log'));
+});
+document.addEventListener('pointerup', () => {
+  state.taskDetailLogSelecting = false;
+});

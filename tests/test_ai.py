@@ -1,0 +1,713 @@
+import copy
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+from fastapi.testclient import TestClient
+
+# 本模块在 unittest discover 的字母序里最先导入。storage 会在首次导入时按环境变量
+# 固定数据目录路径，因此必须在导入 movsp 之前指向临时目录，否则整套测试可能
+# 触发 server 启动流程并改写正在运行的真实 data/（恢复中断任务等）。
+os.environ.setdefault('MOVSP_DATA_DIR', str(Path(tempfile.gettempdir()) / 'javsp-web-testdata'))
+
+from movsp import ai, ai_router, ai_tools, storage, tasks
+
+
+def tool_call(name, arguments, identifier="call-1"):
+    return {"role": "assistant", "content": "", "tool_calls": [
+        {"id": identifier, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+    ]}
+
+
+class AITests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        old = storage.DATA_DIR
+        for name, value in list(vars(storage).items()):
+            if isinstance(value, Path) and value.is_relative_to(old):
+                self.enterContext(patch.object(storage, name, self.root / value.relative_to(old)))
+        with patch("threading.Thread.start"), patch.object(tasks, "recover_interrupted_tasks"):
+            from movsp import server
+        self.server = server
+        self.user = {"username": "ai-admin", "role": "admin"}
+        self.enterContext(patch.dict(server.app.dependency_overrides, {server.current_user: lambda: self.user}))
+        self.enterContext(patch.object(ai_router, "_active", set()))
+        self.enterContext(patch.object(ai_router, "_cancelled", set()))
+        self.client = TestClient(server.app)
+        self.addCleanup(self.client.close)
+        self.config = {"enabled": True, "provider": "compatible", "base_url": "https://llm.test/v1",
+                       "model": "test-model", "api_key": "private-ai-key", "timeout": 60}
+        ai.save_settings(ai.AISettings(**self.config))
+
+    def conversation(self, message="请创建刮削任务"):
+        with patch.object(ai_router, "_start_analysis"):
+            response = self.client.post("/api/ai/chat", json={"message": message})
+        self.assertEqual(response.status_code, 202, response.text)
+        return storage._read_json(ai_router._path(response.json()["id"]), None)
+
+    def run_reply(self, conversation, replies):
+        with patch.object(ai, "complete", side_effect=replies):
+            ai_router._run(conversation, self.config)
+        return self.client.get("/api/ai/conversations/" + conversation["id"]).json()
+
+    def test_settings_key_preserved_cleared_and_not_returned(self):
+        response = self.client.get("/api/ai/settings")
+        self.assertTrue(response.json()["has_api_key"])
+        self.assertNotIn("private-ai-key", response.text)
+        update = dict(self.config, model="another", api_key="")
+        response = self.client.put("/api/ai/settings", json=update)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(ai.settings(True)["api_key"], "private-ai-key")
+        update["clear_api_key"] = True
+        self.client.put("/api/ai/settings", json=update)
+        self.assertFalse(ai.settings()["has_api_key"])
+
+    def test_admin_only_and_owner_checks(self):
+        conversation = self.conversation()
+        self.user["username"] = "other-admin"
+        self.assertEqual(self.client.get("/api/ai/conversations/" + conversation["id"]).status_code, 404)
+        self.user["role"] = "operator"
+        for path in ("/api/ai/settings", "/api/ai/skills"):
+            self.assertEqual(self.client.get(path).status_code, 403)
+        self.assertEqual(self.client.post("/api/ai/chat", json={"message": "test"}).status_code, 403)
+
+    def test_advanced_settings_persist_and_validate_merged_limits(self):
+        update = dict(self.config, context_tokens=32768, max_output_tokens=2048, temperature=.2,
+                      history_messages=8, max_rounds=3, max_tool_calls=4, search_enabled=False,
+                      search_results=5, search_pages=2, search_timeout=10, search_page_chars=3000)
+        response = self.client.put('/api/ai/settings', json=update)
+        self.assertEqual(response.status_code, 200, response.text)
+        for key in ('context_tokens', 'max_output_tokens', 'temperature', 'history_messages', 'max_rounds', 'search_enabled'):
+            self.assertEqual(response.json()[key], update[key])
+        self.client.put('/api/ai/settings', json={'model': 'changed'})
+        self.assertEqual(ai.settings()['context_tokens'], 32768)
+        self.assertEqual(self.client.put('/api/ai/settings', json={'max_output_tokens': 32768, 'api_key': 'hidden-value'}).status_code, 400)
+        response = self.client.put('/api/ai/settings', json={'max_output_tokens': 32768, 'api_key': 'hidden-value'})
+        self.assertNotIn('hidden-value', response.text)
+        self.assertEqual(self.client.put('/api/ai/settings', json={'search_enabled': True, 'search_provider': 'searxng'}).status_code, 400)
+
+    def test_disabled_search_is_not_advertised_or_executed(self):
+        conversation = self.conversation()
+        replies = [tool_call('web_search', {'query': 'test'}), {'role': 'assistant', 'content': '搜索未启用'}]
+        with patch.object(ai, 'complete', side_effect=replies) as complete, patch.object(ai_tools, 'execute') as execute:
+            ai_router._run(conversation, self.config | {'search_enabled': False})
+        execute.assert_not_called()
+        names = [item['function']['name'] for item in complete.call_args.args[2]]
+        self.assertNotIn('web_search', names)
+        self.assertNotIn('ai_lookup', names)
+        self.assertNotIn('read_webpage', names)
+        self.assertEqual(conversation['steps'][0]['status'], 'failed')
+
+    def test_webpage_tool_is_available_and_dispatched_without_write_action(self):
+        from movsp import ai_web
+        conversation = self.conversation('读取 https://example.com/search')
+        replies = [tool_call('read_webpage', {'url': 'https://example.com/search'}),
+                   {'role': 'assistant', 'content': '已读取页面'}]
+        with patch.object(ai, 'complete', side_effect=replies) as complete, patch.object(ai_web, 'read_webpage', return_value={'html': '<h1>测试</h1>'}) as read:
+            ai_router._run(conversation, self.config)
+        read.assert_called_once_with(url='https://example.com/search', offset=0, selector='', use_cookiecloud=True)
+        self.assertIn('read_webpage', [tool['function']['name'] for tool in complete.call_args.args[2]])
+        self.assertFalse(conversation['actions'])
+        self.assertEqual(conversation['steps'][0]['status'], 'completed')
+
+    def test_disabled_search_rejects_fabricated_webpage_call(self):
+        conversation = self.conversation()
+        replies = [tool_call('read_webpage', {'url': 'https://example.com'}), {'role': 'assistant', 'content': '联网已关闭'}]
+        with patch.object(ai, 'complete', side_effect=replies), patch.object(ai_tools, 'execute') as execute:
+            ai_router._run(conversation, self.config | {'search_enabled': False})
+        execute.assert_not_called()
+        self.assertEqual(conversation['steps'][0]['status'], 'failed')
+
+    def test_followup_includes_real_previous_tool_evidence(self):
+        conversation = self.conversation('上次网页读取结果是什么？')
+        conversation['steps'] = [{'id': 'previous-call', 'turn_id': 'previous-turn', 'tool': 'read_webpage',
+                                  'status': 'completed', 'result': '{"access_status":"login_or_permission_required"}'}]
+        with patch.object(ai, 'complete', return_value={'role': 'assistant', 'content': '上次页面提示需要登录'}) as complete:
+            ai_router._run(conversation, self.config)
+        messages = complete.call_args.args[1]
+        evidence = next(item['content'] for item in messages if 'previous-call' in str(item['content']))
+        self.assertIn('login_or_permission_required', evidence)
+        self.assertIn('本轮再次调用', evidence)
+
+    def test_webpage_calls_within_one_turn_share_session_and_close_afterwards(self):
+        from movsp import ai_web
+        conversation = self.conversation('读取搜索页和详情页')
+        replies = [tool_call('read_webpage', {'url': 'https://example.com/search'}),
+                   tool_call('read_webpage', {'url': 'https://example.com/thread'}, identifier='call-2'),
+                   {'role': 'assistant', 'content': '已读取'}]
+        sessions = []
+        def read(**kwargs):
+            sessions.append(ai_web._session.get())
+            return {'html': '<p>result</p>'}
+        with patch.object(ai, 'complete', side_effect=replies), patch.object(ai_web, 'read_webpage', side_effect=read):
+            ai_router._run(conversation, self.config)
+        self.assertEqual(len(sessions), 2)
+        self.assertIsNotNone(sessions[0])
+        self.assertIs(sessions[0], sessions[1])
+        self.assertIsNone(ai_web._session.get())
+
+    def test_configured_round_limit_and_history_count(self):
+        conversation = self.conversation()
+        conversation['turns'] = [{'role': 'user', 'content': 'old'}, {'role': 'assistant', 'content': 'old reply'},
+                                 {'role': 'user', 'content': 'new'}]
+        with patch.object(ai, 'summarize', return_value='旧对话摘要') as summarize, patch.object(ai, 'complete', return_value=tool_call('list_presets', {})) as complete, patch.object(ai_tools, 'execute', return_value=[]):
+            ai_router._run(conversation, self.config | {'max_rounds': 1, 'history_messages': 2})
+        self.assertEqual(complete.call_count, 1)
+        summarize.assert_called_once()
+        self.assertEqual(conversation['context_summary'], {'through': 2, 'text': '旧对话摘要'})
+        self.assertNotIn('old', [message['content'] for message in complete.call_args.args[1]])
+        self.assertEqual(conversation['status'], 'failed')
+
+    def test_search_test_uses_unsaved_settings_without_saving(self):
+        from movsp import ai_scrape
+        with patch.object(ai_scrape, 'search_web', return_value=[{'title': 'result'}]) as search:
+            result = self.client.post('/api/ai/test-search', json={'search_results': 4})
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(search.call_args.kwargs['config']['search_results'], 4)
+        self.assertEqual(ai.settings()['search_results'], 8)
+
+    def test_models_use_unsaved_connection_and_saved_key_without_saving(self):
+        before = ai.settings(True)
+        with patch.object(ai, 'list_models', return_value=['model-a']) as fetch:
+            response = self.client.post('/api/ai/models', json={'base_url': 'https://new.test/v1', 'model': ''})
+        self.assertEqual(response.json(), {'models': ['model-a']})
+        self.assertEqual(fetch.call_args.args[0]['base_url'], 'https://new.test/v1')
+        self.assertEqual(fetch.call_args.args[0]['api_key'], 'private-ai-key')
+        self.assertEqual(ai.settings(True), before)
+        with patch.object(ai, 'list_models', return_value=['model-a']) as fetch:
+            self.client.post('/api/ai/models', json={'api_key': 'temporary-key'})
+        self.assertEqual(fetch.call_args.args[0]['api_key'], 'temporary-key')
+        with patch.object(ai, 'list_models', return_value=['model-a']) as fetch:
+            self.client.post('/api/ai/models', json={'clear_api_key': True})
+        self.assertEqual(fetch.call_args.args[0]['api_key'], '')
+        self.user['role'] = 'operator'
+        with patch.object(ai, 'list_models') as fetch:
+            self.assertEqual(self.client.post('/api/ai/models', json={}).status_code, 403)
+        fetch.assert_not_called()
+
+    def test_summary_is_incremental_preserves_transcript_and_tool_evidence(self):
+        conversation = self.conversation('新问题')
+        old = [{'id': 'u1', 'role': 'user', 'content': '保留预设'},
+               {'id': 'a1', 'role': 'assistant', 'content': '等待确认'}]
+        conversation['turns'] = old + conversation['turns']
+        conversation['steps'] = [{'turn_id': 'a1', 'tool': 'list_presets', 'result': '真实资料', 'status': 'completed'}]
+        with patch.object(ai, 'summarize', return_value='保留预设，未执行') as summarize, patch.object(ai, 'complete', return_value={'role': 'assistant', 'content': '答复'}) as complete:
+            ai_router._run(conversation, self.config | {'history_messages': 2})
+        self.assertEqual(conversation['turns'][:2], old)
+        self.assertEqual(summarize.call_args.args[1]['tools'][0]['result'], '真实资料')
+        self.assertIn('未执行', json.dumps(complete.call_args.args[1], ensure_ascii=False))
+        self.assertFalse(conversation['actions'])
+        conversation['turns'].append({'id': 'u3', 'role': 'user', 'content': '继续'})
+        with patch.object(ai, 'summarize', return_value='增量摘要') as summarize, patch.object(ai, 'complete', return_value={'role': 'assistant', 'content': '继续答复'}):
+            ai_router._run(conversation, self.config | {'history_messages': 2})
+        self.assertEqual(summarize.call_args.args[2], '保留预设，未执行')
+        self.assertEqual(summarize.call_args.args[1]['turns'][0]['content'], '新问题')
+        self.assertEqual(conversation['context_summary']['through'], 4)
+
+    def test_summary_failure_or_stop_keeps_history_and_does_not_execute(self):
+        for stop in (False, True):
+            with self.subTest(stop=stop):
+                conversation = self.conversation('继续')
+                conversation['turns'] = [{'role': 'user', 'content': 'old'}, {'role': 'assistant', 'content': 'reply'}] + conversation['turns']
+                def summarize(*args):
+                    if stop:
+                        ai_router._cancelled.add(conversation['id'])
+                        args[3]()
+                    raise ai.AIError('摘要服务不可用')
+                with patch.object(ai, 'summarize', side_effect=summarize), patch.object(ai, 'complete') as complete, patch.object(ai_tools, 'execute') as execute:
+                    ai_router._run(conversation, self.config | {'history_messages': 2})
+                complete.assert_not_called()
+                execute.assert_not_called()
+                self.assertNotIn('context_summary', conversation)
+                self.assertEqual(conversation['turns'][0]['content'], 'old')
+                self.assertEqual(conversation['status'], 'stopped' if stop else 'failed')
+
+    def test_long_conversation_can_continue_past_old_limit(self):
+        conversation = self.conversation()
+        conversation['turns'] = [{'role': 'user' if i % 2 == 0 else 'assistant', 'content': str(i)} for i in range(40)]
+        conversation['status'] = 'completed'
+        ai_router._save(conversation)
+        with patch.object(ai_router, '_start_analysis'):
+            response = self.client.post('/api/ai/chat', json={'conversation_id': conversation['id'], 'message': '继续'})
+        self.assertEqual(response.status_code, 202)
+
+    def test_prompt_defaults_for_legacy_settings_and_round_trip(self):
+        storage._write_json(storage.DATA_DIR / 'ai-settings.json', self.config)
+        settings = self.client.get('/api/ai/settings').json()
+        self.assertEqual(settings['system_prompt'], ai.DEFAULT_SYSTEM_PROMPT)
+        self.assertEqual(settings['default_system_prompt'], ai.DEFAULT_SYSTEM_PROMPT)
+        custom = '先说最重要的原因，再给一条处理建议。'
+        result = self.client.put('/api/ai/settings', json=self.config | {'system_prompt': custom}).json()
+        self.assertEqual(result['system_prompt'], custom)
+        self.assertEqual(self.client.get('/api/ai/settings').json()['system_prompt'], custom)
+        saved = storage._read_json(storage.DATA_DIR / 'ai-settings.json', {})
+        self.assertEqual(saved['system_prompt'], custom)
+        self.assertNotIn('default_system_prompt', saved)
+        self.client.put('/api/ai/settings', json=self.config | {'model': 'updated-model'})
+        self.assertEqual(ai.settings(True)['system_prompt'], custom)
+        self.client.put('/api/ai/settings', json=self.config | {'system_prompt': '  '})
+        self.assertEqual(ai.settings(True)['system_prompt'], ai.DEFAULT_SYSTEM_PROMPT)
+        self.assertEqual(self.client.put('/api/ai/settings', json=self.config | {'system_prompt': '字' * 12001}).status_code, 422)
+
+    def test_prompt_reaches_model_and_existing_conversation_uses_new_setting(self):
+        conversation = self.conversation('分析失败原因')
+        with patch.object(ai, 'complete', return_value={'role': 'assistant', 'content': '已检查'}) as complete:
+            ai_router._run(conversation, ai.settings(True))
+        prompt = complete.call_args.args[1][0]['content']
+        self.assertIn(ai.DEFAULT_SYSTEM_PROMPT, prompt)
+        self.assertIn('必须如实告诉用户点击确认', prompt)
+        custom = '请优先描述分类匹配问题。'
+        self.client.put('/api/ai/settings', json=self.config | {'system_prompt': custom})
+        with patch.object(ai_router, '_start_analysis') as start:
+            response = self.client.post('/api/ai/chat', json={'conversation_id': conversation['id'], 'message': '继续分析'})
+        self.assertEqual(response.status_code, 202)
+        pending, config = start.call_args.args
+        self.assertEqual(config['system_prompt'], custom)
+        with patch.object(ai, 'complete', return_value={'role': 'assistant', 'content': '已分析'}) as complete:
+            ai_router._run(pending, config)
+        prompt = complete.call_args.args[1][0]['content']
+        self.assertIn(custom, prompt)
+        self.assertNotIn(ai.DEFAULT_SYSTEM_PROMPT, prompt)
+        self.assertIn('必须如实告诉用户点击确认', prompt)
+
+    def test_action_is_not_executed_until_confirmed_and_only_once(self):
+        conversation = self.conversation()
+        with patch.object(self.server, "start_task", return_value={"count": 1, "scan": True}) as create:
+            result = self.run_reply(conversation, [tool_call("create_task", {"input_directory": "/video/example"}),
+                                                   {"role": "assistant", "content": "请检查并确认创建任务。"}])
+            create.assert_not_called()
+            action = result["actions"][0]
+            self.assertNotIn("snapshot", action)
+            path = f"/api/ai/conversations/{conversation['id']}/actions/{action['id']}"
+            self.assertEqual(self.client.post(path, json={"approve": True}).status_code, 200)
+            self.assertEqual(create.call_count, 1)
+            self.assertEqual(self.client.post(path, json={"approve": True}).status_code, 409)
+            self.assertEqual(create.call_count, 1)
+
+    def test_rejected_action_never_runs(self):
+        conversation = self.conversation()
+        result = self.run_reply(conversation, [tool_call("create_task", {"input_directory": "/video/example"}),
+                                               {"role": "assistant", "content": "待确认"}])
+        action = result["actions"][0]
+        with patch.object(self.server, "start_task") as create:
+            path = f"/api/ai/conversations/{conversation['id']}/actions/{action['id']}"
+            self.assertEqual(self.client.post(path, json={"approve": False}).json()["actions"][0]["status"], "rejected")
+            self.assertEqual(self.client.post(path, json={"approve": True}).status_code, 409)
+            create.assert_not_called()
+
+    def test_tool_read_results_redacted_before_sent_to_llm(self):
+        conversation = self.conversation("读取预设")
+        replies = [tool_call("get_preset", {"preset_id": "default"}), {"role": "assistant", "content": "完成"}]
+        seen = []
+        def complete(config, messages, tools, on_update=None):
+            seen.append(copy.deepcopy(messages))
+            return replies.pop(0)
+        with patch.object(ai_tools, "execute", return_value={"api_key": "another-key", "nested": {"password": "secret"}}), patch.object(ai, "complete", side_effect=complete):
+            ai_router._run(conversation, self.config)
+        sent = json.dumps(seen, ensure_ascii=False)
+        self.assertNotIn("another-key", sent)
+        self.assertNotIn('"secret"', sent)
+        self.assertIn("已隐藏", sent)
+
+    def test_unknown_tool_is_not_dispatched(self):
+        conversation = self.conversation()
+        with patch.object(ai_tools, "execute") as execute:
+            result = self.run_reply(conversation, [tool_call("shell", {"command": "echo unsafe"}), {"role": "assistant", "content": "无法执行"}])
+            execute.assert_not_called()
+        self.assertEqual(result["steps"][0]["status"], "failed")
+
+    def test_restart_marks_running_action_unknown(self):
+        conversation = self.conversation()
+        conversation["actions"] = [{"id": "action", "status": "executing", "tool": "create_task", "arguments": {}}]
+        ai_router._save(conversation)
+        ai_router._active.clear()
+        result = self.client.get("/api/ai/conversations/" + conversation["id"]).json()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["actions"][0]["status"], "unknown")
+
+    def test_loop_is_bounded_and_errors_do_not_expose_key(self):
+        conversation = self.conversation()
+        with patch.object(ai_tools, "execute", return_value=[]):
+            result = self.run_reply(conversation, [tool_call("list_presets", {})] * 6)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(result["steps"]), 6)
+        conversation = self.conversation()
+        result = self.run_reply(conversation, [ai.AIError("failed private-ai-key")])
+        self.assertNotIn("private-ai-key", json.dumps(result))
+
+    def test_skills_catalog_and_path_validation(self):
+        names = {item['name'] for item in self.client.get("/api/ai/skills").json()}
+        self.assertTrue({'javsp-scrape', 'javsp-translate', 'javsp-settings'}.issubset(names))
+        with self.assertRaises(ValueError):
+            ai_tools.validate_arguments("read_skill", {"name": "../../config"})
+
+    def test_conversation_management_persistence_and_ownership(self):
+        first = self.conversation("第一段对话")
+        self.run_reply(first, [{"role": "assistant", "content": "完成"}])
+        second = self.conversation("第二段对话")
+        self.run_reply(second, [{"role": "assistant", "content": "完成"}])
+        items = self.client.get('/api/ai/conversations').json()
+        self.assertEqual({item['title'] for item in items}, {'第一段对话', '第二段对话'})
+        self.assertNotIn('turns', items[0])
+        path = '/api/ai/conversations/' + first['id']
+        self.assertEqual(self.client.patch(path, json={'title': '新标题'}).status_code, 200)
+        self.assertEqual(self.client.get(path).json()['title'], '新标题')
+        self.assertEqual(self.client.patch(path, json={'title': '   '}).status_code, 400)
+        self.assertEqual(self.client.patch(path, json={'title': '长' * 81}).status_code, 422)
+        self.user['username'] = 'another-admin'
+        self.assertEqual(self.client.get('/api/ai/conversations').json(), [])
+        self.assertEqual(self.client.patch(path, json={'title': '不能修改'}).status_code, 404)
+        self.assertEqual(self.client.delete(path).status_code, 404)
+        self.assertEqual(self.client.post(path + '/stop').status_code, 404)
+        self.user['username'] = 'ai-admin'
+        self.assertEqual(self.client.delete(path).status_code, 200)
+        self.assertEqual(self.client.get(path).status_code, 404)
+        self.assertEqual(len(self.client.get('/api/ai/conversations').json()), 1)
+
+    def test_running_conversation_cannot_be_deleted_or_renamed(self):
+        conversation = self.conversation()
+        path = '/api/ai/conversations/' + conversation['id']
+        self.assertEqual(self.client.delete(path).status_code, 409)
+        self.assertEqual(self.client.patch(path, json={'title': '新标题'}).status_code, 409)
+
+    def test_stream_progress_persisted_before_completion(self):
+        conversation = self.conversation()
+        def complete(config, messages, tools, on_update):
+            on_update('', '模型提供的分析 private-ai-key')
+            snapshot = self.client.get('/api/ai/conversations/' + conversation['id']).json()
+            self.assertEqual(snapshot['status'], 'running')
+            self.assertIn('模型提供的分析', snapshot['turns'][-1]['reasoning_content'])
+            self.assertNotIn('private-ai-key', json.dumps(snapshot))
+            on_update('部分回复 private-ai-', '')
+            self.assertNotIn('private-ai-', conversation['turns'][-1]['content'])
+            on_update('部分回复', '模型提供的分析')
+            return {'role': 'assistant', 'content': '完整回复', 'reasoning_content': '模型提供的分析'}
+        with patch.object(ai, 'complete', side_effect=complete):
+            ai_router._run(conversation, self.config)
+        result = self.client.get('/api/ai/conversations/' + conversation['id']).json()
+        self.assertEqual(result['turns'][-1]['content'], '完整回复')
+        self.assertEqual(result['turns'][-1]['status'], 'completed')
+
+    def test_stop_preserves_partial_reply_and_prevents_tools(self):
+        conversation = self.conversation()
+        def complete(config, messages, tools, on_update):
+            on_update('已收到的回复', '')
+            self.client.post('/api/ai/conversations/' + conversation['id'] + '/stop')
+            return tool_call('list_presets', {})
+        with patch.object(ai, 'complete', side_effect=complete), patch.object(ai_tools, 'execute') as execute:
+            ai_router._run(conversation, self.config)
+            execute.assert_not_called()
+        self.assertEqual(conversation['status'], 'stopped')
+        self.assertEqual(conversation['turns'][-1]['content'], '已收到的回复')
+        self.assertNotIn(conversation['id'], ai_router._active)
+
+    def test_tool_history_retained_and_attached_to_reply(self):
+        conversation = self.conversation()
+        with patch.object(ai_tools, 'execute', return_value=[]):
+            first = self.run_reply(conversation, [tool_call('list_presets', {}), {'role': 'assistant', 'content': '已查看'}])
+        turn_id = first['turns'][-1]['id']
+        self.assertEqual(first['steps'][0]['turn_id'], turn_id)
+        with patch.object(ai_router, '_start_analysis'):
+            response = self.client.post('/api/ai/chat', json={'conversation_id': conversation['id'], 'message': '继续'})
+        second = response.json()
+        self.assertEqual(second['steps'][0]['turn_id'], turn_id)
+        saved = storage._read_json(ai_router._path(conversation['id']), None)
+        self.run_reply(saved, [{'role': 'assistant', 'content': '下一次回复'}])
+        self.assertEqual(len(saved['turns']), 4)
+
+    def test_legacy_conversation_has_title_and_turn_ids(self):
+        conversation = self.conversation('旧对话')
+        conversation.pop('title')
+        conversation['turns'][0].pop('id')
+        ai_router._save(conversation)
+        result = self.client.get('/api/ai/conversations/' + conversation['id']).json()
+        self.assertEqual(result['title'], '旧对话')
+        self.assertEqual(result['turns'][0]['id'], 'legacy-0')
+
+    def test_skills_add_edit_delete_and_restore_persist(self):
+        original_names = {item['name'] for item in self.client.get('/api/ai/skills').json()}
+        self.assertIn('javsp-translate', original_names)
+        source = '---\nname: local-rule\ndescription: Test rule\n---\n\nKeep verified metadata.\n'
+        self.assertEqual(self.client.put('/api/ai/skills', json={'source': source}).status_code, 200)
+        self.assertEqual(self.client.get('/api/ai/skills/local-rule').json()['source'], source)
+        self.assertEqual({item['name'] for item in self.client.get('/api/ai/skills').json()}, original_names | {'local-rule'})
+        edited = source.replace('Keep verified metadata.', 'Preserve existing fields.')
+        self.client.put('/api/ai/skills', json={'source': edited})
+        self.assertIn('Preserve existing', ai_tools.execute('read_skill', {'name': 'local-rule'})['instructions'])
+        self.assertEqual(self.client.delete('/api/ai/skills/local-rule').status_code, 200)
+        self.assertEqual(self.client.get('/api/ai/skills/local-rule').status_code, 404)
+        self.client.delete('/api/ai/skills/javsp-scrape')
+        self.assertNotIn('javsp-scrape', [item['name'] for item in ai_tools.skill_catalog()])
+        self.client.post('/api/ai/skills/restore-defaults')
+        self.assertIn('javsp-scrape', [item['name'] for item in ai_tools.skill_catalog()])
+        self.assertEqual(self.client.put('/api/ai/skills', json={'source': 'not a skill'}).status_code, 400)
+
+    def test_metadata_preview_preserves_fields_and_tracks_changes(self):
+        task = {'status': 'succeeded', 'progress': {'metadata': {'dvdid': 'TEST-001', 'title': 'old', 'actress': ['Actor']}}}
+        with patch.object(self.server, 'task', return_value=task):
+            proposal = ai_tools.prepare_action('update_metadata', {'task_id': 'task', 'title': 'new'})
+            self.assertEqual(proposal['arguments']['actress'], ['Actor'])
+            self.assertEqual(proposal['arguments']['dvdid'], 'TEST-001')
+            task['progress']['metadata']['title'] = 'changed'
+            updated = ai_tools.prepare_action('update_metadata', proposal['arguments'])
+            self.assertNotEqual(proposal['snapshot'], updated['snapshot'])
+
+    def test_changed_preset_requires_new_preview(self):
+        preset = {"id": "default", "name": "默认", "form_values": {"crawler": {"required_keys": ["cover", "title"]}}, "task_concurrency": 1}
+        with patch.object(ai_tools, "_preset", return_value=preset), patch.object(self.server, "_prepare_preset"):
+            conversation = self.conversation()
+            result = self.run_reply(conversation, [tool_call("change_preset", {"preset_id": "default", "changes": {"crawler": {"required_keys": ["title"]}}}), {"role": "assistant", "content": "待确认"}])
+            action = result["actions"][0]
+            preset["name"] = "其他修改"
+            path = f"/api/ai/conversations/{conversation['id']}/actions/{action['id']}"
+            with patch.object(self.server, "update_preset") as update:
+                self.assertEqual(self.client.post(path, json={"approve": True}).status_code, 409)
+                update.assert_not_called()
+
+    def test_preset_patch_preserves_existing_keys(self):
+        preset = {"name": "默认", "form_values": {"network": {"proxy_server": "http://localhost:7890"}, "translator": {"engine": {"api_key": "existing-secret"}}, "summarizer": {"move_files": True}}, "task_concurrency": 2}
+        with patch.object(ai_tools, "_preset", return_value=preset), patch.object(self.server, "update_preset", return_value={"id": "default", "name": "默认"}) as update:
+            ai_tools.execute("change_preset", {"preset_id": "default", "changes": {"summarizer": {"move_files": False}}}, confirmed=True)
+        updated = update.call_args.args[1]
+        self.assertEqual(updated.form["translator"]["engine"]["api_key"], "existing-secret")
+        self.assertFalse(updated.form["summarizer"]["move_files"])
+        self.assertEqual(updated.task_concurrency, 2)
+
+
+class ProviderTests(unittest.TestCase):
+    def setUp(self):
+        self.config = dict(provider="compatible", base_url="https://llm.test/v1", model="demo", api_key="private-key", timeout=60)
+
+    def response(self, data, status=200):
+        response = Mock()
+        response.status_code = status
+        response.iter_content.return_value = [json.dumps(data).encode()]
+        context = Mock()
+        context.__enter__ = Mock(return_value=response)
+        context.__exit__ = Mock(return_value=False)
+        return context
+
+    def test_openai_tool_protocol_and_no_redirect(self):
+        raw = {"choices": [{"message": tool_call("list_presets", {})}]}
+        with patch.object(ai.requests, "post", return_value=self.response(raw)) as post:
+            result = ai.complete(self.config, [{"role": "user", "content": "test"}], [{"type": "function"}])
+        self.assertEqual(result["tool_calls"][0]["function"]["name"], "list_presets")
+        self.assertEqual(post.call_args.args[0], "https://llm.test/v1/chat/completions")
+        self.assertFalse(post.call_args.kwargs["allow_redirects"])
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer private-key")
+
+    def test_anthropic_multiple_tool_results(self):
+        messages = [{"role": "system", "content": "rules"}, {"role": "user", "content": "test"}, tool_call("list_presets", {}),
+                    {"role": "tool", "tool_call_id": "call-1", "content": "[]"},
+                    {"role": "tool", "tool_call_id": "call-2", "content": "[]"}]
+        raw = {"content": [{"type": "text", "text": "完成"}]}
+        with patch.object(ai.requests, "post", return_value=self.response(raw)) as post:
+            result = ai.complete(self.config | {"provider": "anthropic"}, messages)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["system"], "rules")
+        self.assertEqual(len(payload["messages"][-1]["content"]), 2)
+        self.assertEqual(result["content"], "完成")
+        self.assertNotIn("Authorization", post.call_args.kwargs["headers"])
+
+    def test_upstream_error_body_not_exposed(self):
+        with patch.object(ai.requests, "post", return_value=self.response({"error": "private-key"}, 401)):
+            with self.assertRaises(ai.AIError) as raised:
+                ai.complete(self.config, [])
+        self.assertNotIn("private-key", str(raised.exception))
+        self.assertIn("401", str(raised.exception))
+
+    def test_truncated_or_invalid_json_rejected(self):
+        for data in ({"choices": []}, {"choices": [{"finish_reason": "length", "message": {"content": "half"}}]}, {"choices": [{"message": {"content": None}}]}):
+            with self.subTest(data=data), patch.object(ai.requests, "post", return_value=self.response(data)):
+                with self.assertRaises(ai.AIError):
+                    ai.complete(self.config, [])
+
+    def test_invalid_endpoint_rejected(self):
+        for url in ("file:///etc/passwd", "https://user:pass@host/v1", "https://host/v1?api_key=secret"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                ai.AISettings(base_url=url)
+
+    def test_output_and_temperature_passed_to_both_protocols(self):
+        for provider in ('compatible', 'anthropic'):
+            raw = {'content': [{'type': 'text', 'text': 'done'}]} if provider == 'anthropic' else {'choices': [{'message': {'content': 'done'}}]}
+            with patch.object(ai.requests, 'post', return_value=self.response(raw)) as post:
+                ai.complete(self.config | {'provider': provider, 'max_output_tokens': 512, 'temperature': .2}, [])
+            self.assertEqual(post.call_args.kwargs['json']['max_tokens'], 512)
+            self.assertEqual(post.call_args.kwargs['json']['temperature'], .2)
+
+    def test_context_estimates_tokens_without_silently_deleting_history(self):
+        current = tool_call('list_presets', {})
+        messages = [{'role': 'system', 'content': 'rules'}, {'role': 'user', 'content': 'old' * 4000},
+                    {'role': 'assistant', 'content': 'old answer'}, {'role': 'user', 'content': 'current'}, current,
+                    {'role': 'tool', 'tool_call_id': 'call-1', 'content': '[]'}]
+        result = ai.fit_context({'context_tokens': 8192, 'max_output_tokens': 512}, messages)
+        self.assertEqual(result, messages)
+        self.assertEqual(len(messages), 6)
+        with self.assertRaises(ai.AIError):
+            ai.fit_context({'context_tokens': 8192, 'max_output_tokens': 512}, [messages[0], {'role': 'user', 'content': '中文' * 4000}])
+
+    def stream_response(self, events):
+        response = Mock(status_code=200, headers={'Content-Type': 'text/event-stream; charset=utf-8'})
+        response.iter_lines.return_value = [b'data: ' + (json.dumps(event).encode() if isinstance(event, dict) else event) for event in events]
+        context = Mock()
+        context.__enter__ = Mock(return_value=response)
+        context.__exit__ = Mock(return_value=False)
+        return context
+
+    def test_model_list_protocols_and_endpoint_normalization(self):
+        for provider, base, endpoint, data in (
+            ('compatible', 'https://llm.test/v1/chat/completions', 'https://llm.test/v1/models', {'data': [{'id': 'z'}, {'id': 'a'}, {'id': 'a'}, {'id': None}]}),
+            ('deepseek', 'https://llm.test', 'https://llm.test/models', {'data': [{'id': 'a'}]}),
+            ('ollama', 'http://localhost:11434', 'http://localhost:11434/api/tags', {'models': [{'name': 'a'}]}),
+            ('ollama', 'http://localhost:11434/v1', 'http://localhost:11434/v1/models', {'data': [{'id': 'a'}]}),
+            ('anthropic', 'https://llm.test/v1/messages', 'https://llm.test/v1/models', {'data': [{'id': 'a'}]}),
+        ):
+            with self.subTest(provider=provider, base=base), patch.object(ai.requests, 'get', return_value=self.response(data)) as get:
+                names = ai.list_models(self.config | {'provider': provider, 'base_url': base, 'model': ''})
+            self.assertEqual(names[0], 'a')
+            self.assertEqual(len(names), len(set(names)))
+            self.assertEqual(get.call_args.args[0], endpoint)
+            self.assertFalse(get.call_args.kwargs['allow_redirects'])
+            headers = get.call_args.kwargs['headers']
+            self.assertEqual(headers.get('x-api-key') if provider == 'anthropic' else headers.get('Authorization'),
+                             self.config['api_key'] if provider == 'anthropic' else 'Bearer ' + self.config['api_key'])
+
+    def test_anthropic_model_pagination(self):
+        pages = [self.response({'data': [{'id': 'a'}], 'has_more': True, 'last_id': 'a'}),
+                 self.response({'data': [{'id': 'b'}], 'has_more': False})]
+        with patch.object(ai.requests, 'get', side_effect=pages) as get:
+            self.assertEqual(ai.list_models(self.config | {'provider': 'anthropic'}), ['a', 'b'])
+        self.assertEqual(get.call_args.kwargs['params'], {'after_id': 'a'})
+
+    def test_gateway_models_accept_wrapped_lists_and_names(self):
+        for data in ([{'id': 'a'}], {'models': ['a']}, {'data': {'models': [{'name': 'a'}]}}):
+            with self.subTest(data=data), patch.object(ai.requests, 'get', return_value=self.response(data)):
+                self.assertEqual(ai.list_models(self.config), ['a'])
+
+    def test_gateway_rate_limit_retries_are_bounded(self):
+        rate_limit = self.response({}, 429)
+        rate_limit.__enter__.return_value.headers = {'Retry-After': '1'}
+        with patch.object(ai.requests, 'get', side_effect=[rate_limit, self.response({'data': [{'id': 'a'}]})]) as get, patch.object(ai.time, 'sleep') as sleep:
+            self.assertEqual(ai.list_models(self.config), ['a'])
+            self.assertEqual(get.call_count, 2)
+            sleep.assert_called_once_with(1)
+        with patch.object(ai.requests, 'get', return_value=rate_limit) as get, patch.object(ai.time, 'sleep'):
+            with self.assertRaisesRegex(ai.AIError, '429'):
+                ai.list_models(self.config)
+            self.assertEqual(get.call_count, 3)
+
+    def test_models_redirect_only_within_same_origin(self):
+        redirect = self.response({}, 307)
+        redirect.__enter__.return_value.headers = {'Location': '/v1/models/'}
+        with patch.object(ai.requests, 'get', side_effect=[redirect, self.response({'data': [{'id': 'a'}]})]) as get:
+            self.assertEqual(ai.list_models(self.config), ['a'])
+            self.assertTrue(get.call_args.args[0].endswith('/v1/models/'))
+        redirect.__enter__.return_value.headers = {'Location': 'https://other.test/models'}
+        with patch.object(ai.requests, 'get', return_value=redirect) as get:
+            with self.assertRaises(ai.AIError):
+                ai.list_models(self.config)
+            self.assertEqual(get.call_count, 1)
+
+    def test_model_list_errors_do_not_expose_response_or_credentials(self):
+        for status, data in ((401, {'secret': 'private-key'}), (302, {}), (200, {'data': []}), (200, [])):
+            with self.subTest(status=status, data=data), patch.object(ai.requests, 'get', return_value=self.response(data)):
+                with self.assertRaises(ai.AIError) as error:
+                    ai.list_models(self.config)
+                self.assertNotIn('private-key', str(error.exception))
+        with patch.object(ai.requests, 'get', side_effect=ai.requests.Timeout('private-key')):
+            with self.assertRaises(ai.AIError) as error:
+                ai.list_models(self.config)
+        self.assertNotIn('private-key', str(error.exception))
+
+    def test_summary_chunks_large_input_without_recursive_compression(self):
+        config = self.config | {'context_tokens': 8192, 'max_output_tokens': 512}
+        def respond(settings, messages, **kwargs):
+            ai.fit_context(settings, messages)
+            self.assertNotIn('tools', kwargs)
+            return {'role': 'assistant', 'content': '事实摘要'}
+        with patch.object(ai, '_complete', side_effect=respond) as complete:
+            result = ai.summarize(config, {'html': '网页资料' * 6000}, '已有要求')
+        self.assertGreater(complete.call_count, 1)
+        self.assertEqual(result, '事实摘要')
+        self.assertIn('已有要求', complete.call_args_list[0].args[1][1]['content'])
+        self.assertIn('事实摘要', complete.call_args_list[1].args[1][1]['content'])
+
+    def test_compaction_keeps_user_rules_and_paired_latest_tools(self):
+        first = tool_call('read_webpage', {'url': 'https://example.com'})
+        first['anthropic_content'] = [{'type': 'tool_use', 'id': 'call-1', 'name': 'read_webpage', 'input': {}}]
+        latest = tool_call('list_presets', {}, identifier='call-2')
+        messages = [{'role': 'system', 'content': 'rules'}, {'role': 'user', 'content': '完整的当前需求'}, first,
+                    {'role': 'tool', 'tool_call_id': 'call-1', 'content': '网页' * 5000}, latest,
+                    {'role': 'tool', 'tool_call_id': 'call-2', 'content': '[]'}]
+        with patch.object(ai, 'summarize', return_value='已读取网页'):
+            fitted = ai.compact_context(self.config | {'context_tokens': 8192, 'max_output_tokens': 512}, messages)
+        self.assertEqual(fitted[:2], messages[:2])
+        self.assertEqual(fitted[-2:], messages[-2:])
+        self.assertNotIn('anthropic_content', fitted[2])
+        self.assertEqual(len(messages), 6)
+        converted = ai._anthropic_messages(fitted)
+        self.assertEqual(converted[-1]['content'][0]['tool_use_id'], 'call-2')
+
+    def test_token_estimate_handles_chinese_and_ascii(self):
+        self.assertLess(ai.estimate_tokens('abc' * 1000), 1100)
+        self.assertGreater(ai.estimate_tokens('中文' * 1000), 3900)
+
+    def test_stream_reasoning_text_and_split_tool_arguments(self):
+        events = [
+            {'choices': [{'delta': {'reasoning_content': '检查预设'}}]},
+            {'choices': [{'delta': {'content': '正在查询'}}]},
+            {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'call-1', 'function': {'name': 'get_preset', 'arguments': '{"preset_'}}]}}]},
+            {'choices': [{'delta': {'tool_calls': [{'index': 0, 'function': {'arguments': 'id":"default"}'}}]}, 'finish_reason': 'tool_calls'}]},
+            b'[DONE]',
+        ]
+        updates = []
+        with patch.object(ai.requests, 'post', return_value=self.stream_response(events)) as post:
+            result = ai.complete(self.config, [], on_update=lambda content, reasoning: updates.append((content, reasoning)))
+        self.assertTrue(post.call_args.kwargs['json']['stream'])
+        self.assertEqual(updates[0], ('', '检查预设'))
+        self.assertEqual(result['content'], '正在查询')
+        self.assertEqual(json.loads(result['tool_calls'][0]['function']['arguments']), {'preset_id': 'default'})
+
+    def test_anthropic_stream_thinking_signature_and_tool(self):
+        events = [
+            {'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'thinking', 'thinking': ''}},
+            {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'thinking_delta', 'thinking': '模型分析'}},
+            {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'signature_delta', 'signature': 'signed'}},
+            {'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'text', 'text': ''}},
+            {'type': 'content_block_delta', 'index': 1, 'delta': {'type': 'text_delta', 'text': '查询预设'}},
+            {'type': 'content_block_start', 'index': 2, 'content_block': {'type': 'tool_use', 'id': 'call-1', 'name': 'list_presets', 'input': {}}},
+            {'type': 'content_block_delta', 'index': 2, 'delta': {'type': 'input_json_delta', 'partial_json': '{}'}},
+            {'type': 'message_stop'},
+        ]
+        with patch.object(ai.requests, 'post', return_value=self.stream_response(events)):
+            result = ai.complete(self.config | {'provider': 'anthropic'}, [], on_update=Mock())
+        self.assertEqual(result['reasoning_content'], '模型分析')
+        self.assertEqual(result['content'], '查询预设')
+        converted = ai._anthropic_messages([result])
+        self.assertEqual(converted[0]['content'][0]['signature'], 'signed')
+        self.assertEqual(result['tool_calls'][0]['function']['arguments'], '{}')
+
+    def test_stream_interruption_and_truncation_fail(self):
+        for events in ([{'choices': [{'delta': {'content': '一部分'}}]}],
+                       [{'choices': [{'delta': {}, 'finish_reason': 'length'}]}],
+                       [{'error': {'message': 'private-key'}}]):
+            with self.subTest(events=events), patch.object(ai.requests, 'post', return_value=self.stream_response(events)):
+                with self.assertRaises(ai.AIError) as raised:
+                    ai.complete(self.config, [], on_update=Mock())
+                self.assertNotIn('private-key', str(raised.exception))
+
+    def test_stream_request_accepts_json_from_nonstreaming_provider(self):
+        context = self.response({'choices': [{'message': {'content': '完整回复'}}]})
+        context.__enter__.return_value.headers = {'Content-Type': 'application/json'}
+        with patch.object(ai.requests, 'post', return_value=context):
+            result = ai.complete(self.config, [], on_update=Mock())
+        self.assertEqual(result['content'], '完整回复')
+
+
+if __name__ == "__main__":
+    unittest.main()

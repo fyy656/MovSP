@@ -1,0 +1,98 @@
+import os, tempfile, unittest
+from pathlib import Path
+from unittest.mock import patch
+from fastapi.testclient import TestClient
+
+# 导入 movsp.server 会当场执行启动流程，先把数据目录指向临时位置，
+# 避免测试进程改写正在运行的真实数据。
+os.environ.setdefault('MOVSP_DATA_DIR', str(Path(tempfile.gettempdir()) / 'javsp-web-testdata'))
+
+from movsp import storage
+
+# 后台调度线程会在测试进程里打开临时目录中的 tasks.db，导致收尾删除失败。
+with patch('threading.Thread.start'):
+    from movsp import server
+
+class ProfileTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix='profile-test-')
+        self.addCleanup(directory.cleanup)
+        folder = Path(directory.name)
+        self.temp = folder
+        previous = storage.DATA_DIR
+        for name, value in list(vars(storage).items()):
+            if isinstance(value, Path) and value.is_relative_to(previous):
+                self.enterContext(patch.object(storage, name, folder / value.relative_to(previous)))
+        storage.upsert_user('alice', 'test-password', 'operator')
+        storage.upsert_user('bob', 'test-password', 'operator')
+        self.client = TestClient(server.app)
+        self.previous = dict(server.app.dependency_overrides)
+        self.addCleanup(lambda: (server.app.dependency_overrides.clear(), server.app.dependency_overrides.update(self.previous)))
+
+    def as_user(self, name):
+        server.app.dependency_overrides[server.current_user] = lambda: {'username': name, 'role': 'operator'}
+
+    def test_profile_identity_survives_name_and_login_rename_without_leaking(self):
+        self.as_user('alice')
+        first = self.client.get('/api/profile')
+        self.assertEqual(first.headers['cache-control'], 'no-store')
+        token = first.json()['comment_token']
+        self.assertGreaterEqual(len(token), 40)
+        reply = self.client.put('/api/profile', json={'display_name': '新名字', 'avatar_id': '', 'role': 'admin', 'comment_token': 'forged'})
+        self.assertEqual(reply.status_code, 200)
+        self.assertEqual(reply.json()['comment_token'], token)
+        self.assertEqual(storage.find_user('alice')['role'], 'operator')
+        self.as_user('bob')
+        self.assertNotEqual(self.client.get('/api/profile').json()['comment_token'], token)
+        self.assertNotIn(token, str(storage.list_users()))
+        storage.upsert_user('renamed', None, 'operator', old_username='alice')
+        self.as_user('renamed')
+        self.assertEqual(self.client.get('/api/profile').json()['comment_token'], token)
+
+    def test_profile_validation_and_authentication(self):
+        server.app.dependency_overrides.pop(server.current_user, None)
+        self.assertEqual(self.client.get('/api/profile').status_code, 401)
+        self.as_user('alice')
+        for body in [{'display_name':'  '}, {'display_name':'name','avatar_id':'../../private'}, {'display_name':'a'*33}]:
+            self.assertEqual(self.client.put('/api/profile', json=body).status_code, 422)
+        import json
+        catalog = json.loads((server.WEB_DIR/'assets/avatar-catalog.json').read_text(encoding='utf-8'))
+        avatar = catalog[0]['id']
+        self.assertEqual(self.client.put('/api/profile',json={'display_name':'新名字','avatar_id':avatar}).json()['avatar_id'],avatar)
+        self.assertTrue((server.WEB_DIR/'assets/avatars'/f'{avatar}.webp').is_file())
+
+    def test_community_session_is_self_only_and_never_stores_pin(self):
+        body = {'display_name':'apecme#AB12','comment_username':'apecme','avatar_id':'','comment_token':'s'*64,'pin':'123456'}
+        self.assertEqual(self.client.put('/api/profile/community',json=body).status_code,401)
+        self.as_user('alice')
+        response = self.client.put('/api/profile/community',json=body)
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.headers['cache-control'],'no-store')
+        self.assertTrue(response.json()['identity_ready'])
+        self.assertNotIn('123456',storage.USERS_FILE.read_text())
+        self.assertNotIn('s'*64,str(storage.list_users()))
+        self.as_user('bob')
+        self.assertFalse(self.client.get('/api/profile').json()['identity_ready'])
+        self.assertNotEqual(self.client.get('/api/profile').json()['comment_token'],'s'*64)
+        for change in [{'comment_token':'bad'}, {'display_name':'forged#AB12'}, {'avatar_id':'../../secret'}]:
+            self.assertEqual(self.client.put('/api/profile/community',json={**body,**change}).status_code,422)
+
+    def test_clearing_comment_session_forgets_token_for_this_account_only(self):
+        body = {'display_name':'apecme#AB12','comment_username':'apecme','avatar_id':'','comment_token':'s'*64}
+        self.assertEqual(self.client.delete('/api/profile/community').status_code,401)
+        for name in ('alice','bob'):
+            self.as_user(name)
+            self.client.put('/api/profile/community',json={**body,'comment_token':name[0]*64})
+        self.as_user('alice')
+        cleared = self.client.delete('/api/profile/community')
+        self.assertEqual(cleared.status_code,200)
+        self.assertEqual(cleared.headers['cache-control'],'no-store')
+        data = cleared.json()
+        self.assertFalse(data['identity_ready'])
+        self.assertNotEqual(data['comment_token'],'a'*64)
+        self.assertNotIn('#',data['display_name'])
+        self.assertEqual(data['comment_username'],'apecme')
+        self.as_user('bob')
+        self.assertEqual(self.client.get('/api/profile').json()['comment_token'],'b'*64)
+
+if __name__ == '__main__': unittest.main()

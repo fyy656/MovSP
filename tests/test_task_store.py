@@ -1,0 +1,743 @@
+import copy
+from collections import deque
+import concurrent.futures
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / 'vendor/JavSP'))
+
+from movsp import storage, tasks, task_store, artwork
+
+
+class TaskStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.folder = Path(self.temp.name)
+        old = storage.DATA_DIR
+        for name, value in list(vars(storage).items()):
+            if isinstance(value, Path) and value.is_relative_to(old):
+                self.enterContext(patch.object(storage, name, self.folder / value.relative_to(old)))
+        self.enterContext(patch.object(tasks, 'DATA_DIR', self.folder))
+        self.enterContext(patch.object(tasks, '_TASK_COVERS_DIR', self.folder / 'task-covers'))
+        self.enterContext(patch.object(tasks, '_logs', {}))
+        self.enterContext(patch.object(tasks, '_deleted_tasks', set()))
+        self.enterContext(patch.object(artwork, 'DATA_DIR', self.folder))
+
+    def item(self, task_id='one', status='succeeded', **kw):
+        return dict(id=task_id, created_at='2026-09-23T12:00:00+00:00', status=status,
+                    input_directory=str(self.folder / (task_id + '.mp4')), file_name=task_id,
+                    size_bytes=1024**3, log_tail=['JAVSP_PROGRESS ' + json.dumps({'stage': 'metadata', 'title': task_id, 'dvdid': 'ABC-123'})], **kw)
+
+    def client(self):
+        from fastapi.testclient import TestClient
+        with patch('threading.Thread.start'):
+            from movsp import server
+        self.server = server
+        self.enterContext(patch.dict(server.app.dependency_overrides, {server.current_user: lambda: {'username': 'test', 'role': 'admin'}}))
+        client = TestClient(server.app)
+        self.addCleanup(client.close)
+        return client
+
+    def test_library_tasks_are_visible_in_the_manual_queue(self):
+        """从媒体库发起的任务也要出现在任务队列里，否则用户看不到它在运行。"""
+        client = self.client()
+        storage.save_tasks([
+            self.item('manual-task', source='manual'),
+            self.item('library-task', status='queued', source='library'),
+        ])
+        page = client.get('/api/tasks', params={'view': 'manual', 'limit': 50}).json()
+        ids = [item['id'] for item in page['items']]
+        self.assertIn('library-task', ids)
+        self.assertIn('manual-task', ids)
+
+    def test_json_import_backup_and_deleted_history_does_not_reappear(self):
+        record = self.item()
+        content = json.dumps([record], ensure_ascii=False)
+        storage.TASKS_FILE.write_text(content, encoding='utf-8')
+        self.assertEqual(storage.load_tasks(), [record | {'source': 'manual'}])
+        self.assertEqual((self.folder / 'tasks.pre-sqlite.json').read_text(encoding='utf-8'), content)
+        self.assertTrue(storage.delete_task_record('one'))
+        task_store._ready.discard(str(storage.TASKS_DB_FILE.resolve()))
+        self.assertEqual(storage.load_tasks(), [])
+        self.assertEqual(storage.TASKS_FILE.read_text(encoding='utf-8'), content)
+
+    def test_invalid_json_does_not_mark_import_complete(self):
+        storage.TASKS_FILE.write_text('{broken', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            storage.load_tasks()
+        storage.TASKS_FILE.write_text(json.dumps([self.item()]), encoding='utf-8')
+        self.assertEqual(len(storage.load_tasks()), 1)
+
+    def test_playback_api_returns_links_and_reports_missing_items(self):
+        client = self.client()
+        storage.save_tasks([self.item()])
+        links = [{'name': 'Jellyfin', 'url': 'https://play.test/web/#/details?id=film'}]
+        with patch.object(self.server, 'playback_links', return_value=links) as resolve:
+            self.assertEqual(client.get('/api/tasks/one/playback').json(), {'links': links})
+            self.assertEqual(resolve.call_args.args[0]['id'], 'one')
+        with patch.object(self.server, 'playback_links', return_value=[]):
+            self.assertEqual(client.get('/api/tasks/one/playback').status_code, 404)
+        self.assertEqual(client.get('/api/tasks/missing/playback').status_code, 404)
+
+    def test_replaced_outputs_do_not_offer_destructive_restore(self):
+        original, organized = self.folder / 'original.mp4', self.folder / 'organized.mp4'
+        organized.write_bytes(b'video')
+        record = self.item(file_organizer={'original_files': [str(original)], 'organized_files': [str(organized)],
+                                          'generated_files': [], 'preexisting_output': True, 'replaced_existing': True})
+        storage.save_tasks([record])
+        self.assertFalse(tasks.get_task('one')['restore_available'])
+        self.assertFalse(tasks.restore_task_files('one'))
+        self.assertTrue(organized.exists())
+
+    def test_duplicate_ids_abort_import(self):
+        storage.TASKS_FILE.write_text(json.dumps([self.item(), self.item()]), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, '重复'):
+            storage.load_tasks()
+
+    def test_row_update_logs_separation_and_concurrent_writes(self):
+        records = [self.item(str(i)) for i in range(20)]
+        storage.save_tasks(records)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(storage.upsert_task, [record | {'error': record['id']} for record in records]))
+        self.assertEqual(len(storage.load_tasks()), 20)
+        for record in storage.load_tasks():
+            self.assertEqual(record['error'], record['id'])
+        with task_store.connection() as db:
+            self.assertNotIn('log_tail', json.loads(db.execute('SELECT payload FROM tasks LIMIT 1').fetchone()[0]))
+            self.assertEqual(db.execute('SELECT count(*) FROM task_logs').fetchone()[0], 20)
+        storage.delete_task_record('1')
+        with task_store.connection() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM task_logs').fetchone()[0], 19)
+
+    def test_global_filters_before_pagination_and_queue_order(self):
+        records = [self.item(str(i), source='manual') for i in range(120)]
+        records[110]['metadata_override'] = {'title': 'Hidden unique title', 'actress': ['Alice']}
+        records[111]['status'] = 'running'
+        records[111]['created_at'] = '2020-01-01T00:00:00Z'
+        storage.save_tasks(records)
+        result = tasks.list_task_summaries(10, 0, view='manual')
+        self.assertEqual(result['items'][0]['id'], '111')
+        self.assertEqual(result['total'], 120)
+        result = tasks.list_task_summaries(10, 0, view='manual', query='alice', field='actress')
+        self.assertEqual([item['id'] for item in result['items']], ['110'])
+        self.assertEqual(tasks.list_task_summaries(10, 0, size_min=1025)['total'], 0)
+        self.assertEqual(tasks.list_task_summaries(10, 0, date_from='2026-01-01T00:00:00Z')['total'], 119)
+        self.assertEqual(tasks.list_task_summaries(10, 9999)['offset'], 110)
+
+    def test_overview_groups_before_paginating_and_global_metrics(self):
+        records = [self.item(str(i), image_sources={'cover_urls': ['https://example.test/cover']}) for i in range(30)]
+        for record in records[:3]:
+            record['image_output'] = {'save_dir': '/shared', 'fanart_file': '/shared/fanart.jpg'}
+        records[1]['status'] = 'failed'
+        records.append(self.item('active', status='queued'))
+        storage.save_tasks(records)
+        result = tasks.list_task_summaries(10, 0, view='overview')
+        self.assertEqual(result['total'], 28)
+        self.assertEqual(result['metrics']['total'], 31)
+        self.assertEqual(result['metrics']['running'], 1)
+        pages = [tasks.list_task_summaries(10, offset, view='overview')['items'] for offset in (0, 10, 20)]
+        combined = [item for page in pages for item in page]
+        self.assertEqual(len(combined), 28)
+        group = next(item for item in combined if len(item['task_ids']) == 3)
+        self.assertEqual(set(group['task_ids']), {'0', '1', '2'})
+        self.assertEqual(group['status'], 'succeeded')
+
+    def test_overview_cover_groups_aggregate_film_representatives_and_filter_walls(self):
+        records = [self.item(str(i), image_sources={'cover_urls': ['https://example.test/cover']}) for i in range(6)]
+        details = [(['Alice', 'Bea'], 'S1', '2024-01-02', 'D:\\Media\\JAV\\A'), (['Alice'], 'S1', '2023-05-06', 'D:/Media/JAV/B'),
+                   ('Bea', 'Moodyz', '2023', '/other/C'), ([], '', 'unknown', '/media/jav/D'), (['Alice'], 'S1', '2024-03-04', '/shared'),
+                   (['Alice'], 'S1', '2024-03-04', '/shared')]
+        for record, (actress, producer, date, folder) in zip(records, details):
+            record['metadata_override'] = {'title': record['id'], 'actress': actress, 'producer': producer, 'publish_date': date, 'dvdid': 'ABC-' + record['id']}
+            record['image_output'] = {'save_dir': folder, 'fanart_file': folder + '/fanart.jpg'}
+        storage.save_tasks(records)
+        actress = task_store.overview_groups('actress')
+        self.assertEqual(actress['all']['count'], 5)
+        self.assertEqual([(item['name'], item['count']) for item in actress['groups']], [('Alice', 3), ('Bea', 2), ('未知演员', 1)])
+        self.assertEqual([item['key'] for item in task_store.overview_groups('year')['groups']], ['2024', '2023', ''])
+        self.assertEqual([item['name'] for item in task_store.overview_groups('producer', query='mood')['groups']], ['Moodyz'])
+        libraries = [{'key': 'srv:lib', 'name': '影片', 'roots': ['d:/media/jav']}, {'key': 'srv:empty', 'name': '空库', 'roots': ['/nowhere']}]
+        grouped = task_store.overview_groups('library', libraries=libraries)
+        self.assertEqual([(item['name'], item['count']) for item in grouped['groups']], [('影片', 2), ('空库', 0)])
+        wall = lambda **filters: {item['id'] for item in tasks.list_task_summaries(20, 0, view='overview', **filters)['items']}
+        self.assertEqual(wall(group_by='actress', group='Alice'), {'0', '1', '4'})
+        self.assertEqual(wall(group_by='actress', group='Bea'), {'0', '2'})
+        self.assertEqual(wall(group_by='actress', group=''), {'3'})
+        self.assertEqual(wall(group_by='year', group='2023'), {'1', '2'})
+        self.assertEqual(wall(group_by='year', group=''), {'3'})
+        self.assertEqual(wall(group_by='library', group='srv:lib', group_roots=['D:/Media/JAV']), {'0', '1'})
+        self.assertEqual(wall(group_by='library', group='x', group_roots=[]), set())
+        client = self.client()
+        with patch.object(self.server, 'overview_libraries', return_value=libraries):
+            response = client.get('/api/tasks/overview-groups', params={'by': 'library'})
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()['libraries_available'])
+            self.assertEqual(response.json()['groups'][0]['count'], 2)
+            self.assertEqual(client.get('/api/tasks/overview-groups', headers={'If-None-Match': response.headers['etag']}, params={'by': 'library'}).status_code, 304)
+            items = client.get('/api/tasks', params={'view': 'overview', 'limit': 20, 'group_by': 'library', 'group': 'srv:lib'}).json()['items']
+            self.assertEqual({item['id'] for item in items}, {'0', '1'})
+        with patch.object(self.server, 'overview_libraries', return_value=[]):
+            payload = client.get('/api/tasks/overview-groups', params={'by': 'library'}).json()
+            self.assertEqual((payload['by'], payload['libraries_available']), ('library', False))
+
+    def test_metadata_update_and_detail_touch_one_record(self):
+        storage.save_tasks([self.item('one'), self.item('two')])
+        with patch.object(tasks, 'save_tasks', side_effect=AssertionError('full rewrite')), patch.object(tasks, 'load_tasks', wraps=storage.load_tasks) as load:
+            tasks.update_task_metadata('one', {'title': 'Updated'}, False)
+            self.assertEqual(tasks.get_task('one')['title'], 'Updated')
+            load.assert_called_once_with({'one'})
+        self.assertEqual(tasks.get_task('two')['title'], 'two')
+
+    def test_metadata_edit_updates_every_movie_nfo_in_the_folder(self):
+        """A folder holding both {name}.nfo and movie.nfo must not keep a stale copy."""
+        folder = self.folder / 'media' / 'ABC-123'
+        folder.mkdir(parents=True)
+        (folder / 'ABC-123.mp4').write_bytes(b'x' * 20)
+        for name in ('ABC-123.nfo', 'movie.nfo'):
+            (folder / name).write_text('<?xml version="1.0" encoding="utf-8"?>\n<movie><title>Old</title></movie>', encoding='utf-8')
+        record = self.item('one', image_output={'save_dir': str(folder)})
+        storage.save_tasks([record])
+        result = tasks.update_task_metadata('one', {'title': 'New title', 'actress': ['Alice']}, True)
+        self.assertEqual(sorted(Path(path).name for path in result['nfo_paths']), ['ABC-123.nfo', 'movie.nfo'])
+        for name in ('ABC-123.nfo', 'movie.nfo'):
+            text = (folder / name).read_text(encoding='utf-8')
+            self.assertIn('New title', text)
+            self.assertIn('Alice', text)
+            self.assertNotIn('Old', text)
+
+    def test_metadata_edit_never_overwrites_an_unparsable_nfo(self):
+        folder = self.folder / 'media' / 'ABC-123'
+        folder.mkdir(parents=True)
+        (folder / 'ABC-123.mp4').write_bytes(b'x' * 20)
+        broken = folder / 'broken.nfo'
+        broken.write_bytes(b'<movie><title>not closed')
+        storage.save_tasks([self.item('one', image_output={'save_dir': str(folder)})])
+        result = tasks.update_task_metadata('one', {'title': 'New title'}, True)
+        self.assertEqual(broken.read_bytes(), b'<movie><title>not closed')
+        self.assertTrue(result['nfo_path'].endswith('movie.nfo'))
+        self.assertIn('New title', (folder / 'movie.nfo').read_text(encoding='utf-8'))
+
+    def test_metadata_edit_reports_when_no_nfo_can_be_safely_written(self):
+        folder = self.folder / 'media' / 'ABC-123'
+        folder.mkdir(parents=True)
+        (folder / 'ABC-123.mp4').write_bytes(b'x' * 20)
+        for name in ('broken.nfo', 'movie.nfo'):
+            (folder / name).write_bytes(b'<movie><title>not closed')
+        storage.save_tasks([self.item('one', image_output={'save_dir': str(folder)})])
+        with self.assertRaisesRegex(ValueError, '未写入以免覆盖'):
+            tasks.update_task_metadata('one', {'title': 'New title'}, True)
+        client = self.client()
+        response = client.patch('/api/tasks/one/metadata', json={'title': 'New title', 'apply_to_folder': True})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('写入 NFO 失败', response.json()['detail'])
+
+    def test_metadata_edit_without_a_file_only_stores_the_override(self):
+        record = self.item('one')
+        storage.save_tasks([record])
+        result = tasks.update_task_metadata('one', {'title': 'Only record'}, False)
+        self.assertEqual(result['nfo_paths'], [])
+        self.assertEqual(result['nfo_path'], '')
+        self.assertEqual(tasks.get_task('one')['title'], 'Only record')
+
+    def test_image_retry_is_not_offered_after_the_folder_moved_away(self):
+        """Retrying a stale record would recreate the old folder and write images there."""
+        gone = self.folder / 'moved-away' / 'ABC-123'
+        output = {'save_dir': str(gone), 'fanart_file': str(gone / 'fanart.jpg'), 'poster_file': str(gone / 'poster.jpg')}
+        record = self.item('one', status='failed', image_output=output,
+                           image_sources={'cover_urls': ['https://example.test/cover'], 'preview_pics': []})
+        storage.save_tasks([record])
+        self.assertFalse(tasks._artwork_availability(record, output)['image_retry_available'])
+        self.assertFalse(tasks.retry_task_images('one'))
+        self.assertFalse(tasks.get_task('one').get('image_retry_running'))
+
+        gone.mkdir(parents=True)
+        self.assertTrue(tasks._artwork_availability(record, output)['image_retry_available'])
+
+    def test_image_retry_still_works_while_the_folder_exists(self):
+        folder = self.folder / 'media' / 'ABC-123'
+        folder.mkdir(parents=True)
+        output = {'save_dir': str(folder), 'fanart_file': str(folder / 'fanart.jpg')}
+        record = self.item('one', status='failed', image_output=output,
+                           image_sources={'cover_urls': ['https://example.test/cover'], 'preview_pics': []})
+        self.assertTrue(tasks._artwork_availability(record, output)['image_retry_available'])
+
+    def test_deleting_a_task_removes_its_config_and_diagnostic_log(self):
+        configs = self.folder / 'task-config'
+        configs.mkdir(parents=True, exist_ok=True)
+        config = configs / 'one.yml'
+        config.write_text('scanner: {}', encoding='utf-8')
+        logs = self.folder / 'task-logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        for name in ('one.log', 'one.log.1'):
+            (logs / name).write_text('raw engine log', encoding='utf-8')
+        storage.save_tasks([self.item('one', config_path=str(config))])
+        self.assertTrue(tasks.delete_task('one'))
+        self.assertFalse(config.exists())
+        self.assertFalse((logs / 'one.log').exists())
+        self.assertFalse((logs / 'one.log.1').exists())
+
+    def test_deleting_a_task_never_touches_files_outside_the_data_folders(self):
+        outside = self.folder / 'outside.log'
+        outside.write_text('keep', encoding='utf-8')
+        storage.save_tasks([self.item('one', config_path=str(outside))])
+        self.assertTrue(tasks.delete_task('one'))
+        self.assertEqual(outside.read_text(encoding='utf-8'), 'keep')
+
+    def test_search_matches_text_literally_without_wildcards(self):
+        """搜索用 instr() 做子串匹配：% 和 _ 必须按字面处理，不能当成通配符。"""
+        records = []
+        for task_id, name in (('pct', 'ABC%DEF'), ('underscore', 'ABC_DEF'), ('plain', 'ABCDEF')):
+            record = self.item(task_id)
+            record['input_directory'] = f'X:/lib/{name}.mp4'
+            records.append(record)
+        storage.save_tasks(records)
+        for query, expected in (('ABC%DEF', {'pct'}), ('ABC_DEF', {'underscore'}), ('%', {'pct'}),
+                                ('_', {'underscore'}), ('ABCDEF', {'plain'}), ('abc_def', {'underscore'})):
+            with self.subTest(query=query):
+                result = tasks.list_task_summaries(50, 0, view='all', query=query)
+                self.assertEqual({item['id'] for item in result['items']}, expected)
+
+    def test_status_filter_totals_match_the_returned_items(self):
+        storage.save_tasks([self.item('a', status='succeeded'), self.item('b', status='failed'),
+                            self.item('c', status='failed'), self.item('d', status='queued')])
+        for status, expected in (('', 4), ('failed', 2), ('queued', 1), ('cancelled', 0)):
+            with self.subTest(status=status):
+                result = tasks.list_task_summaries(50, 0, view='all', status=status)
+                self.assertEqual(result['total'], expected)
+                self.assertEqual(len(result['items']), expected)
+                if status:
+                    self.assertTrue(all(item['status'] == status for item in result['items']))
+
+    def test_paging_survives_out_of_range_offset_and_unparsable_dates(self):
+        storage.save_tasks([self.item(str(index)) for index in range(5)])
+        # 超出范围的 offset 会被夹到最后一页，避免翻页后拿到空表
+        result = tasks.list_task_summaries(2, 10 ** 6, view='all')
+        self.assertEqual((result['total'], [item['id'] for item in result['items']]), (5, ['4']))
+        # 界面使用 type=date 控件；这里只需保证非法日期不会抛异常（julianday 得到 NULL → 不过滤出任何记录）
+        self.assertEqual(tasks.list_task_summaries(50, 0, view='all', date_from='2026-13-45')['total'], 0)
+        self.assertEqual(tasks.list_task_summaries(50, 0, view='all', date_from='2026-01-01T00:00:00Z')['total'], 5)
+
+    def test_deleted_task_is_not_resurrected_by_a_background_finish(self):
+        """图片重试/封面搜索的收尾持久化不得把已删除的任务写回列表。"""
+        storage.save_tasks([self.item('one', status='succeeded', image_retry_started_at='2026-09-24T00:00:00+00:00')])
+        self.assertTrue(tasks.delete_task('one'))
+        tasks._persist({'id': 'one', 'status': 'succeeded', 'image_retry_running': False})
+        tasks._persist({'id': 'one', 'status': 'succeeded', 'google_cover_search_status': 'failed'})
+        self.assertEqual(storage.load_tasks(), [])
+        self.assertIsNone(storage.get_task_record('one'))
+
+    def test_other_tasks_still_persist_after_a_delete(self):
+        storage.save_tasks([self.item('one'), self.item('two')])
+        self.assertTrue(tasks.delete_task('one'))
+        record = storage.get_task_record('two')
+        record['title'] = 'updated title'
+        tasks._persist(record)
+        self.assertEqual(storage.get_task_record('two')['title'], 'updated title')
+
+    def test_cover_search_of_a_task_without_config_fails_instead_of_hanging(self):
+        record = self.item('scan-task', status='succeeded', task_type='scan', config_path=None,
+                           progress={'metadata': {'dvdid': 'SNOS-094'}})
+        storage.save_tasks([record])
+        tasks._search_google_cover(dict(record))
+        stored = storage.get_task_record('scan-task')
+        self.assertEqual(stored['google_cover_search_status'], 'failed')
+        self.assertFalse(stored['google_cover_search_running'])
+        self.assertTrue(stored['google_cover_search_error'])
+        self.assertIn('没有生成刮削配置', ' '.join(stored.get('log_tail') or []))
+
+    def test_library_search_filters_before_pagination_without_losing_group_members(self):
+        records = [self.item(str(i), image_sources={'cover_urls': ['https://example.test/cover']}) for i in range(30)]
+        for record in records[25:28]:
+            record['image_output'] = {'save_dir': '/shared', 'fanart_file': '/shared/fanart.jpg'}
+            record['metadata_override'] = {'title': 'Quiet Garden', 'actress': ['Alice'], 'dvdid': 'XYZ-987'}
+        storage.save_tasks(records)
+        for query in ('quiet garden', 'ALICE', 'XYZ-987'):
+            result = tasks.list_task_summaries(10, 0, view='overview', query=query)
+            self.assertEqual(result['total'], 1)
+            self.assertEqual(len(result['items']), 1)
+            self.assertEqual(set(result['items'][0]['task_ids']), {'25', '26', '27'})
+            self.assertEqual(result['metrics']['total'], 30)
+        self.assertEqual(tasks.list_task_summaries(10, 0, view='overview', query='absent')['total'], 0)
+
+    def test_cover_lookup_never_loads_history_or_logs_for_new_records(self):
+        from PIL import Image
+        path = self.folder / 'poster.jpg'
+        Image.new('RGB', (800, 1200)).save(path)
+        storage.upsert_task(self.item(image_output={'poster_file': str(path), 'fanart_file': str(path), 'save_dir': str(self.folder)}))
+        with patch.object(tasks, 'load_tasks', side_effect=AssertionError('full read')), patch.object(tasks, '_task_progress', side_effect=AssertionError('log parse')):
+            self.assertEqual(tasks.get_cover_path('one', 0), path)
+
+    def artwork_record(self, extension='.png', generated=True):
+        from PIL import Image
+        output = {key: str(self.folder / name) for key, name in
+                  [('fanart_file', 'custom-fanart.jpg'), ('poster_file', 'custom-poster.jpg')]}
+        output['save_dir'] = str(self.folder)
+        actual = [self.folder / ('custom-' + role + extension) for role in ('fanart', 'poster')]
+        for path in actual:
+            Image.new('RGB', (24, 36), 'red').save(path)
+        record = self.item(image_output=output, image_sources={'cover_urls': ['https://example.test/cover']},
+                           file_organizer={'generated_files': list(map(str, actual)) if generated else []})
+        record['log_tail'].append('JAVSP_PROGRESS ' + json.dumps(dict(stage='images', kind='cover', done=1, total=1, status='completed')))
+        return record, actual
+
+    def test_actual_extensions_and_custom_names_reach_details_and_cover_api(self):
+        client = self.client()
+        for extension, generated in [('.png', True), ('.jpeg', False), ('.webp', False), ('.PNG', True)]:
+            with self.subTest(extension=extension):
+                record, actual = self.artwork_record(extension, generated)
+                storage.upsert_task(record)
+                detail = client.get('/api/tasks/one').json()
+                self.assertEqual(detail['cover_count'], 1)
+                self.assertEqual(Path(detail['progress']['output']['poster_file']), actual[1])
+                self.assertFalse(detail['image_retry_available'])
+                self.assertEqual(tasks.get_cover_path('one', 0), actual[1])
+                self.assertEqual(client.get('/api/tasks/one/cover/0').status_code, 200)
+                self.assertEqual(client.get('/api/tasks/one/cover/0?thumbnail=true').status_code, 200)
+                self.assertEqual(client.get('/api/tasks?limit=10&view=overview').json()['items'][0]['cover_count'], 1)
+                for path in actual:
+                    path.unlink()
+
+    def legacy_artwork_record(self):
+        record, actual = self.artwork_record()
+        storage.upsert_task(record)
+        with task_store.connection() as db:
+            summary = json.loads(db.execute('SELECT summary FROM tasks WHERE id=?', ('one',)).fetchone()[0])
+            summary.update(cover_count=0, image_retry_available=True)
+            db.execute('UPDATE tasks SET summary=? WHERE id=?', (task_store._dump(summary), 'one'))
+        return record, actual
+
+    def test_history_repair_updates_cached_overview_without_changing_logs(self):
+        record, actual = self.legacy_artwork_record()
+        with patch.object(tasks, '_progress_from_logs', side_effect=AssertionError('history log scan')):
+            self.assertEqual(task_store.repair_artwork_paths(), 1)
+        persisted = storage.get_task_record('one')
+        self.assertEqual(persisted['log_tail'], record['log_tail'])
+        self.assertEqual(persisted['image_output']['poster_file'], str(actual[1]))
+        summary = tasks.list_task_summaries(10, view='overview')['items'][0]
+        self.assertEqual(summary['cover_count'], 1)
+        self.assertFalse(summary['image_retry_available'])
+        self.assertEqual(summary['progress']['metadata']['title'], 'one')
+        with patch.object(tasks, '_resolved_image_output', side_effect=AssertionError('repeat scan')):
+            self.assertEqual(task_store.repair_artwork_paths(), 0)
+
+    def test_missing_artwork_is_not_reported_available_and_never_scans_other_movies(self):
+        record, actual = self.artwork_record()
+        for path in actual:
+            path.unlink()
+        storage.upsert_task(record)
+        with patch.object(Path, 'rglob', side_effect=AssertionError('recursive mount scan')):
+            self.assertIsNone(tasks.get_cover_path('one', 0))
+        detail = tasks.get_task('one')
+        self.assertEqual(detail['cover_count'], 0)
+        self.assertTrue(detail['image_retry_available'])
+        task_store.repair_artwork_paths()
+        self.assertEqual(tasks.list_task_summaries(10)['items'][0]['cover_count'], 0)
+
+    def test_success_without_cover_event_does_not_invent_download_progress(self):
+        storage.upsert_task(self.item())
+        detail = tasks.get_task('one')
+        self.assertEqual(detail['progress']['images']['cover_done'], 0)
+        self.assertEqual(detail['cover_count'], 0)
+
+    def test_history_repair_does_not_block_polling_on_a_slow_mount(self):
+        import threading
+        self.legacy_artwork_record()
+        entered, release = threading.Event(), threading.Event()
+        resolve = tasks._resolved_image_output
+        def slow(task, output=None):
+            if task['id'] == 'one':
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError('test did not release mount')
+            return resolve(task, output)
+        with patch.object(tasks, '_resolved_image_output', side_effect=slow), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(task_store.repair_artwork_paths)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(tasks.list_task_summaries(10)['total'], 1)
+                storage.upsert_task(self.item('independent', status='queued'))
+            finally:
+                release.set()
+            self.assertEqual(future.result(timeout=5), 1)
+
+    def test_history_repair_does_not_resurrect_concurrently_deleted_task(self):
+        self.legacy_artwork_record()
+        resolve = tasks._resolved_image_output
+        def deleting(task):
+            storage.delete_task_record(task['id'])
+            return resolve(task)
+        with patch.object(tasks, '_resolved_image_output', side_effect=deleting):
+            self.assertEqual(task_store.repair_artwork_paths(), 0)
+        self.assertIsNone(storage.get_task_record('one'))
+
+    def test_existing_jpg_wins_over_stale_generated_png(self):
+        from PIL import Image
+        record, _ = self.artwork_record()
+        jpg = self.folder / 'custom-poster.jpg'
+        Image.new('RGB', (24, 36)).save(jpg)
+        storage.upsert_task(record)
+        self.assertEqual(tasks.get_cover_path('one', 0), jpg)
+
+    def test_update_api_exposes_cached_check_and_worker_status(self):
+        self.enterContext(patch.dict(os.environ, {'MOVSP_RELEASE_LABEL': 'v1.1.36'}))
+        client = self.client()
+        from movsp import updater
+        storage.save_update_settings({'experience_program': False})
+        updater.write_state('check', {'channel': 'stable', 'current': updater.current_version(), 'available': True, 'target': '1.1.37'})
+        with patch.object(updater, 'capability', return_value={'supported': True}), patch.object(updater, 'job', return_value={'status': 'pulling', 'message': '正在拉取目标镜像'}):
+            response = client.get('/api/update')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['result']['target'], '1.1.37')
+        self.assertEqual(response.json()['job']['status'], 'pulling')
+
+    def test_joining_experience_program_applies_immediately_without_auto_update(self):
+        self.enterContext(patch.dict(os.environ, {'MOVSP_RELEASE_LABEL': 'v1.1.36'}))
+        client = self.client()
+        from movsp import updater
+        storage.save_update_settings({'experience_program': False, 'auto_update': False})
+        with patch.object(updater, 'apply', return_value={'status': 'scheduled', 'target': 'bata.20260924044117'}) as apply:
+            response = client.put('/api/update/settings', json={'experience_program': True, 'auto_update': False})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['settings']['experience_program'])
+        self.assertEqual(response.json()['activation']['status'], 'scheduled')
+        apply.assert_called_once_with()
+
+    def test_joining_experience_program_reports_install_error_and_keeps_setting(self):
+        self.enterContext(patch.dict(os.environ, {'MOVSP_RELEASE_LABEL': 'v1.1.36'}))
+        client = self.client()
+        from movsp import updater
+        storage.save_update_settings({'experience_program': False})
+        with patch.object(updater, 'apply', side_effect=updater.UpdateError('需要手动更新镜像')):
+            response = client.put('/api/update/settings', json={'experience_program': True})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['activation_error'], '需要手动更新镜像')
+        self.assertTrue(storage.get_update_settings()['experience_program'])
+
+    def test_leaving_experience_program_installs_stable_and_preserves_opt_out_on_failure(self):
+        self.enterContext(patch.dict(os.environ, {'MOVSP_RELEASE_LABEL': 'bata.20261011000000'}))
+        client = self.client()
+        from movsp import updater
+        for failure in (False, True):
+            storage.save_update_settings({'experience_program': True, 'auto_update': False})
+            with patch.object(updater, 'apply', return_value={'status': 'scheduled', 'target': '1.1.40'},
+                              side_effect=updater.UpdateError('正在刮削') if failure else None) as apply:
+                response = client.put('/api/update/settings', json={'experience_program': False, 'auto_update': False})
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(response.json()['settings']['experience_program'])
+            self.assertEqual(response.json()['channel'], 'stable')
+            self.assertEqual(storage.get_update_settings()['experience_program'], False)
+            apply.assert_called_once_with()
+            if failure:
+                self.assertEqual(response.json()['activation_error'], '正在刮削')
+            else:
+                self.assertEqual(response.json()['activation']['target'], '1.1.40')
+            self.assertFalse(client.get('/api/update').json()['settings']['experience_program'])
+
+    def test_cookiecloud_interval_manual_sync_and_shared_snapshot(self):
+        from movsp import cookiecloud
+        self.enterContext(patch.object(cookiecloud, '_snapshot', {}))
+        client = self.client()
+        body = {'enabled': True, 'server_url': 'https://cloud.test', 'uuid': 'test', 'password': 'private-password',
+                'sync_interval_minutes': 12}
+        response = client.put('/api/cookiecloud', json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['sync_interval_minutes'], 12)
+        self.assertNotIn('private-password', response.text)
+        self.assertEqual(client.get('/api/cookiecloud').json()['sync_interval_minutes'], 12)
+        for invalid in (0, 1441):
+            self.assertEqual(client.put('/api/cookiecloud', json=body | {'sync_interval_minutes': invalid}).status_code, 422)
+        with patch.object(cookiecloud, 'fetch_cookiecloud', return_value={'example.com': {'session': 'private-value'}}) as fetch:
+            result = client.post('/api/cookiecloud/sync')
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertTrue(result.json()['sync']['last_sync_at'])
+            self.assertNotIn('private-value', result.text)
+            self.assertEqual(tasks._image_cookiecloud_cookies('https://example.com/cover.jpg'), {'session': 'private-value'})
+            fetch.assert_called_once()
+        client.put('/api/cookiecloud', json=body | {'enabled': False})
+        self.assertEqual(client.post('/api/cookiecloud/sync').status_code, 400)
+        self.assertFalse(client.get('/api/cookiecloud').json()['sync']['next_sync_at'])
+
+    def test_cookiecloud_connection_test_does_not_change_active_snapshot(self):
+        from movsp import cookiecloud
+        self.enterContext(patch.object(cookiecloud, '_snapshot', {}))
+        client = self.client()
+        body = {'enabled': True, 'server_url': 'https://cloud.test', 'uuid': 'test', 'password': 'private-password'}
+        client.put('/api/cookiecloud', json=body)
+        with patch.object(self.server, 'fetch_cookiecloud', return_value={'example.com': {'session': 'test-only'}}):
+            result = client.post('/api/cookiecloud/test', json=body | {'uuid': 'unsaved'})
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(client.get('/api/cookiecloud').json()['uuid'], 'test')
+        self.assertFalse(cookiecloud.sync_status()['last_sync_at'])
+
+    def test_api_page_etag_thumbnail_and_version(self):
+        client = self.client()
+        from PIL import Image
+        path = self.folder / 'poster.jpg'
+        Image.new('RGB', (800, 1200), 'red').save(path)
+        storage.upsert_task(self.item(image_output={'poster_file': str(path), 'fanart_file': str(path), 'save_dir': str(self.folder)}))
+        response = client.get('/api/tasks?limit=10&view=manual')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['total'], 1)
+        self.assertEqual(client.get('/api/tasks?limit=10&view=manual', headers={'If-None-Match': response.headers['etag']}).status_code, 304)
+        cover = client.get('/api/tasks/one/cover/0?thumbnail=true')
+        self.assertEqual(cover.status_code, 200)
+        import io
+        with Image.open(io.BytesIO(cover.content)) as image:
+            self.assertLessEqual(image.width, 360)
+            self.assertLessEqual(image.height, 540)
+        self.assertEqual(client.get('/api/tasks/one/cover/0?thumbnail=true', headers={'If-None-Match': cover.headers['etag']}).status_code, 304)
+        Image.new('RGB', (801, 1200), 'blue').save(path)
+        fresh = client.get('/api/tasks/one/cover/0?thumbnail=true', headers={'If-None-Match': cover.headers['etag']})
+        self.assertEqual(fresh.status_code, 200)
+        self.assertNotEqual(fresh.headers['etag'], cover.headers['etag'])
+        with patch.object(self.server, 'RELEASE_LABEL', 'vv1.1.37'):
+            runtime = client.get('/api/runtime').json()
+            self.assertEqual(runtime['version'], '1.1.37')
+            self.assertEqual(runtime['app_version'], '1.1.37')
+        asset = client.get('/assets/app.js?v=' + self.server.ASSET_VERSION)
+        self.assertIn('immutable', asset.headers['cache-control'])
+        self.assertNotIn('immutable', client.get('/assets/app.js?v=wrong').headers['cache-control'])
+        self.assertIn(self.server.ASSET_VERSION, client.get('/login').text)
+
+    def test_pending_dispatch_respects_batch_and_uses_fixed_workers(self):
+        records = [self.item('a', status='queued', batch_id='batch1', task_concurrency=1),
+                   self.item('b', status='queued', batch_id='batch1', task_concurrency=1),
+                   self.item('c', status='queued', batch_id='batch2', task_concurrency=1)]
+        with patch.object(tasks, '_pending_tasks', deque()), patch.object(tasks, '_worker_threads', []), \
+             patch.object(tasks, '_worker_batches', {}), patch.object(tasks.threading, 'Thread') as thread:
+            for record in records:
+                tasks._enqueue_task(record)
+            self.assertEqual(thread.call_count, tasks._GLOBAL_TASK_LIMIT)
+            self.assertEqual(tasks._take_pending_task()[0]['id'], 'a')
+            self.assertEqual(tasks._take_pending_task()[0]['id'], 'c')
+            self.assertIsNone(tasks._take_pending_task())
+            tasks._worker_batches['batch1'] = 0
+            self.assertEqual(tasks._take_pending_task()[0]['id'], 'b')
+
+    def test_worker_releases_reservation_when_persistence_fails(self):
+        record = self.item(status='queued')
+        class StopWorker(BaseException):
+            pass
+        with patch.object(tasks, '_worker_batches', {'batch': 1}), \
+             patch.object(tasks, '_take_pending_task', side_effect=[(record, 'batch'), StopWorker]), \
+             patch.object(tasks, '_run_task', side_effect=OSError('disk error')), \
+             patch.object(tasks, '_persist', side_effect=OSError('disk error')), \
+             patch.object(tasks.logging, 'exception'):
+            with self.assertRaises(StopWorker):
+                tasks._task_worker()
+            self.assertEqual(tasks._worker_batches, {})
+
+    def test_batch_delete_removes_records_and_sidecars_and_skips_running(self):
+        configs, logs = self.folder / 'task-config', self.folder / 'task-logs'
+        configs.mkdir(parents=True, exist_ok=True)
+        logs.mkdir(parents=True, exist_ok=True)
+        for task_id in ('a', 'b'):
+            (configs / f'{task_id}.yml').write_text('scanner: {}', encoding='utf-8')
+            (logs / f'{task_id}.log').write_text('raw', encoding='utf-8')
+        storage.save_tasks([self.item('a'), self.item('b'), self.item('run', status='running')])
+        with patch.dict(tasks._processes, {'run': object()}):
+            result = tasks.delete_tasks(['a', 'b', 'run', 'missing'])
+        self.assertEqual(result['deleted'], 2)
+        self.assertEqual({item['id']: item['reason'] for item in result['skipped']},
+                         {'run': 'running', 'missing': 'not_found'})
+        self.assertEqual({item['id'] for item in storage.load_tasks()}, {'run'})
+        for task_id in ('a', 'b'):
+            self.assertFalse((configs / f'{task_id}.yml').exists())
+            self.assertFalse((logs / f'{task_id}.log').exists())
+
+    def test_purge_preview_and_execution_respect_status_age_and_scan_flag(self):
+        old_ok = self.item('old-ok', status='succeeded')
+        old_ok['created_at'] = '2026-01-01T00:00:00+08:00'
+        old_failed = self.item('old-failed', status='failed')
+        old_failed['created_at'] = '2026-01-01T00:00:00+08:00'
+        new_ok = self.item('new-ok', status='succeeded')
+        new_ok['created_at'] = '2026-09-23T00:00:00+08:00'
+        old_scan = self.item('old-scan', status='succeeded', task_type='scan')
+        old_scan['created_at'] = '2026-01-01T00:00:00+08:00'
+        storage.save_tasks([old_ok, old_failed, new_ok, old_scan])
+        preview = tasks.purge_tasks(statuses=['succeeded'], before='2026-06-01T00:00:00Z', dry_run=True)
+        self.assertEqual((preview['matched'], preview['deletable']), (1, 1))
+        self.assertGreater(preview['bytes'], 0)
+        with_scan = tasks.purge_tasks(statuses=['succeeded'], before='2026-06-01T00:00:00Z',
+                                      include_scan=True, dry_run=True)
+        self.assertEqual(with_scan['deletable'], 2)
+        result = tasks.purge_tasks(statuses=['succeeded'], before='2026-06-01T00:00:00Z', dry_run=False)
+        self.assertEqual(result['deleted'], 1)
+        self.assertEqual({item['id'] for item in storage.load_tasks()}, {'old-failed', 'new-ok', 'old-scan'})
+
+    def test_purge_merge_duplicates_keeps_newest_record_per_path(self):
+        shared = str(self.folder / 'same.mp4')
+        records = [self.item('old'), self.item('mid'), self.item('new'), self.item('other')]
+        for record, created in zip(records, ('2026-09-01', '2026-09-02', '2026-09-03', '2026-09-01')):
+            record['created_at'] = f'{created}T00:00:00+08:00'
+        for record in records[:3]:
+            record['input_directory'] = shared
+        storage.save_tasks(records)
+        preview = tasks.purge_tasks(statuses=['succeeded'], merge_duplicates=True, dry_run=True)
+        self.assertEqual((preview['matched'], preview['deletable']), (4, 2))
+        tasks.purge_tasks(statuses=['succeeded'], merge_duplicates=True, dry_run=False)
+        self.assertEqual({item['id'] for item in storage.load_tasks()}, {'new', 'other'})
+
+    def test_ids_and_batch_delete_endpoints_follow_the_current_filter(self):
+        client = self.client()
+        records = [self.item(str(index)) for index in range(3)]
+        records[0]['input_directory'] = 'D:/lib/keep.mp4'
+        records[1]['input_directory'] = 'D:/lib/drop.mp4'
+        records[2]['input_directory'] = 'D:/lib/drop2.mp4'
+        storage.save_tasks(records)
+        payload = client.get('/api/tasks/ids', params={'view': 'manual', 'query': 'drop'}).json()
+        self.assertEqual((payload['total'], set(payload['ids'])), (2, {'1', '2'}))
+        deleted = client.post('/api/tasks/delete', json={'ids': payload['ids']}).json()
+        self.assertEqual(deleted['deleted'], 2)
+        self.assertEqual([item['id'] for item in storage.load_tasks()], ['0'])
+        preview = client.post('/api/tasks/purge', json={'statuses': ['succeeded'], 'dry_run': True}).json()
+        self.assertEqual(preview['deletable'], 1)
+        executed = client.post('/api/tasks/purge', json={'statuses': ['succeeded'], 'dry_run': False}).json()
+        self.assertEqual(executed['deleted'], 1)
+        self.assertEqual(storage.load_tasks(), [])
+
+    def test_ids_endpoint_expands_grouped_overview_records(self):
+        client = self.client()
+        records = [self.item(str(index), image_sources={'cover_urls': ['https://example.test/cover']}) for index in range(3)]
+        for record in records:
+            record['image_output'] = {'save_dir': '/shared', 'fanart_file': '/shared/fanart.jpg'}
+        storage.save_tasks(records)
+        payload = client.get('/api/tasks/ids', params={'view': 'overview'}).json()
+        self.assertEqual((payload['total'], set(payload['ids'])), (3, {'0', '1', '2'}))
+
+    def test_bulk_insert_is_atomic(self):
+        storage.upsert_task(self.item('existing'))
+        with self.assertRaises(KeyError):
+            task_store.upsert_many([self.item('new'), {}])
+        self.assertEqual([item['id'] for item in storage.load_tasks()], ['existing'])
+
+    def test_rollback_export_preserves_raw_logs_and_never_overwrites(self):
+        from scripts.export_task_history import export
+        records = [self.item('one'), self.item('two')]
+        task_store.upsert_many(records)
+        destination = self.folder / 'rollback.json'
+        self.assertEqual(export(storage.TASKS_DB_FILE, destination), 2)
+        self.assertEqual(json.loads(destination.read_text(encoding='utf-8')), records)
+        with self.assertRaises(FileExistsError):
+            export(storage.TASKS_DB_FILE, destination)
+
+    def test_recovery_only_changes_interrupted_records(self):
+        task_store.upsert_many([self.item('done'), self.item('interrupted', status='running')])
+        with patch.object(tasks, '_enqueue_task') as enqueue:
+            self.assertEqual(tasks.recover_interrupted_tasks(), 1)
+            self.assertEqual(enqueue.call_args.args[0]['id'], 'interrupted')
+        self.assertEqual(storage.get_task_record('done')['status'], 'succeeded')
+        self.assertEqual(storage.get_task_record('interrupted')['status'], 'queued')
+        self.assertNotIn('done', tasks._logs)
+
+
+if __name__ == '__main__':
+    unittest.main()

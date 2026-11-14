@@ -1,0 +1,17 @@
+services:
+  javsp-web:
+    image: ghcr.io/fyy656/movsp:latest
+    container_name: movsp
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      MOVSP_HOST: 0.0.0.0
+      MOVSP_PORT: 8090
+      MOVSP_TIMEZONE: Asia/Shanghai
+      TZ: Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+      - ./video:/video

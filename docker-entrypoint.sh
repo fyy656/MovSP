@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+# Include administrator-mounted proxy / enterprise CAs in the trusted bundle.
+if [ "$(id -u)" = "0" ]; then
+    update-ca-certificates
+fi
+
+export DISPLAY="${DISPLAY:-:99}"
+export JAVSP_GOOGLE_BROWSER_VNC=1
+
+Xvfb "$DISPLAY" -screen 0 1440x900x24 -ac +extension GLX +render -noreset &
+x11vnc -display "$DISPLAY" -localhost -forever -shared -nopw -rfbport "${JAVSP_GOOGLE_VNC_PORT:-5900}" &
+
+exec python -m movsp.app_supervisor

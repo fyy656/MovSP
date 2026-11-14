@@ -1,0 +1,124 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/fyy656/movsp
+
+jobs:
+  docker:
+    name: Publish Docker release
+    # 暂停：需要发布镜像时，在仓库 Settings → Variables 里添加 PUBLISH_DOCKER=true
+    if: ${{ vars.PUBLISH_DOCKER == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          build-args: |
+            movsp_RELEASE_LABEL=${{ github.ref_name }}
+            movsp_RELEASE_COMMIT=${{ github.sha }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  windows-release:
+    name: Build Windows release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build single-file EXE
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+          python -m PyInstaller --noconfirm --clean MovSP.spec
+          # 产物名带版本号：MovSP-<VERSION>.exe
+          $version = (Get-Content VERSION -Raw).Trim()
+          Copy-Item "dist/MovSP.exe" "dist/MovSP-$version.exe"
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v3
+        with:
+          name: MovSP ${{ github.ref_name }}
+          body_path: docs/RELEASE_NOTES_${{ github.ref_name }}.md
+          generate_release_notes: false
+          files: dist/MovSP-*.exe
+
+  android-release:
+    name: Build Android APK
+    # 需要发布安卓包时，在仓库 Settings → Variables 添加 PUBLISH_ANDROID=true，
+    # 并在 Secrets 里配置：
+    #   ANDROID_KEYSTORE_BASE64     签名证书 base64（base64 -w0 javsp-release.jks）
+    #   ANDROID_KEYSTORE_PASSWORD   storePassword
+    #   ANDROID_KEY_ALIAS           keyAlias
+    #   ANDROID_KEY_PASSWORD        keyPassword
+    if: ${{ vars.PUBLISH_ANDROID == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      # 运行器自带 Android SDK；不装 android-actions/setup-android，
+      # 它的 v3 会去安装已被移除的 "tools" 包导致任务直接失败。
+      - name: Check Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          echo "sdkmanager=$SDKMANAGER"
+          if [ ! -d "$ANDROID_HOME/platforms/android-35" ] || [ ! -d "$ANDROID_HOME/build-tools/35.0.0" ]; then
+            yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+            "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+          fi
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
+      - name: Restore signing config
+        working-directory: android
+        run: |
+          mkdir -p keystore
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore/javsp-release.jks
+          printf 'storeFile=keystore/javsp-release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
+            "${{ secrets.ANDROID_KEY_ALIAS }}" \
+            "${{ secrets.ANDROID_KEY_PASSWORD }}" > keystore.properties
+      - name: Build release APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleRelease
+      - name: Rename APK
+        working-directory: android
+        run: |
+          # 产物名带应用版本号：JavSP-for-Android-<versionName>.apk
+          version=$(grep -oP "versionName\s+'\K[^']+" app/build.gradle)
+          echo "APK_VERSION=$version" >> "$GITHUB_ENV"
+          cp app/build/outputs/apk/release/app-release.apk \
+            "../JavSP-for-Android-$version.apk"
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v3
+        with:
+          files: JavSP-for-Android-*.apk

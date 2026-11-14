@@ -1,0 +1,1611 @@
+// 媒体库前端的离线回归：标签页切换、库内多文件夹、卡片状态、详情保存与“保存并刮削”。
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+
+const source = fs.readFileSync(path.join(__dirname, '../movsp/web/assets/library.js'), 'utf8');
+
+function makeElement(value = '') {
+  const classes = new Set();
+  return {
+    value, textContent: '', innerHTML: '', hidden: false, disabled: false, checked: true,
+    options: [], dataset: {},
+    style: { values: {}, setProperty(name, value) { this.values[name] = value; } },
+    showModal() {}, close() {},
+    classList: {
+      add: (name) => classes.add(name),
+      remove: (name) => classes.delete(name),
+      toggle: (name, force) => {
+        const next = force === undefined ? !classes.has(name) : Boolean(force);
+        if (next) classes.add(name); else classes.delete(name);
+        return next;
+      },
+      contains: (name) => classes.has(name),
+      includes: (name) => classes.has(name),
+    },
+    querySelector() { return null; }, querySelectorAll() { return []; }, focus() {}, select() {},
+  };
+}
+
+function boot({ role = 'admin', routes = {}, runtime = {} } = {}) {
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) elements.set(id, makeElement());
+    return elements.get(id);
+  };
+  const calls = [];
+  const listeners = {};
+  const storage = new Map();
+  const sandboxWindow = { JavspState: { user: { role }, runtime }, setInterval: () => 0, clearInterval: () => {} };
+  const localStorage = { getItem: (key) => (storage.has(key) ? storage.get(key) : null), setItem: (key, value) => storage.set(key, String(value)) };
+  const context = vm.createContext({
+    console,
+    window: sandboxWindow,
+    setTimeout, clearTimeout, Number, Math, Date, String, URLSearchParams, localStorage,
+    document: {
+      addEventListener: (name, callback) => { listeners[name] = callback; },
+      getElementById: element,
+      querySelector: () => null,
+    },
+    api: async (url, options = {}) => {
+      calls.push({ url, method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : null });
+      const key = Object.keys(routes).find((pattern) => (pattern.endsWith('*')
+        ? url.startsWith(pattern.slice(0, -1))
+        : url.split('?')[0] === pattern));
+      if (!key) throw new Error(`未模拟的请求: ${url}`);
+      const route = routes[key];
+      return typeof route === 'function' ? route(url, options) : route;
+    },
+    showToast: (message) => { calls.push({ toast: message }); },
+    confirmAction: ({ run }) => { calls.push({ confirm: true }); return run(); },
+  });
+  vm.runInContext(source, context);
+  return { context, element, calls, listeners, library: sandboxWindow.JavspLibrary };
+}
+
+const folder = (id, name, extra = {}) => ({ id, name, path: `/media/${name}`, recursive: true, film_count: 1, scan_status: 'succeeded', ...extra });
+const libraryEntry = (id, name, folders, extra = {}) => ({
+  id, name, preset_id: 'default', folders, film_count: folders.reduce((sum, item) => sum + (item.film_count || 0), 0),
+  stats: { total: 2, complete: 1, partial: 1, unscraped: 0, failed: 0, missing: 0 }, ...extra,
+});
+
+const film = (overrides = {}) => ({
+  id: 'f-1', root_id: 'r-1', dvdid: 'ABC-123', title: '演示标题', original_title: '', plot: '',
+  release_date: '2024-05-01', studio: '示例片商', publisher: '', director: '', runtime: 120,
+  actress: ['演员甲'], size_bytes: 2_000_000_000, files: ['/media/ABC-123/ABC-123.mp4'],
+  video_path: '/media/ABC-123/ABC-123.mp4', cover_path: '/media/ABC-123/ABC-123.jpg',
+  fanart_count: 5, nfo_path: '/media/ABC-123/movie.nfo', nfo_mtime: 1234, status: 'complete',
+  missing_fields: ['publisher'], scrape_state: 'idle', last_task_id: '', last_error: '',
+  updated_at: '2026-10-17T10:00:00+08:00', ...overrides,
+});
+
+const filmPage = (items, stats = {}) => ({
+  items, total: items.length, limit: 48, offset: 0,
+  stats: { total: items.length, complete: 0, partial: 0, unscraped: 0, failed: 0, missing: 0, ...stats },
+});
+
+async function main() {
+  // 1) 卡片：状态徽标、封面地址、无番号时的“填写番号”按钮
+  {
+    const { library } = boot();
+    const complete = library.internals.cardMarkup(film());
+    assert.match(complete, /lib-badge" data-tone="success">资料完整/);
+    assert.match(complete, /\/api\/library\/films\/f-1\/cover\?v=/);
+    assert.match(complete, /data-lib-scrape="f-1">刮削</);
+
+    const unscraped = film({ id: 'f-2', dvdid: '', title: '', cover_path: '', status: 'unscraped', actress: [], runtime: 0, release_date: '', studio: '', missing_fields: ['dvdid', 'title', 'cover'] });
+    const unscrapedMarkup = library.internals.cardMarkup(unscraped);
+    assert.doesNotMatch(unscrapedMarkup, /\/cover\?v=/);
+    assert.match(unscrapedMarkup, /data-tone="neutral">未刮削/);
+    assert.match(unscrapedMarkup, /填写番号/);
+
+    // JAV 卡片显示番号；普通影视没有番号时不能出现孤零零的横杠
+    const javCard = library.internals.cardMarkup(film({ dvdid: 'SSIS-001', title: '某部影片' }));
+    assert.match(javCard, /<strong class="lib-id">SSIS-001<\/strong>/, 'JAV 卡片显示番号');
+    const movieCard = library.internals.cardMarkup(
+      film({ dvdid: '', title: '花木兰', tmdb_id: '337401' }));
+    assert.doesNotMatch(movieCard, /lib-id/, '电影无番号时不应渲染番号行');
+    assert.doesNotMatch(movieCard, />—</, '不应出现占位横杠');
+
+    // 1.5) 海报形态：竖版取 cover，横版取 fanart；横版没有独立图时退回封面
+  {
+    const { library } = boot();
+    library.internals.state.posterShape = 'portrait';
+    const portrait = library.internals.cardMarkup(film());
+    assert.match(portrait, /\/api\/library\/films\/f-1\/cover\?v=/, '竖版用 cover');
+    assert.doesNotMatch(portrait, /\/fanart\?v=/, '竖版不该请求 fanart');
+
+    library.internals.state.posterShape = 'landscape';
+    const withFanart = library.internals.cardMarkup(film({ fanart_path: '/x/ABC-123-fanart.jpg' }));
+    assert.match(withFanart, /\/api\/library\/films\/f-1\/fanart\?v=/, '横版用 fanart');
+
+    // 没有横版图、但有竖版封面：仍显示图（后端会退回封面），不算“无封面”
+    const fallback = library.internals.cardMarkup(film({ fanart_path: '', cover_path: '/x/poster.jpg' }));
+    assert.match(fallback, /\/fanart\?v=/, '退回封面也走 fanart 接口');
+
+    // 两种图都没有：显示无封面占位
+    const nothing = library.internals.cardMarkup(film({ fanart_path: '', cover_path: '' }));
+    assert.doesNotMatch(nothing, /\/fanart\?v=/);
+
+    library.internals.state.posterShape = 'portrait';
+  }
+
+  // 1.6) 媒体库设置：预设下拉框必须回填当前值（曾被异步填充覆盖成第一项）
+  {
+    const { library } = boot({
+      routes: {
+        '/api/presets': [
+          { id: 'javp', name: 'JAV预设', kind: 'jav' },
+          { id: 'mediap', name: '影视预设', kind: 'media' },
+        ],
+      },
+    });
+    const makeSelect = () => {
+      const node = {
+        _value: '', _innerHTML: '',
+        get value() { return this._value; },
+        set value(next) { this._value = next; },
+      };
+      // 模拟浏览器：重建 options 会把不再存在的选中值清空
+      Object.defineProperty(node, 'innerHTML', {
+        get() { return this._innerHTML || ''; },
+        set(next) {
+          this._innerHTML = next;
+          if (!next.includes(`value="${this._value}"`)) this._value = '';
+        },
+      });
+      return node;
+    };
+
+    const select = makeSelect();
+    await library.internals.fillPresets(select, 'mediap');
+    assert.match(select.innerHTML, /value="mediap"/, '选项应包含目标预设');
+    assert.equal(select.value, 'mediap', '必须选中保存过的预设，而不是第一项');
+
+    // 目标预设不存在时不留空，退回第一个有效项
+    const second = makeSelect();
+    await library.internals.fillPresets(second, 'missing-preset');
+    assert.notEqual(second.value, '', '不该留空');
+    assert.ok(['javp', 'mediap'].includes(second.value), '应退回第一个有效预设');
+  }
+
+  assert.match(library.internals.cardMarkup(film({ scrape_state: 'failed', status: 'partial' })), /data-tone="danger">刮削失败/);    assert.match(library.internals.cardMarkup(film({ status: 'missing' })), /文件已丢失/);
+    assert.match(library.internals.cardMarkup(film({ files: ['a.mp4', 'b.mp4', 'c.mp4'] })), /3 个文件/);
+    assert.match(library.internals.cardMarkup(film({ detached: 1 })), /已整理/);
+    assert.doesNotMatch(library.internals.cardMarkup(film({ detached: 0 })), /已整理/);
+  }
+
+  // 1.7) 改了标题但没动 ID：旧 ID 必须丢掉，否则永远按旧 ID 取片、不出候选
+  {
+    const { library } = boot();
+    const drop = library.internals.shouldDropStaleId;
+    const original = { title: '绣春刀：无间炼狱', original_title: '绣春刀：无间炼狱', tmdb_id: '1407400', imdb_id: '' };
+
+    // 改了标题、ID 没动 -> 丢弃（这正是「刮成绣春刀：诛邪」的场景）
+    assert.equal(drop({ title: '绣春刀', tmdb_id: '1407400', imdb_id: '' }, original), true);
+
+    // 标题没改 -> 保留 ID，走 ID 直取
+    assert.equal(drop({ title: '绣春刀：无间炼狱', tmdb_id: '1407400' }, original), false);
+
+    // 改了标题，也手动改了 ID -> 尊重用户输入
+    assert.equal(drop({ title: '绣春刀', tmdb_id: '291692' }, original), false);
+
+    // 本来就没有 ID -> 无需丢弃
+    assert.equal(drop({ title: '绣春刀' }, { title: '旧标题', tmdb_id: '', imdb_id: '' }), false);
+
+    // 原始标题不参与判定（已从资料页移除，只认标题）
+    assert.equal(drop({ title: '绣春刀：无间炼狱', original_title: '别的名字', tmdb_id: '1407400' }, original), false);
+
+    // 首尾空白不算改动
+    assert.equal(drop({ title: '  绣春刀：无间炼狱  ', tmdb_id: '1407400' }, original), false);
+  }
+
+  // 1.8) 清空输入：把资料页所有输入框置空，并收起旧候选
+  {
+    const { library } = boot();
+    const fields = [
+      { dataset: { libField: 'tmdb_id' }, value: '1407400' },
+      { dataset: { libField: 'title' }, value: '绣春刀：诛邪' },
+      { dataset: { libField: 'plot' }, value: '旧简介' },
+      { dataset: { libField: 'actress' }, value: '张三、李四' },
+    ];
+    const nfoBox = { value: '<?xml version="1.0"?><movie/>' };
+    const dialog = {
+      querySelectorAll(selector) {
+        return selector === '[data-lib-field]' ? fields : [];
+      },
+      querySelector(selector) {
+        return selector === '[data-lib-nfo]' ? nfoBox : null;
+      },
+    };
+    // 借用真实的 el()：把 dialog 注册进 mock 元素表
+    const holder = library.internals.el('library-film-dialog');
+    holder.querySelectorAll = dialog.querySelectorAll;
+    holder.querySelector = dialog.querySelector;
+    const candidates = library.internals.el('lib-candidates');
+    candidates.innerHTML = '<ul>旧候选</ul>';
+    candidates.classList.remove('hidden');
+    const message = library.internals.el('library-film-message');
+    message.textContent = '之前残留的错误提示';
+
+    library.internals.clearFilmFields();
+
+    fields.forEach((field) => {
+      assert.equal(field.value, '', `${field.dataset.libField} 应被清空`);
+    });
+    assert.equal(nfoBox.value, '', '原始 NFO 也应清空');
+    assert.equal(candidates.innerHTML, '', '旧候选收起');
+    assert.ok(candidates.classList.contains('hidden'), '候选面板隐藏');
+    // 清空动作本身即反馈，不该再留提示文字
+    assert.equal(message.textContent, '', '不显示额外提示');
+  }
+
+  // 1.9) JAV 影片详情页：大图 + 信息 + 播放 + 演员跳转
+  {
+    const { library } = boot();
+    const markup = library.internals.javDetailMarkup(film({
+      dvdid: 'SSIS-001', title: '某部影片', studio: '片商A',
+      release_date: '2024-01-01', runtime: 120, plot: '剧情简介',
+      actress: ['张三', '李四'], fanart_path: '/x/ABC-123-fanart.jpg',
+    }));
+    // 大图走 fanart 接口
+    assert.match(markup, /\/api\/library\/films\/f-1\/fanart\?v=/, '大图用横版图');
+    // 信息表
+    assert.match(markup, /SSIS-001/, '显示番号');
+    assert.match(markup, /2024-01-01/, '显示发行日期');
+    assert.match(markup, /120 分钟/, '显示时长');
+    assert.match(markup, /片商A/, '显示片商');
+    // 演员可点击
+    assert.match(markup, /data-lib-actress="张三"/);
+    // 两个播放入口（大图浮层 + 底部按钮）
+    assert.equal((markup.match(/data-lib-play="f-1"/g) || []).length, 2, '两个播放入口');
+    // 编辑资料按钮指向编辑页
+    assert.match(markup, /data-lib-edit="f-1">编辑资料/);
+
+    // 没有横版图时退回竖版
+    const noFanart = library.internals.javDetailMarkup(film({
+      dvdid: 'SSIS-002', fanart_path: '', cover_path: '/x/poster.jpg',
+    }));
+    assert.match(noFanart, /\/fanart\?v=/, '没有横版时仍走 fanart 接口（后端会退回封面）');
+
+    // 两者都没有：显示占位
+    const empty = library.internals.javDetailMarkup(film({
+      dvdid: 'SSIS-003', fanart_path: '', cover_path: '',
+    }));
+    assert.match(empty, /暂无大图/);
+  }
+
+  // 1.10) 电影详情页：无番号时以标题为主，并显示 TMDb/IMDb
+  {
+    const { library } = boot();
+    const movie = library.internals.javDetailMarkup(film({
+      dvdid: '', title: '绣春刀：无间炼狱', original_title: 'Brotherhood of Blades',
+      tmdb_id: '1277162', imdb_id: 'tt1234567', studio: '北京大楚', release_date: '2024-12-25',
+    }));
+    assert.match(movie, /lib-javdetail-headline/, '无番号时标题作主标题');
+    assert.match(movie, /绣春刀：无间炼狱/);
+    assert.doesNotMatch(movie, /无番号/, '不显示「无番号」占位');
+    assert.match(movie, /TMDb/, '显示 TMDb');
+    assert.match(movie, /1277162/);
+    assert.match(movie, /tt1234567/, '显示 IMDb');
+    // 文案统一为「演员」，兼容普通电影
+    assert.match(movie, /<h3>演员<\/h3>/, '统一用「演员」');
+    assert.doesNotMatch(movie, /<h3>女优<\/h3>/, '不应出现旧文案');
+    // 片商可点
+    assert.match(movie, /data-lib-studio="北京大楚"/, '片商可点击筛选');
+
+    // JAV 影片仍以番号为主
+    const jav = library.internals.javDetailMarkup(film({
+      dvdid: 'SSIS-001', title: '某片', tmdb_id: '', imdb_id: '',
+    }));
+    assert.match(jav, /<strong>SSIS-001<\/strong>/);
+    assert.match(jav, /<h3>演员<\/h3>/, 'JAV 也用「演员」');
+  }
+
+  // 1.10.1) 片商跳转：关详情页 + 记住来源 + 走 studio 分组
+  {
+    const { library } = boot({
+      routes: {
+        '/api/library/films': filmPage([film()]),
+        '/api/library/groups*': { by: 'studio', groups: [{ key: 'E-BODY', count: 3 }], all: { count: 3, covers: [] } },
+      },
+    });
+    const state = library.internals.state;
+    state.libraries = [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])];
+    state.activeLibraryId = 'lib-a';
+    state.status = 'complete';
+
+    const dialog = library.internals.el('library-jav-detail-dialog');
+    dialog.open = true;
+    dialog.close = () => { dialog.open = false; };
+
+    await library.internals.openStudio('E-BODY');
+    assert.equal(dialog.open, false, '跳转时关闭详情页');
+    assert.equal(state.groupBy, 'studio', '走片商分组');
+    assert.equal(state.group, 'E-BODY');
+    assert.ok(state.libraryHistory, '记录来源位置');
+  }
+
+  // 1.10.2) 详情页：大图可点击放大
+  {
+    const { library } = boot();
+    const markup = library.internals.javDetailMarkup(film({
+      dvdid: 'ABC-123', fanart_path: '/x/ABC-123-fanart.jpg',
+    }));
+    assert.match(markup, /data-lib-zoom="\/api\/library\/films\/f-1\/fanart/, '大图可点击放大');
+  }
+
+  // 1.10.3) 详情页图片墙：竖版/横版/剧照都列出，点击放大
+  {
+    const { library } = boot({
+      routes: {
+        '/api/library/films/f-1/gallery': {
+          items: [
+            { name: 'poster.jpg', kind: 'poster', url: '/api/library/films/f-1/asset?path=poster.jpg' },
+            { name: 'ABC-123-fanart.jpg', kind: 'fanart', url: '/api/library/films/f-1/asset?path=ABC-123-fanart.jpg' },
+            { name: 's1.jpg', kind: 'still', url: '/api/library/films/f-1/asset?path=s1.jpg' },
+          ],
+        },
+      },
+    });
+    const host = library.internals.el('library-jav-detail-gallery');
+    await library.internals.loadFilmGallery('f-1');
+    const html = host.innerHTML;
+    assert.match(html, /lib-gallery-grid/, '有图片网格');
+    assert.match(html, /data-lib-zoom=/, '图片可点击放大');
+    assert.match(html, /竖版海报/, '标注竖版海报');
+    assert.match(html, /横版图/, '标注横版图');
+    assert.match(html, /剧照/, '标注剧照');
+    assert.equal((html.match(/lib-gallery-item/g) || []).length, 3, '三张图');
+
+    // 没有图片时不渲染
+    const empty = boot({ routes: { '/api/library/films/f-1/gallery': { items: [] } } });
+    const emptyHost = empty.library.internals.el('library-jav-detail-gallery');
+    await empty.library.internals.loadFilmGallery('f-1');
+    assert.equal(emptyHost.innerHTML, '', '无图时不渲染区块');
+  }
+
+  // 1.10.4) 放大看图：设置图片地址与文件名
+  {
+    const { library } = boot();
+    const dialog = library.internals.el('library-image-zoom-dialog');
+    dialog.showModal = () => { dialog.open = true; };
+    dialog.close = () => { dialog.open = false; };
+    library.internals.openImageZoom('/x/a.jpg', 'a.jpg');
+    assert.equal(library.internals.el('library-image-zoom-img').src, '/x/a.jpg');
+    assert.equal(library.internals.el('library-image-zoom-name').textContent, 'a.jpg');
+    assert.equal(dialog.open, true, '打开预览对话框');
+  }
+
+  // 1.11) 剧集卡片：按钮改为「资料」，进编辑页
+  {
+    const { library } = boot();
+    const series = library.internals.seriesCardMarkup(film({
+      id: 's-1', kind: 'series', title: '大明风华', season_count: 1, episode_count: 61,
+    }));
+    assert.match(series, /data-lib-edit="s-1">资料</, '剧集按钮为资料');
+    assert.doesNotMatch(series, /data-lib-series="s-1">分集</, '不再是分集按钮');
+  }
+
+  // 1.12) 剧集资料页：季编号可编辑
+  {
+    const { library } = boot();
+    const markup = library.internals.seriesDetailMarkup(film({
+      kind: 'series', title: '爱情公寓', tmdb_id: '68809', season_number: 5,
+    }));
+    assert.match(markup, /data-lib-field="season_number"/, '有季编号输入框');
+    assert.match(markup, /value="5"/, '回填已保存的季号');
+    assert.match(markup, /TMDb 一个剧 ID 含全部季/, '说明为什么必填');
+  }
+
+  // 1.13) collectFields：季编号转数字，空值为 0
+  {
+    const { library } = boot();
+    const dialog = library.internals.el('library-film-dialog');
+    const makeField = (name, value) => ({ dataset: { libField: name }, value });
+    dialog.querySelectorAll = () => [makeField('season_number', '5'), makeField('title', '爱情公寓')];
+    let values = library.internals.collectFields();
+    assert.equal(values.season_number, 5, '数字季号');
+
+    dialog.querySelectorAll = () => [makeField('season_number', ''), makeField('title', '爱情公寓')];
+    values = library.internals.collectFields();
+    assert.equal(values.season_number, 0, '空值归一为 0');
+
+    dialog.querySelectorAll = () => [makeField('season_number', '999'), makeField('title', 'x')];
+    values = library.internals.collectFields();
+    assert.equal(values.season_number, 200, '上限 200');
+  }
+
+  // 1.14) 原始标题不再单独显示：用户只维护一个标题
+  {
+    const { library } = boot();
+    const seriesMarkup = library.internals.seriesDetailMarkup(film({
+      kind: 'series', title: '爱情公寓：辣味英雄传', original_title: '爱情公寓：辣味英雄传',
+    }));
+    assert.doesNotMatch(seriesMarkup, /data-lib-field="original_title"/, '剧集不显示原始标题');
+    assert.doesNotMatch(seriesMarkup, /原始标题/, '剧集无原始标题文案');
+
+    const movieMarkup = library.internals.detailMarkup(film({
+      title: '绣春刀', original_title: 'Brotherhood of Blades',
+    }));
+    assert.doesNotMatch(movieMarkup, /data-lib-field="original_title"/, '电影不显示原始标题');
+  }
+
+  // 1.15) 保存时沿用原始标题，NFO 的 originaltitle 不丢
+  {
+    const { library } = boot();
+    const state = library.internals.state;
+    state.active = film({ title: '爱情公寓', original_title: 'iPartment' });
+    const dialog = library.internals.el('library-film-dialog');
+    const makeField = (name, value) => ({ dataset: { libField: name }, value });
+    dialog.querySelectorAll = () => [makeField('title', '爱情公寓')];
+
+    let values = library.internals.collectFields();
+    assert.equal(values.original_title, 'iPartment', '沿用刮削时存入的原始标题');
+
+    // 刮削没给出原始标题时，用当前标题顶上
+    state.active = film({ title: '爱情公寓', original_title: '' });
+    values = library.internals.collectFields();
+    assert.equal(values.original_title, '爱情公寓', '没有原始标题时用标题');
+  }
+
+  // 1.16) 无海报时用视频预览帧；详情页与剧集也生效
+  {
+    const { library } = boot();
+
+    // 卡片：没有海报时回退到预览帧
+    const noPoster = library.internals.cardMarkup(film({
+      id: 'f-1', dvdid: 'ABCD-123', cover_path: '', fanart_path: '',
+    }));
+    assert.match(noPoster, /\/api\/library\/films\/f-1\/thumbnail/, '卡片用预览帧');
+    assert.match(noPoster, /lib-cover--preview/, '标记为预览态');
+
+    // 有海报时不应走预览帧
+    const withPoster = library.internals.cardMarkup(film({
+      id: 'f-2', dvdid: 'ABCD-124', cover_path: '/x/poster.jpg',
+    }));
+    assert.doesNotMatch(withPoster, /\/thumbnail/, '有海报时不请求预览帧');
+
+    // 详情页：大图缺失时也用预览帧
+    const detail = library.internals.javDetailMarkup(film({
+      id: 'f-3', title: '某片', cover_path: '', fanart_path: '',
+    }));
+    assert.match(detail, /\/api\/library\/films\/f-3\/thumbnail/, '详情页用预览帧');
+    assert.match(detail, /lib-javhero-preview/, '详情页标记预览态');
+  }
+
+  // 1.17) 预览帧不占用海报文件名（避免与刮削冲突）
+  {
+    const { library } = boot();
+    const markup = library.internals.cardMarkup(film({
+      id: 'f-9', dvdid: 'X-1', cover_path: '', fanart_path: '',
+    }));
+    // 预览走独立接口，不拼 -poster.jpg 这类 Emby 海报名
+    assert.doesNotMatch(markup, /-poster\.jpg/, '不得生成 Emby 海报名');
+    assert.match(markup, /\/thumbnail\?/, '走独立缩略图接口');
+  }
+
+  // 1.18) 预览图开关：关掉后不再请求缩略图接口
+  {
+    const { library } = boot();
+    const state = library.internals.state;
+    const filmData = film({ id: 'f-7', dvdid: 'NV-1', cover_path: '', fanart_path: '' });
+
+    // 默认开启
+    state.videoPreview = true;
+    const on = library.internals.cardMarkup(filmData);
+    assert.match(on, /\/thumbnail\?/, '开启时请求预览帧');
+    assert.match(on, /lib-cover--preview/, '开启时标记预览态');
+
+    // 关闭后：不请求缩略图，回到纯文字占位
+    state.videoPreview = false;
+    const off = library.internals.cardMarkup(filmData);
+    assert.doesNotMatch(off, /\/thumbnail/, '关闭时不请求预览帧');
+    assert.doesNotMatch(off, /lib-cover--preview/, '关闭时不是预览态');
+    assert.match(off, /lib-cover--empty/, '关闭时用空封面占位');
+    assert.match(off, /NV-1/, '仍显示番号文字');
+
+    // 有海报的影片不受开关影响
+    const withPoster = library.internals.cardMarkup(film({
+      id: 'f-8', dvdid: 'HP-1', cover_path: '/x/poster.jpg',
+    }));
+    assert.match(withPoster, /\/cover\?/, '有海报时照常显示海报');
+
+    state.videoPreview = true;
+  }
+
+  // 1.19) 预览图开关：详情页同样遵守
+  {
+    const { library } = boot();
+    const state = library.internals.state;
+    const noArt = film({ id: 'f-6', title: '某片', cover_path: '', fanart_path: '' });
+
+    state.videoPreview = true;
+    assert.match(library.internals.javDetailMarkup(noArt), /\/thumbnail/, '详情页开启时有预览');
+
+    state.videoPreview = false;
+    const detailOff = library.internals.javDetailMarkup(noArt);
+    assert.doesNotMatch(detailOff, /\/thumbnail/, '详情页关闭时无预览');
+    assert.match(detailOff, /暂无大图/, '回落占位');
+
+    state.videoPreview = true;
+  }
+
+  // 1.20) 全屏看图：不裁切、不出滚动条
+  {
+    const fs = require('node:fs');
+    const css = fs.readFileSync(require('node:path').join(__dirname, '../movsp/web/assets/overrides.css'), 'utf8');
+    const dialogRule = css.match(/\.library-image-zoom \{[^}]*\}/);
+    assert.ok(dialogRule, '应有 .library-image-zoom 规则');
+    // 必须显式撑满：否则继承 .app-dialog 的 480px 宽度，横图被压窄
+    assert.match(dialogRule[0], /width:\s*100vw/, '对话框宽度撑满视口');
+    assert.match(dialogRule[0], /max-width:\s*100vw/, '最大宽度不设限');
+    assert.match(dialogRule[0], /overflow:\s*hidden/, '不要滚动条');
+
+    const imgRule = css.match(/\.lib-zoom-body img \{[^}]*\}/);
+    assert.ok(imgRule, '应有图片规则');
+    // 宽高都限制，图片才能完整落在视口内
+    assert.match(imgRule[0], /max-width:\s*calc\(100vw/, '限制宽度');
+    assert.match(imgRule[0], /max-height:\s*calc\(100vh/, '限制高度');
+    assert.match(imgRule[0], /object-fit:\s*contain/, '按比例完整显示');
+  }
+
+  // 1.21) 图片下载失败要在任务上显示原因
+  {
+    const fs = require('node:fs');
+    const app = fs.readFileSync(require('node:path').join(__dirname, '../movsp/web/assets/app.js'), 'utf8');
+    const fn = app.slice(app.indexOf('function imageProgressSummary'),
+                         app.indexOf('function syncTaskExpansion'));
+    assert.match(fn, /task\.artwork_error/, '读取 artwork_error');
+    assert.ok(fn.indexOf('artwork_error') < fn.indexOf('missing_required'),
+              '图片失败原因优先于缺失字段提示');
+  }
+
+  // 2) 统计筛选按钮
+  {
+    const { library } = boot();
+    const markup = library.internals.statsMarkup({ total: 9, complete: 4, partial: 3, unscraped: 2, failed: 1, missing: 0 });
+    assert.match(markup, /data-lib-status="all"[^>]*aria-pressed="true"/);
+    assert.match(markup, /<strong>4<\/strong><span>资料完整<\/span>/);
+    assert.match(markup, /data-lib-status="failed"/);
+  }
+
+  // 2.5) 刮削路径标签：由预设推导，只读展示在媒体库卡片上
+  {
+    const { library } = boot();
+    const state = library.internals.state;
+    state.activeLibraryId = '';
+    state.libraries = [
+      libraryEntry('lib-jav', '正片', [], { scrape_path: { path: 'jav', label: 'JAV', description: '按番号刮削', scrapers: ['javbus'], warnings: [] } }),
+      libraryEntry('lib-film', '华语电影', [], { scrape_path: { path: 'title', label: '电影 / 剧集', description: '按标题刮削', scrapers: ['tmdb'], warnings: [] } }),
+      libraryEntry('lib-mixed', '混合', [], { scrape_path: { path: 'hybrid', label: 'JAV + 电影', description: '', scrapers: ['javbus', 'tmdb'], warnings: [] } }),
+      libraryEntry('lib-none', '未配置', [], { scrape_path: { path: 'none', label: '未配置', description: '', scrapers: [], warnings: ['该预设还没有选择刮削器'] } }),
+    ];
+    const tabs = library.internals.tabsMarkup();
+    // 媒体库卡片只显示「电影 / 剧集 + 文件夹数 + 影片数」，
+    // 刮削路径（JAV / 电影·剧集）属于内部实现，不再暴露给用户
+    assert.doesNotMatch(tabs, /lib-libcard-path/, '不应再显示刮削路径标签');
+    assert.doesNotMatch(tabs, />JAV</, '不应显示 JAV 标记');
+    assert.doesNotMatch(tabs, /电影\/剧集/, '不应显示路径类型标记');
+    assert.match(tabs, /lib-libcard-kind/, '仍保留媒体库类型（电影/剧集）');
+  }
+
+  // 2.6) 刮削按钮：JAV 库无番号提示"填写番号"，电影库直接"刮削"
+  {
+    const { library } = boot();
+    const state = library.internals.state;
+    const noCode = film({ id: 'f-x', dvdid: '', title: '', cover_path: '', status: 'unscraped',
+                          actress: [], runtime: 0, release_date: '', studio: '' });
+    // JAV 库
+    state.libraries = [libraryEntry('lib-jav', '正片', [], {
+      scrape_path: { path: 'jav', label: 'JAV', description: '', scrapers: ['javbus'], warnings: [] },
+    })];
+    state.activeLibraryId = 'lib-jav';
+    assert.match(library.internals.cardMarkup(noCode), /填写番号/, 'JAV 库无番号时提示填写番号');
+    // 电影库：不需要番号
+    state.libraries = [libraryEntry('lib-film', '电影', [], {
+      scrape_path: { path: 'title', label: '电影 / 剧集', description: '', scrapers: ['tmdb'], warnings: [] },
+    })];
+    state.activeLibraryId = 'lib-film';
+    const filmMarkup = library.internals.cardMarkup(noCode);
+    assert.doesNotMatch(filmMarkup, /填写番号/, '电影库不应要求番号');
+    assert.match(filmMarkup, /data-lib-scrape="f-x">刮削</, '电影库直接给刮削按钮');
+  }
+
+  // 2.7) 待确认状态：卡片徽标 + 详情页候选面板
+  {
+    const { library } = boot();
+    const pending = film({ id: 'f-p', scrape_state: 'needs_choice', status: 'partial' });
+    const markup = library.internals.cardMarkup(pending);
+    assert.match(markup, /待确认/, '待确认徽标');
+  }
+
+  // 3) 查询参数：库、状态、搜索都进 URL；“全部”不发送 status
+  {
+    const { library } = boot();
+    const state = library.internals.state;
+    state.status = 'all';
+    state.query = '';
+    state.activeLibraryId = '';
+    const params = library.internals.filterParams();
+    assert.equal(params.get('status'), null);
+    assert.equal(params.get('library_id'), null);
+    assert.equal(params.get('limit'), '48');
+    state.status = 'partial';
+    state.query = '小梅';
+    state.activeLibraryId = 'lib-9';
+    const filtered = library.internals.filterParams();
+    assert.equal(filtered.get('status'), 'partial');
+    assert.equal(filtered.get('query'), '小梅');
+    assert.equal(filtered.get('library_id'), 'lib-9');
+  }
+
+  // 4) 标签页：每个库一个标签，统计数量；管理员多一个“新建”
+  {
+    const { library, element } = boot();
+    const state = library.internals.state;
+    state.libraries = [
+      libraryEntry('lib-a', '正片', [folder('r-1', 'A', { film_count: 3 })]),
+      libraryEntry('lib-b', '素人', [folder('r-2', 'B', { film_count: 5 })]),
+    ];
+    state.activeLibraryId = 'lib-b';
+    const tabs = library.internals.tabsMarkup();
+    // 卡片式标签：名字 + 类型 + 文件夹数 + 影片数，可拖动排序
+    assert.match(tabs, /class="lib-libcard lib-libcard-all"/);
+    assert.match(tabs, /class="lib-libcard" type="button" role="tab" draggable="false" title="拖动可调整顺序" aria-selected="false" data-lib-library="lib-a"/);
+    assert.match(tabs, /lib-libcard-name">正片</);
+    assert.match(tabs, /lib-libcard-kind">电影</);
+    assert.match(tabs, /lib-libcard-count">3</);
+    assert.match(tabs, /aria-selected="true"[^>]*data-lib-library="lib-b"/);
+    assert.match(tabs, /id="library-create-tab"/);
+    // 没有 scrape_path 时不渲染路径标签（旧接口兼容）
+    assert.doesNotMatch(tabs, /lib-libcard-path/);
+    // 文件夹条：显示路径名、数量、可移除按钮
+    const folders = library.internals.foldersMarkup();
+    assert.match(folders, /1 个文件夹/);
+    state.libraries[1].minimum_size = 243269632;
+    assert.match(library.internals.foldersMarkup(), /忽略小于 232\.0 MB 的文件/);
+    assert.match(folders, /lib-folder-name">B</);
+    assert.match(folders, /data-lib-remove-folder="r-2"/);
+
+    // 非管理员看不到新建与移除入口
+    const operatorView = boot({ role: 'operator' });
+    const operatorState = operatorView.library.internals.state;
+    operatorState.libraries = state.libraries;
+    operatorState.activeLibraryId = 'lib-b';
+    assert.doesNotMatch(operatorView.library.internals.tabsMarkup(), /library-create-tab/);
+    assert.doesNotMatch(operatorView.library.internals.foldersMarkup(), /data-lib-remove-folder/);
+  }
+
+  // 5) load()：先取库列表，再取当前库的影片，并渲染标签页/统计/卡片
+  {
+    const { library, element, calls, listeners, context } = boot({
+      routes: {
+        '/api/library/libraries': {
+          libraries: [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])],
+        },
+        '/api/library/films': filmPage([film(), film({ id: 'f-2', dvdid: 'DEF-456', status: 'unscraped', title: '', cover_path: '', actress: [], missing_fields: ['title', 'cover'] })], { total: 2, complete: 1, unscraped: 1 }),
+      },
+    });
+    await library.load();
+    assert.deepEqual(calls.map((call) => call.url.split('?')[0]), ['/api/library/libraries', '/api/library/films']);
+    assert.match(calls[1].url, /library_id=lib-a/);
+    assert.match(element('library-tabs').innerHTML, /主库/);
+    assert.match(element('library-grid').innerHTML, /ABC-123/);
+    assert.match(element('library-stats').innerHTML, /影片总数/);
+    assert.equal(element('library-more').hidden, true);
+    assert.equal(element('library-scan').disabled, false);
+    assert.equal(element('library-body').hidden, false);
+    assert.equal(element('library-empty').hidden, true);
+    assert.equal(element('library-grid').style.values['--lib-card-size'], '150px');
+    assert.equal(library.internals.state.posterTier, 'medium');
+
+    listeners.click({
+      target: {
+        closest: (selector) => (selector === '[data-poster-tier]'
+          ? { dataset: { posterTier: 'large' } }
+          : null),
+      },
+      preventDefault() {},
+    });
+    assert.equal(element('library-grid').style.values['--lib-card-size'], '190px');
+    assert.equal(library.internals.state.posterTier, 'large');
+    assert.equal(context.localStorage.getItem('javsp-web.library-poster-size'), 'large');
+  }
+
+  // 6) 没有媒体库时显示空状态，并隐藏主体
+  {
+    const { library, element } = boot({ routes: { '/api/library/libraries': { libraries: [] } } });
+    await library.load();
+    assert.equal(element('library-empty').hidden, false);
+    assert.equal(element('library-body').hidden, true);
+    assert.equal(element('library-scan').disabled, true);
+  }
+
+  // 7) 切换标签页：带上新的 library_id 重新加载，并重置筛选
+  {
+    const { library, listeners, calls } = boot({
+      routes: {
+        '/api/library/libraries': {
+          libraries: [libraryEntry('lib-a', '正片', [folder('r-1', 'A')]), libraryEntry('lib-b', '素人', [folder('r-2', 'B')])],
+        },
+        '/api/library/films': filmPage([film()]),
+      },
+    });
+    await library.load();
+    library.internals.state.status = 'partial';
+    library.internals.state.query = '旧搜索';
+    listeners.click({ target: { closest: (selector) => (selector === '[data-lib-library]' ? { dataset: { libLibrary: 'lib-b' } } : null) }, preventDefault() {} });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const last = calls.filter((call) => call.url.startsWith('/api/library/films')).at(-1);
+    assert.match(last.url, /library_id=lib-b/);
+    assert.doesNotMatch(last.url, /status=/);
+    assert.doesNotMatch(last.url, /query=/);
+    assert.equal(library.internals.state.activeLibraryId, 'lib-b');
+  }
+
+  // 8) 新建媒体库：提交名称/预设/首个文件夹，并切到新库
+  {
+    const { library, element, calls } = boot({
+      routes: {
+        '/api/library/libraries': (url, options) => (options.method === 'POST'
+          ? { library: libraryEntry('lib-new', '新库', [folder('r-9', 'media2')]), scan: { id: 's-1', status: 'running' } }
+          : { libraries: [libraryEntry('lib-new', '新库', [folder('r-9', 'media2')])] }),
+        '/api/library/scans/s-1': { scan: { id: 's-1', status: 'succeeded', discovered: 1, added: 1, updated: 0, removed: 0 } },
+        '/api/library/films': filmPage([film()]),
+      },
+    });
+    element('library-create-name').value = '  新库  ';
+    element('library-create-path').value = '  /media2  ';
+    element('library-create-preset').value = 'default';
+    await library.createLibrary();
+    const created = calls.find((call) => call.url === '/api/library/libraries' && call.method === 'POST');
+    assert.equal(created.body.name, '新库');
+    assert.deepEqual([...created.body.folders], [{ path: '/media2', recursive: true }]);
+    assert.equal(created.body.scan, true);
+    assert.equal(library.internals.state.activeLibraryId, 'lib-new');
+  }
+
+  // 9) 添加文件夹：POST 到当前库的 folders 接口
+  {
+    const { library, element, calls } = boot({
+      routes: {
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '正片', [folder('r-1', 'A')])] },
+        '/api/library/films': filmPage([film()]),
+        '/api/library/libraries/lib-a/folders': (url, options) => (options.method === 'POST'
+          ? { folder: folder('r-2', 'B'), library: libraryEntry('lib-a', '正片', [folder('r-1', 'A'), folder('r-2', 'B')]), scan: { id: 's-9', status: 'running' } }
+          : {}),
+        '/api/library/scans/s-9': { scan: { id: 's-9', status: 'succeeded', discovered: 1, added: 1, updated: 0, removed: 0 } },
+      },
+    });
+    await library.load();
+    element('library-folder-path').value = '/media/B';
+    element('library-folder-name').value = 'B 目录';
+    await library.addFolder();
+    const added = calls.find((call) => call.url === '/api/library/libraries/lib-a/folders');
+    assert.equal(added.method, 'POST');
+    assert.equal(added.body.path, '/media/B');
+    assert.equal(added.body.name, 'B 目录');
+    assert.equal(added.body.scan, true);
+  }
+
+  // 10) 移除文件夹：发 DELETE，并提示只删索引
+  {
+    const { library, element, calls } = boot({
+      routes: {
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '正片', [folder('r-1', 'A'), folder('r-2', 'B')])] },
+        '/api/library/films': filmPage([film()]),
+        '/api/library/libraries/lib-a/folders/r-2': { ok: true },
+      },
+    });
+    await library.load();
+    let confirmed = '';
+    element('library-film-dialog'); // 占位，避免其它逻辑取不到元素
+    const original = library.internals.state.libraries;
+    await library.removeFolder('r-2');
+    const removed = calls.find((call) => call.url === '/api/library/libraries/lib-a/folders/r-2');
+    assert.ok(removed, '应发送删除请求');
+    assert.equal(removed.method, 'DELETE');
+    assert.deepEqual(original, library.internals.state.libraries);
+  }
+
+  // 11) 详情保存：PATCH 带资料与 NFO mtime；不勾选刮削时不创建任务
+  {
+    const saved = film({ title: '新标题' });
+    const { library, element, calls } = boot({
+      routes: {
+        '/api/library/films/f-1': { film: saved },
+        '/api/library/films/f-1/nfo': { content: '<movie><title>演示标题</title></movie>', path: '/media/ABC-123/movie.nfo', mtime: 1234 },
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])] },
+        '/api/library/films': filmPage([]),
+      },
+    });
+    await library.open('f-1', { edit: true });
+    const dialog = element('library-film-dialog');
+    const fields = new Map();
+    ['dvdid', 'title', 'original_title', 'actress', 'release_date', 'studio', 'publisher', 'director', 'runtime', 'plot']
+      .forEach((name) => fields.set(name, makeElement()));
+    fields.get('dvdid').value = 'ABC-123';
+    fields.get('title').value = '新标题';
+    fields.get('actress').value = '演员甲、演员乙';
+    fields.get('runtime').value = '120';
+    dialog.querySelectorAll = () => [...fields.entries()].map(([name, input]) => ({ dataset: { libField: name }, value: input.value }));
+    await library.save({ scrape: false });
+    const patch = calls.find((call) => call.method === 'PATCH');
+    assert.ok(patch, '应发送 PATCH');
+    assert.equal(patch.url, '/api/library/films/f-1');
+    assert.equal(patch.body.title, '新标题');
+    assert.deepEqual([...patch.body.actress], ['演员甲', '演员乙']);
+    assert.equal(patch.body.runtime, 120);
+    assert.equal(patch.body.write_nfo, true);
+    assert.equal(patch.body.expected_nfo_mtime, 1234);
+    assert.equal(calls.filter((call) => call.url).some((call) => call.url.includes('/scrape')), false);
+  }
+
+  // 12) 保存并刮削：PATCH 之后再 POST /scrape，并把新番号一起提交
+  {
+    const saved = film({ dvdid: 'NEW-999' });
+    const { library, element, calls } = boot({
+      routes: {
+        '/api/library/films/f-1': { film: saved },
+        '/api/library/films/f-1/nfo': { content: '', path: '', mtime: 0 },
+        '/api/library/films/f-1/scrape': { task_id: 'task-1', film: saved },
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])] },
+        '/api/library/films': filmPage([]),
+      },
+    });
+    await library.open('f-1', { edit: true });
+    const dialog = element('library-film-dialog');
+    const dvdid = makeElement();
+    dvdid.value = 'NEW-999';
+    dialog.querySelectorAll = () => [{ dataset: { libField: 'dvdid' }, value: dvdid.value }];
+    await library.save({ scrape: true });
+    const scrape = calls.find((call) => call.url.endsWith('/scrape'));
+    assert.ok(scrape, '应创建刮削任务');
+    assert.equal(scrape.method, 'POST');
+    assert.equal(scrape.body.dvdid, 'NEW-999');
+  }
+
+  // 13) 详情页对非管理员隐藏保存能力（仅浏览与刮削）
+  {
+    const { library, element } = boot({
+      role: 'operator',
+      routes: {
+        '/api/library/films/f-1': { film: film() },
+        '/api/library/films/f-1/nfo': { content: '', path: '', mtime: 0 },
+      },
+    });
+    await library.open('f-1', { edit: true });
+    assert.equal(element('library-film-save').disabled, true);
+    assert.equal(element('library-film-scrape').disabled, false);
+  }
+
+  // 13.5) 详情页演员名可点击：跳到该演员的分类影片列表
+  {
+    const { library } = boot();
+    // 演员跳转已从资料编辑页移除，只保留在详情页
+    const editMarkup = library.internals.detailMarkup(film({ dvdid: 'SSIS-001', actress: ['张三'] }));
+    assert.doesNotMatch(editMarkup, /data-lib-actress/, '资料编辑页不再有演员跳转');
+    const detailMarkup = library.internals.javDetailMarkup(film({ dvdid: 'SSIS-001', actress: ['张三'] }));
+    assert.match(detailMarkup, /data-lib-actress="张三"/, '详情页保留演员跳转');
+  }
+
+  // 13.6) 演员跳转：关闭详情页 + 记住来源位置，返回能回到原处
+  {
+    const { library } = boot({
+      routes: {
+        '/api/library/films': filmPage([film()]),
+        '/api/library/groups*': { by: 'actress', groups: [{ key: '张三', count: 2 }], all: { count: 2, covers: [] } },
+      },
+    });
+    const state = library.internals.state;
+    state.libraries = [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])];
+    state.activeLibraryId = 'lib-a';
+    state.status = 'complete';
+    state.query = 'ABC';
+    state.offset = 24;
+
+    // 模拟详情页打开着
+    const javDialog = library.internals.el('library-jav-detail-dialog');
+    javDialog.open = true;
+    javDialog.close = () => { javDialog.open = false; };
+
+    await library.internals.openActress('张三');
+
+    assert.equal(javDialog.open, false, '跳转时必须关闭 JAV 详情页');
+    assert.equal(state.groupBy, 'actress');
+    assert.equal(state.group, '张三');
+
+    // 历史记录应保存跳转前的筛选条件
+    const history = state.libraryHistory;
+    assert.ok(history, '应记录浏览历史');
+    assert.equal(history.status, 'complete', '记住原状态筛选');
+    assert.equal(history.query, 'ABC', '记住原搜索词');
+    assert.equal(history.offset, 24, '记住原分页位置');
+
+    // 返回：应还原而不是清空
+    await library.internals.popLibraryHistory();
+    assert.equal(state.group, null, '退出分组');
+    assert.equal(state.status, 'complete', '恢复原状态筛选');
+    assert.equal(state.query, 'ABC', '恢复原搜索词');
+    assert.equal(state.libraryHistory, null, '历史用掉后清空');
+  }
+
+  // 13.7) 无历史时返回：退回不分组列表
+  {
+    const { library } = boot({ routes: { '/api/library/films': filmPage([film()]) } });
+    const state = library.internals.state;
+    state.libraries = [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])];
+    state.activeLibraryId = 'lib-a';
+    state.groupBy = 'actress';
+    state.group = '张三';
+    state.libraryHistory = null;
+    await library.internals.popLibraryHistory();
+    assert.equal(state.group, null);
+  }
+
+  // 13.8) 剧集返回：同样走智能回退，恢复进入前的库/筛选/滚动
+  {
+    const { library } = boot({
+      routes: {
+        '/api/library/films': filmPage([film()]),
+        '/api/library/films/s-1': { film: film({ id: 's-1', kind: 'series', title: '大明风华' }) },
+      },
+    });
+    const state = library.internals.state;
+    state.libraries = [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])];
+    state.activeLibraryId = 'lib-a';
+    state.status = 'complete';
+    state.query = '大明';
+    state.offset = 48;
+
+    // 进入剧集：应记录历史
+    await library.internals.openSeries('s-1');
+    assert.ok(state.libraryHistory, '进剧集前要记录浏览位置');
+    assert.equal(state.libraryHistory.status, 'complete');
+    assert.equal(state.libraryHistory.query, '大明');
+    assert.equal(state.libraryHistory.offset, 48);
+    assert.equal(state.seriesFocus, 's-1', '已进入剧集');
+
+    // 返回：恢复原筛选，并退出剧集
+    await library.internals.popLibraryHistory();
+    state.seriesFocus = '';
+    assert.equal(state.status, 'complete', '恢复原状态筛选');
+    assert.equal(state.query, '大明', '恢复原搜索词');
+    assert.equal(state.libraryHistory, null);
+  }
+
+  // 13.9) 剧集返回按钮文案：有历史时提示回到上一页
+  {
+    const { library } = boot();
+    const state = library.internals.state;
+    state.seriesInfo = film({ id: 's-1', kind: 'series', title: '大明风华' });
+    state.libraryHistory = { status: 'complete' };
+    const withHistory = library.internals.seriesHeaderMarkup();
+    assert.match(withHistory, /返回上一页/, '有历史时显示返回上一页');
+
+    state.libraryHistory = null;
+    const withoutHistory = library.internals.seriesHeaderMarkup();
+    assert.match(withoutHistory, /返回剧集列表/, '无历史时退回剧集列表');
+  }
+
+  // 14) “打开文件所在目录”
+  {
+    const actressFilm = film({ actress: ['演员甲', '演员乙'] });
+    const { library, element, calls, listeners } = boot({
+      routes: {
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])] },
+        '/api/library/groups': {
+          by: 'actress',
+          groups: [
+            { key: '演员甲', name: '演员甲', count: 2 },
+            { key: '演员乙', name: '演员乙', count: 1 },
+          ],
+          total: 3,
+          stats: {},
+        },
+        '/api/library/films/f-1': { film: actressFilm },
+        '/api/library/films/f-1/nfo': { content: '', path: '', mtime: 0 },
+        '/api/library/films': filmPage([actressFilm], { total: 2 }),
+      },
+    });
+    assert.doesNotMatch(library.internals.detailMarkup(film({ actress: [] })), /data-lib-actress/,
+      '没有演员时不渲染跳转链接');
+
+    await library.load();
+    await library.open('f-1', { edit: true });
+    const markup = element('library-film-content').innerHTML;
+    // 资料编辑页不再提供演员跳转（已移到详情页）
+    assert.doesNotMatch(markup, /data-lib-actress/, '资料页无演员跳转');
+
+    listeners.click({
+      target: {
+        closest: (selector) => (selector === '[data-lib-actress]'
+          ? { dataset: { libActress: '演员乙' } }
+          : null),
+      },
+      preventDefault() {},
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const state = library.internals.state;
+    assert.equal(state.groupBy, 'actress');
+    assert.equal(state.group, '演员乙');
+    assert.equal(state.status, 'all');
+    assert.equal(state.query, '');
+    const filmCall = calls.filter((call) => call.url.startsWith('/api/library/films')).at(-1);
+    assert.match(filmCall.url, /group_by=actress/);
+    assert.match(filmCall.url, /group=%E6%BC%94%E5%91%98%E4%B9%99/);
+    assert.match(filmCall.url, /library_id=lib-a/);
+    assert.match(element('library-group-nav').innerHTML, /当前：演员乙/);
+  }
+
+  // 14) 扫描：按媒体库发起，轮询到 succeeded 后刷新
+  {
+    let polls = 0;
+    const { library, element, calls } = boot({
+      routes: {
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])] },
+        '/api/library/libraries/lib-a/scan': { scan: { id: 's-1', status: 'running' } },
+        '/api/library/scans/s-1': () => ({ scan: { id: 's-1', status: ++polls < 2 ? 'running' : 'succeeded', discovered: 3, added: 1, updated: 1, removed: 1, skipped: 2 } }),
+        '/api/library/films': filmPage([film()]),
+      },
+    });
+    await library.load();
+    await library.scan();
+    assert.match(element('library-message').textContent, /扫描完成：发现 3 部，新增 1/);
+    assert.match(element('library-message').textContent, /忽略/);
+    assert.ok(calls.some((call) => call.url === '/api/library/libraries/lib-a/scan' && call.method === 'POST'));
+  }
+
+  // 15) 翻页与刷新：追加用已加载条数作为 offset；刷新从 0 开始并保留已加载数量
+  {
+    const pageOf = (offset, limit) => ({
+      items: Array.from({ length: Math.min(limit, 60 - offset) }, (_, index) => film({ id: `f-${offset + index}`, dvdid: `ABC-${offset + index}` })),
+      total: 60, limit, offset,
+      stats: { total: 60, complete: 60, partial: 0, unscraped: 0, failed: 0, missing: 0 },
+    });
+    const { library, calls } = boot({
+      routes: {
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])] },
+        '/api/library/films': (url) => {
+          const params = new URL(url, 'https://example.test').searchParams;
+          return pageOf(Number(params.get('offset') || 0), Number(params.get('limit') || 48));
+        },
+      },
+    });
+    await library.load();
+    assert.equal(library.internals.state.films.length, 48);
+    await library.refresh();
+    const filmsCalls = calls.filter((call) => call.url.startsWith('/api/library/films'));
+    assert.equal(filmsCalls.length, 2);
+    assert.match(filmsCalls[0].url, /offset=0/);
+    assert.match(filmsCalls[1].url, /offset=0/);
+    assert.match(filmsCalls[1].url, /limit=48/);
+    assert.match(filmsCalls[1].url, /library_id=lib-a/);
+  }
+
+  // 16) 分类浏览：选“按演员”会拉取分组，点分组把 group_by/group 带进影片请求
+  {
+    const { library, element, calls, listeners } = boot({
+      routes: {
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])] },
+        '/api/library/groups': { by: 'actress', groups: [{ key: '演员甲', name: '演员甲', count: 2 }, { key: '', name: '未知演员', count: 1 }], total: 3, stats: {} },
+        '/api/library/films': filmPage([film()], { total: 3 }),
+      },
+    });
+    await library.load();
+    assert.equal(element('library-groups').hidden, true, '不分组时不显示分组条');
+    listeners.change({ target: { id: 'library-group', value: 'actress' } });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(element('library-groups').hidden, false);
+    // 默认卡片视图：选分类后主内容是分类卡片，影片墙让位
+    assert.match(element('library-groups').innerHTML, /data-lib-group-card="演员甲"/);
+    assert.equal(element('library-grid').hidden, true, '分类视图不显示影片墙');
+    assert.equal(calls.filter((call) => call.url.startsWith('/api/library/films')).length, 1,
+      '分类视图不应再请求影片墙');
+    listeners.click({ target: { closest: (selector) => (selector === '[data-lib-group-card]' ? { dataset: { libGroupCard: '演员甲' } } : null) }, preventDefault() {} });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const last = calls.filter((call) => call.url.startsWith('/api/library/films')).at(-1);
+    assert.match(last.url, /group_by=actress/);
+    assert.match(last.url, /group=%E6%BC%94%E5%91%98%E7%94%B2/);
+    assert.match(last.url, /library_id=lib-a/);
+  }
+
+  // 17) “打开文件所在目录”：本地部署显示按钮，容器部署隐藏；点击调用 reveal 接口
+  {
+    const filmData = film();
+    const local = boot({
+      routes: { '/api/library/films/f-1': { film: filmData }, '/api/library/films/f-1/nfo': { content: '', path: '', mtime: 0 } },
+      runtime: { docker: false, local_client: true },
+    });
+    await local.library.open('f-1', { edit: true });
+    const markup = local.element('library-film-content').innerHTML;
+    assert.match(markup, /data-lib-reveal="f-1">打开文件所在目录/);
+
+    const container = boot({
+      routes: { '/api/library/films/f-1': { film: filmData }, '/api/library/films/f-1/nfo': { content: '', path: '', mtime: 0 } },
+      runtime: { docker: true, local_client: true },
+    });
+    await container.library.open('f-1', { edit: true });
+    assert.doesNotMatch(container.element('library-film-content').innerHTML, /data-lib-reveal/);
+
+    // 局域网其它设备：即使不是 Docker 也不能显示（点了会让主机弹窗）
+    const remote = boot({
+      routes: { '/api/library/films/f-1': { film: filmData }, '/api/library/films/f-1/nfo': { content: '', path: '', mtime: 0 } },
+      runtime: { docker: false, local_client: false },
+    });
+    await remote.library.open('f-1', { edit: true });
+    assert.doesNotMatch(remote.element('library-film-content').innerHTML, /data-lib-reveal/,
+      '非本机客户端不应出现“打开文件所在目录”');
+
+    local.calls.length = 0;
+    const button = makeElement();
+    button.dataset = { libReveal: 'f-1' };
+    local.listeners.click({ target: { closest: (selector) => (selector === '[data-lib-reveal]' ? button : null) }, preventDefault() {} });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const revealCall = local.calls.find((call) => call.url && call.url.endsWith('/reveal'));
+    assert.ok(revealCall, '应调用 reveal 接口');
+    assert.equal(revealCall.url, '/api/library/films/f-1/reveal');
+    assert.equal(revealCall.method, 'POST');
+  }
+
+  // 18) 分类卡片模式：切换后显示大卡片，点卡片进入该分组，返回按钮复位
+  {
+    const { library, element, listeners, calls } = boot({
+      routes: {
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])] },
+        '/api/library/groups': {
+          by: 'actress',
+          groups: [
+            { key: '演员甲', name: '演员甲', count: 2, covers: [{ id: 'f-1', v: 'x' }, { id: 'f-2', v: 'y' }] },
+            { key: '演员乙', name: '演员乙', count: 1, covers: [] },
+            { key: '', name: '未知演员', count: 1, covers: [] },
+          ],
+          total: 4, all: { count: 4, covers: [{ id: 'f-1', v: 'x' }] }, stats: {},
+        },
+        '/api/library/films': filmPage([film()], { total: 2 }),
+      },
+    });
+    await library.load();
+    const state = library.internals.state;
+    state.groupBy = 'actress';
+    state.group = null;
+    await library.refresh();
+
+    // 默认卡片模式：名字渲染成封面大卡
+    assert.equal(state.groupMode, 'cards');
+    assert.match(element('library-groups').innerHTML, /class="lc-library-card" data-lib-group-card="演员甲"/);
+
+    // 切到标签模式
+    listeners.click({ target: { closest: (selector) => (selector === '#library-group-mode' ? {} : null) }, preventDefault() {} });
+    assert.equal(state.groupMode, 'chips');
+    assert.match(element('library-groups').innerHTML, /lib-group[^"]*"[^>]*data-lib-group="演员甲"/);
+    assert.doesNotMatch(element('library-groups').innerHTML, /lc-library-card/);
+
+    // 再切回卡片模式
+    listeners.click({ target: { closest: (selector) => (selector === '#library-group-mode' ? {} : null) }, preventDefault() {} });
+    assert.equal(state.groupMode, 'cards');
+    const cards = element('library-groups').innerHTML;
+    // 与概览一致的卡片结构：lc-library-grid + lc-library-card + 16:9 封面模板
+    assert.match(cards, /class="lc-library-grid"/);
+    assert.match(cards, /class="lc-library-card" data-lib-group-card="演员甲"/);
+    assert.match(cards, /lc-library-meta"><strong[^>]*>演员甲<\/strong><small><i><\/i>2 部影片/);
+    assert.match(cards, /\/api\/library\/films\/f-1\/cover\?v=x/);
+    assert.match(cards, /class="lc-cover lc-tpl-/);
+    assert.match(cards, /按演员浏览/);
+    assert.doesNotMatch(cards, /data-lib-group-card="__all__"/, '分类卡片里不出现“全部影片”');
+    assert.match(element('library-tabs').innerHTML, /lib-libcard-name">全部影片</, '顶部标签含全部影片');
+    assert.equal(element('library-groups').classList.includes('lib-groups--cards'), true, '卡片模式容器切换为块级');
+    assert.equal(element('library-groups').hidden, false);
+    assert.equal(element('library-grid').hidden, true, '卡片模式下不显示影片墙');
+    assert.equal(element('library-more').hidden, true);
+    assert.equal(element('library-group-mode').hidden, false);
+    assert.equal(element('library-group-mode').textContent, '列表视图');
+
+    // 搜索框仍然可用：搜索会带着 query 重新取分组，并且不会清掉已选分组
+    state.query = '演员甲';
+    await library.refresh();
+    const groupCall = calls.filter((call) => call.url.startsWith('/api/library/groups')).at(-1);
+    assert.match(groupCall.url, /query=%E6%BC%94%E5%91%98%E7%94%B2/);
+    state.query = '';
+
+    // 点卡片进入该分组
+    listeners.click({ target: { closest: (selector) => (selector === '[data-lib-group-card]' ? { dataset: { libGroupCard: '演员甲' } } : null) }, preventDefault() {} });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(state.group, '演员甲');
+    const filmCall = calls.filter((call) => call.url.startsWith('/api/library/films')).at(-1);
+    assert.match(filmCall.url, /group_by=actress/);
+    assert.match(filmCall.url, /group=%E6%BC%94%E5%91%98%E7%94%B2/);
+    assert.equal(element('library-grid').hidden, false, '进入分组后显示影片');
+    assert.match(element('library-group-nav').innerHTML, /返回演员列表/);
+    assert.equal(element('library-group-nav').hidden, false);
+    assert.equal(element('library-groups').hidden, true, '进入分类后不再显示其它名字');
+
+    // 排序仍然作用于影片列表
+    listeners.change({ target: { id: 'library-sort', value: 'release' } });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const sorted = calls.filter((call) => call.url.startsWith('/api/library/films')).at(-1);
+    assert.match(sorted.url, /sort=release/);
+    assert.match(sorted.url, /group=%E6%BC%94%E5%91%98%E7%94%B2/);
+
+    // 返回分组列表
+    listeners.click({ target: { closest: (selector) => (selector === '#library-group-back' ? {} : null) }, preventDefault() {} });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(state.group, null);
+    assert.equal(element('library-group-nav').hidden, true);
+    assert.equal(element('library-groups').hidden, false, '返回后重新显示分类');
+    assert.match(element('library-groups').innerHTML, /lc-library-grid/, '返回后仍保持卡片模式');
+
+    assert.equal(state.group, null);
+
+    // 未知分组（空 key）也能点进去
+    listeners.click({ target: { closest: (selector) => (selector === '[data-lib-group-card]' ? { dataset: { libGroupCard: '' } } : null) }, preventDefault() {} });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(state.group, '');
+    const unknownCall = calls.filter((call) => call.url.startsWith('/api/library/films')).at(-1);
+    assert.match(unknownCall.url, /group_by=actress/);
+    assert.match(unknownCall.url, /[?&]group=&/);
+  }
+
+  // 19) 顶部“全部影片”标签：跨库汇总，不带 library_id，隐藏库级操作
+  {
+    const { library, element, listeners, calls } = boot({
+      routes: {
+        '/api/library/libraries': {
+          libraries: [
+            libraryEntry('lib-a', '骑兵', [folder('r-1', 'A', { film_count: 3 })]),
+            libraryEntry('lib-b', '步兵', [folder('r-2', 'B', { film_count: 5 })]),
+          ],
+        },
+        '/api/library/films': filmPage([film()], { total: 8 }),
+        '/api/library/libraries/lib-a/scan': { scan: { id: 's-a', status: 'running' } },
+        '/api/library/libraries/lib-b/scan': { scan: { id: 's-b', status: 'running' } },
+        '/api/library/scans/s-a': { scan: { id: 's-a', status: 'succeeded', discovered: 3, added: 0, updated: 0, removed: 0 } },
+        '/api/library/scans/s-b': { scan: { id: 's-b', status: 'succeeded', discovered: 5, added: 0, updated: 0, removed: 0 } },
+      },
+    });
+    await library.load();
+    const state = library.internals.state;
+    assert.equal(state.activeLibraryId, 'lib-a', '默认选第一个库');
+    assert.match(element('library-tabs').innerHTML, /lib-libcard-count">8</);
+
+    listeners.click({ target: { closest: (selector) => (selector === '[data-lib-library]' ? { dataset: { libLibrary: '__all__' } } : null) }, preventDefault() {} });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(state.activeLibraryId, '__all__');
+    const filmsCall = calls.filter((call) => call.url.startsWith('/api/library/films')).at(-1);
+    assert.doesNotMatch(filmsCall.url, /library_id=/, '全部影片不按库过滤');
+    assert.match(element('library-folders').innerHTML, /全部媒体库 · 2 个库/);
+    assert.equal(element('library-add-folder').hidden, true, '全部影片下不显示添加文件夹');
+    assert.equal(element('library-settings').hidden, true);
+
+    // 全部影片是汇总视图：不显示扫描按钮，也不允许误扫所有库
+    assert.equal(element('library-scan').hidden, true, '全部影片下隐藏扫描按钮');
+    assert.equal(element('library-scan').disabled, true);
+    await library.scan();
+    assert.equal(calls.filter((call) => call.url.endsWith('/scan')).length, 0, '全部影片下不发起扫描');
+
+    // 回到具体库：只扫描当前选中的库
+    listeners.click({ target: { closest: (selector) => (selector === '[data-lib-library]' ? { dataset: { libLibrary: 'lib-b' } } : null) }, preventDefault() {} });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(state.activeLibraryId, 'lib-b');
+    const backCall = calls.filter((call) => call.url.startsWith('/api/library/films')).at(-1);
+    assert.match(backCall.url, /library_id=lib-b/);
+    assert.equal(element('library-add-folder').hidden, false);
+    assert.equal(element('library-scan').hidden, false, '具体库下显示扫描按钮');
+    await library.scan();
+    assert.ok(calls.some((call) => call.url === '/api/library/libraries/lib-b/scan'), '只扫描当前库');
+    assert.ok(!calls.some((call) => call.url === '/api/library/libraries/lib-a/scan'), '不扫描其它库');
+  }
+
+  // 20) 批量刮削：按当前筛选提交，并提示预设必需字段
+  {
+    const { library, element, calls, listeners } = boot({
+      routes: {
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '骑兵', [folder('r-1', 'A', { film_count: 3 })])] },
+        '/api/library/films': filmPage([film()], { total: 3, partial: 3 }),
+        '/api/presets': [{ id: 'default', name: '默认配置', form: { crawler: { required_keys: ['dvdid', 'cover', 'title'] } } }],
+        '/api/library/films/scrape': { accepted: ['t1', 't2'], skipped: [], total: 2 },
+      },
+    });
+    await library.load();
+    const state = library.internals.state;
+    state.status = 'partial';
+    state.query = 'ABC';
+    await library.refresh();
+    state.status = 'partial';
+    state.query = 'ABC';
+    element('library-batch-scrape').disabled = false;
+    await library.batchScrape();
+    await new Promise((resolve) => setTimeout(resolve, 30));  // confirmAction 的回调是异步执行的
+    const call = calls.find((item) => item.url === '/api/library/films/scrape');
+    assert.ok(call, '应调用批量刮削接口');
+    assert.equal(call.method, 'POST');
+    assert.equal(call.body.library_id, 'lib-a');
+    assert.equal(call.body.status, 'partial');
+    assert.equal(call.body.query, 'ABC');
+    assert.equal(call.body.preset_id, 'default');
+    assert.ok(calls.some((item) => item.toast && /已加入 2 个/.test(item.toast)), '应提示已加入数量');
+    assert.equal(element('library-batch-scrape').disabled, false);
+  }
+
+  // 21) 没有影片时批量刮削直接提示，不发请求
+  {
+    const { library, calls } = boot({
+      routes: {
+        '/api/library/libraries': { libraries: [libraryEntry('lib-a', '骑兵', [folder('r-1', 'A')])] },
+        '/api/library/films': filmPage([], { total: 0 }),
+      },
+    });
+    await library.load();
+    await library.batchScrape();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls.filter((item) => item.url === '/api/library/films/scrape').length, 0);
+    assert.ok(calls.some((item) => item.toast && /没有可刮削/.test(item.toast)));
+  }
+
+  // 22) 手动刮削页：原生选择框只在本机显示
+  {
+    const app = fs.readFileSync(path.join(__dirname, '../movsp/web/assets/app.js'), 'utf8');
+    assert.match(app, /nativeHidden = Boolean\(runtime\.docker\) \|\| runtime\.local_client === false/,
+      '原生路径按钮要同时判断 docker 与 local_client');
+    assert.match(app, /nativePickerAllowed = state\.runtime\?\.local_client !== false/,
+      '预设里的“选择路径”按钮也要按本机判断');
+  }
+
+  // 23) 会动宿主机文件的操作只对主机上的页面开放
+  {
+    const app = fs.readFileSync(path.join(__dirname, '../movsp/web/assets/app.js'), 'utf8');
+    assert.match(app, /function hostFileActionsAllowed\(\)/, '需要本机判断助手');
+    assert.match(app, /task\.restore_available && hostFileActionsAllowed\(\)/,
+      '还原文件按钮要按本机判断');
+  }
+
+  // 24) 媒体库播放：详情里有播放入口，进度存本地
+  {
+    const librarySource = fs.readFileSync(path.join(__dirname, '../movsp/web/assets/library.js'), 'utf8');
+    assert.match(librarySource, /data-lib-play="\$\{escape\(film\.id\)\}"/, '详情里要有播放按钮');
+    assert.match(librarySource, /javsp-web\.playback\./, '播放进度要存在 localStorage');
+    assert.match(librarySource, /\/api\/library\/films\/\$\{encodeURIComponent\(filmId\)\}\/playback/,
+      '播放要走 playback 接口');
+    const page = fs.readFileSync(path.join(__dirname, '../movsp/web/index.html'), 'utf8');
+    assert.match(page, /id="library-player-video"/, '播放器元素要存在');
+    assert.match(page, /id="library-player-box"/, 'ArtPlayer 容器要存在');
+    assert.match(page, /\/assets\/artplayer\.min\.js/, '要加载 ArtPlayer');
+    assert.match(librarySource, /new window\.ArtPlayer\(/, '有 ArtPlayer 时用它渲染');
+    assert.match(page, /id="library-player-dialog"/, '播放器是独立大窗');
+    assert.match(librarySource, /class="lib-cover-play"/, '卡片封面要有悬停播放按钮');
+    assert.match(librarySource, /function openPlayer\(/, '播放走 openPlayer');
+    const css = fs.readFileSync(path.join(__dirname, '../movsp/web/assets/overrides.css'), 'utf8');
+    assert.match(css, /\.lib-cover-wrap:hover \.lib-cover-play/, '悬停才显示播放按钮');
+    assert.match(css, /width: min\(1920px, 96vw\)/, '播放窗口按 1920 上限自适应');
+    assert.match(librarySource, /function abortMediaElement\(/, '关闭时要真正断开媒体连接');
+    assert.match(librarySource, /playback\/stop/, '关闭时要通知服务端结束播放');
+    assert.match(librarySource, /keepalive: true/, '关闭页面时也要发出停止请求');
+    assert.doesNotMatch(librarySource, /payload\.mode !== 'emby'\) return;/, '本地播放关闭时也要停流');
+    assert.match(librarySource, /function watchPlaybackStall\(/, '要有卡住检测');
+    assert.match(librarySource, /readyState >= 2/, '卡住判断看是否拿到元数据');
+    assert.match(librarySource, /已改用转码播放/, '卡住后要自动改走转码');
+    assert.match(page, /\/assets\/hls\.min\.js/, '转码用 HLS 播放，需要 hls.js');
+    assert.match(page, /id="library-player-mode"/, '播放器里要有直连/转码切换按钮');
+    assert.match(librarySource, /customType: \{/, 'ArtPlayer 要注册 m3u8 自定义类型');
+    assert.match(librarySource, /function switchPlaybackMode\(/, '要有模式切换逻辑');
+    assert.match(librarySource, /prefer: prefer|query\.set\('prefer'/, '切换模式要带 prefer 参数');
+    assert.match(librarySource, /query\.set\('start'/, '切换模式要保持播放位置');
+    assert.match(librarySource, /destroyPlayer\(\{ keepDialog: true \}\)/, '切换模式时不要关播放窗口');
+    assert.match(librarySource, /state\.playerSwitching = true/, '切换期间要屏蔽 close 事件');
+    assert.match(librarySource, /function abortAllMedia\(/, '关闭时要清理所有残留媒体元素');
+    assert.match(librarySource, /function headlineOf\(/, '缺标题时用文件名做标题');
+    assert.match(librarySource, /fileNameOf\(film\)/, '卡片要能取到文件名');
+    assert.match(librarySource, /escape\(headlineOf\(film\)\)/, '卡片与详情都用统一标题');
+    assert.match(librarySource, /function updatePlayerStatus\(/, '状态显示要统一更新');
+    assert.match(librarySource, /updatePlayerStatus\(playerPayload\)/, '自动切到转码后要刷新状态');
+    assert.ok(fs.existsSync(path.join(__dirname, '../movsp/web/assets/hls.min.js')), 'hls.js 要随仓库分发');
+    assert.match(librarySource, /fallback_mode === 'emby'/, '本地播不了要回退到 Emby');
+    assert.ok(fs.existsSync(path.join(__dirname, '../movsp/web/assets/artplayer.min.js')), 'ArtPlayer 文件要随仓库分发');
+  }
+
+  // 剧集库：卡片显示季/集与 NFO 状态，季标签按接口给的季渲染，分集行带集号
+  {
+    const { library, element } = boot();
+    const internals = library.internals;
+    const state = internals.state;
+    state.libraries = [{ id: 'lib-series', name: '剧集库', kind: 'series', preset_id: 'default', folders: [] }];
+    state.activeLibraryId = 'lib-series';
+    assert.equal(internals.activeKind(), 'series');
+    assert.equal(internals.seriesMode(), true);
+
+    const series = {
+      id: 's-1', kind: 'series', title: '风起长林', cover_path: 'D:/poster.jpg', nfo_path: 'D:/tvshow.nfo',
+      season_count: 2, episode_count: 24, updated_at: '2026-11-01T10:00:00+08:00', size_bytes: 2048,
+    };
+    const card = internals.seriesCardMarkup(series);
+    assert.match(card, /风起长林/);
+    assert.match(card, /2 季 · 24 集/, '剧集卡片要显示季数与集数');
+    assert.match(card, /data-tone="success">有 NFO/);
+    assert.match(card, /data-lib-series="s-1"/, '点卡片进入分集');
+    assert.match(card, /data-lib-refresh="s-1"/, '剧集库的按钮是刷新 NFO');
+    assert.doesNotMatch(card, /data-lib-scrape/, '剧集库不联网刮削');
+
+    const noNfo = internals.seriesCardMarkup({ id: 's-2', title: '另一部', cover_path: '', episode_count: 3 });
+    assert.match(noNfo, /data-tone="neutral">无 NFO/);
+    assert.match(noNfo, /还没有分集|3 集/);
+
+    // 季标签来自季接口，不靠分集列表推导（分集是分页的）
+    state.seasons = [{ season: 1, episodes: 12 }, { season: 2, episodes: 12 }, { season: 0, episodes: 2 }];
+    state.seasonFocus = 2;
+    state.films = [
+      { id: 'e-1', season: 1, episode: 1, title: '第一集', cover_path: '' },
+      { id: 'e-2', season: 2, episode: 1, title: '第二季第一集', cover_path: '' },
+      { id: 'e-3', season: 0, episode: 1, title: '特别篇', cover_path: '' },
+    ];
+    const markup = internals.episodesMarkup();
+    assert.match(markup, /data-lib-season="1"[^>]*>第 1 季<span>12<\/span>/);
+    assert.match(markup, /class="lib-tab active" type="button" data-lib-season="2"/, '当前季要高亮');
+    assert.match(markup, /data-lib-season="0">特别篇<span>2<\/span>/, '第 0 季显示为特别篇');
+    assert.match(markup, /S02E01/, '只渲染当前季的分集');
+    assert.doesNotMatch(markup, /S01E01/, '别的季不在这一页');
+    assert.equal(internals.SEASON_LABEL(0), '特别篇');
+    assert.equal(internals.SEASON_LABEL(3), '第 3 季');
+    assert.equal(internals.episodeLabel({ season: 2, episode: 7 }), 'S02E07');
+
+    // 剧集头部（Emby 版式）：大海报 + 标题 + 元信息 + 操作按钮 + 简介
+    state.seriesInfo = { ...series, plot: '这是一段简介', actress: ['演员甲', '演员乙'] };
+    const head = internals.seriesHeaderMarkup();
+    assert.match(head, /<h1 class="lib-hero-title">风起长林<\/h1>/);
+    assert.match(head, /3 季 · 26 集/, '元信息里要带季集统计');
+    assert.match(head, /class="lib-hero-poster"/, '左侧大海报');
+    assert.match(head, /data-lib-series-back/, '返回按钮');
+    assert.match(head, /data-lib-play="e-1">▶ 播放/, '主操作按钮直接播放当前季第一集');
+    assert.match(head, /lib-hero-plot">这是一段简介/, '简介放在头部');
+
+    const strip = internals.episodesMarkup();
+    assert.match(strip, /class="lib-season-head"><h2>第 2 季<\/h2>/, '季标题作为分区标题');
+    assert.match(strip, /id="library-episode-strip"/, '分集是横向滚动条');
+    assert.match(strip, /data-lib-scroll="-1"/);
+    assert.match(strip, /data-lib-scroll="1"/);
+    assert.match(strip, /class="lib-ep-card"/);
+    assert.match(strip, /<span class="lib-ep-no">1<\/span>/, '卡片左上角是集号角标');
+    assert.match(strip, /lib-ep-name">第二季第一集/, '标题压在剧照上');
+    assert.match(strip, /lib-cast-list/, '有演员时显示演职员');
+
+    // 观看进度：只在分集上做标记（看完打勾、看了一部分留进度条），不在播放按钮上写进度
+    const playing = internals.episodeRowMarkup({
+      id: 'e-1', season: 1, episode: 3, title: '第三集',
+      progress: { position: 300, duration: 1800, percent: 16.7, finished: false },
+    });
+    assert.match(playing, /class="lib-ep-progress" style="width:16.7%"/);
+    assert.doesNotMatch(playing, /看到/, '卡片上不写具体时间');
+    assert.doesNotMatch(playing, /lib-ep-done/);
+
+    const done = internals.episodeRowMarkup({
+      id: 'e-2', season: 1, episode: 4, title: '第四集',
+      progress: { position: 1800, duration: 1800, percent: 100, finished: true },
+    });
+    assert.match(done, /lib-ep-done/, '看完的集打勾');
+    assert.doesNotMatch(done, /lib-ep-progress/, '看完的集不再显示进度条');
+
+    state.seriesProgress = { total: 24, watched: 3, resume: { film_id: 'e-9', season: 2, episode: 1, position: 120 } };
+    const resumed = internals.seriesHeaderMarkup();
+    assert.match(resumed, /已看 3\/24 集/);
+    assert.match(resumed, /data-lib-play="e-9">▶ 播放/, '播放按钮只写「播放」，进度不写在按钮上');
+    assert.doesNotMatch(resumed, /继续观看/);
+
+    // 返回按钮要显眼：统一的 lib-back 胶囊按钮，剧集页与分类页都用它
+    assert.match(resumed, /class="lib-back" type="button" data-lib-series-back/, '剧集页返回按钮用 lib-back');
+    state.groupBy = 'year';
+    state.group = '2026';
+    state.groups = [{ key: '2026', label: '2026', count: 6 }];
+    assert.match(internals.groupNavMarkup(), /class="lib-back" type="button" id="library-group-back"/, '分类页返回按钮用 lib-back');
+    state.groupBy = '';
+    state.group = null;
+
+    // 播放器的上一集 / 下一集
+    state.films = [
+      { id: 'e-1', kind: 'episode', season: 1, episode: 1, title: '一' },
+      { id: 'e-2', kind: 'episode', season: 1, episode: 2, title: '二' },
+      { id: 'e-3', kind: 'episode', season: 1, episode: 3, title: '三' },
+    ];
+    state.playingFilmId = 'e-2';
+    assert.equal(internals.episodeNeighbors().prev.id, 'e-1');
+    assert.equal(internals.episodeNeighbors().next.id, 'e-3');
+    state.playingFilmId = 'e-1';
+    assert.equal(internals.episodeNeighbors().prev, null, '第一集没有上一集');
+    state.playingFilmId = 'e-3';
+    assert.equal(internals.episodeNeighbors().next, null, '最后一集没有下一集');
+
+    // 顶栏按钮的可用状态：第一集禁用「上一集」、最后一集禁用「下一集」，电影直接隐藏
+    state.seasons = [{ season: 1, episodes: 3 }];
+    state.seasonFocus = 1;
+    internals.updateEpisodeNav();
+    assert.equal(element('library-player-prev').hidden, false);
+    assert.equal(element('library-player-next').hidden, false);
+    assert.equal(element('library-player-next').disabled, true, '最后一集禁用下一集');
+    state.playingFilmId = 'e-1';
+    internals.updateEpisodeNav();
+    assert.equal(element('library-player-prev').disabled, true, '第一集禁用上一集');
+    state.films = [{ id: 'm-1', kind: 'movie' }];
+    state.playingFilmId = 'm-1';
+    internals.updateEpisodeNav();
+    assert.equal(element('library-player-prev').hidden, true, '电影不显示上一集/下一集');
+
+    // 资料编辑：电影 / 剧集 / 分集三种表单，NFO 根节点提示各不相同
+    const movieForm = internals.detailMarkup(film());
+    assert.match(movieForm, /data-lib-field="dvdid"/, '电影要能改番号');
+    assert.match(movieForm, /根节点是否为 &lt;movie&gt;/);
+
+    const seriesForm = internals.detailMarkup({ ...series, season_count: 2, episode_count: 20 });
+    assert.match(seriesForm, /data-lib-field="title"/);
+    assert.match(seriesForm, /剧名/);
+    assert.doesNotMatch(seriesForm, /data-lib-field="dvdid"/, '剧集没有番号');
+    assert.match(seriesForm, /根节点是否为 &lt;tvshow&gt;/, '剧集写 tvshow.nfo');
+    assert.match(seriesForm, /2 季 · 20 集/);
+
+    const episodeForm = internals.detailMarkup({ ...film(), kind: 'episode', season: 1, episode: 2, title: '第二集' });
+    assert.match(episodeForm, /分集标题/);
+    assert.match(episodeForm, /S01E02/);
+    assert.match(episodeForm, /根节点是否为 &lt;episodedetails&gt;/, '分集写 episodedetails');
+    assert.doesNotMatch(episodeForm, /data-lib-field="dvdid"/);
+
+    // 剧集页与分集卡片上的编辑入口（仅管理员）
+    assert.match(internals.seriesHeaderMarkup(), /data-lib-edit="s-1">编辑资料/);
+    assert.match(internals.episodeRowMarkup({ id: 'e-5', season: 1, episode: 5, title: '五' }),
+      /data-lib-edit="e-5">编辑/);
+
+    // 季资料对话框依赖浏览器 DOMParser，离线环境只能校验入口和元素是否就位
+    const pageHtml = fs.readFileSync(path.join(__dirname, '../movsp/web/index.html'), 'utf8');
+    assert.match(pageHtml, /id="library-season-dialog"/, '要有季资料对话框');
+    assert.match(pageHtml, /id="library-player-prev"/, '播放器要有上一集按钮');
+    assert.match(pageHtml, /id="library-player-next"/, '播放器要有下一集按钮');
+    // 建库与设置里都能选类型
+    const page = fs.readFileSync(path.join(__dirname, '../movsp/web/index.html'), 'utf8');
+    assert.match(page, /<option value="series">剧集/, '新建媒体库要能选剧集');
+    assert.match(page, /id="library-settings-kind"/, '媒体库设置里要能改类型');
+  }
+
+  // 非管理员：看不到改资料 / 刮削 / 刷新入口（服务端也会 403）
+  {
+    const { library } = boot({ role: 'operator' });
+    const internals = library.internals;
+    const card = internals.cardMarkup(film());
+    assert.doesNotMatch(card, /data-lib-scrape/, '非管理员看不到刮削按钮');
+    internals.state.seriesInfo = { id: 's-1', title: '某剧', cover_path: '' };
+    const head = internals.seriesHeaderMarkup();
+    assert.doesNotMatch(head, /data-lib-edit/, '非管理员看不到编辑资料');
+    assert.doesNotMatch(head, /data-lib-refresh/, '非管理员看不到刷新 NFO');
+    const ep = internals.episodeRowMarkup({ id: 'e-1', season: 1, episode: 1, title: '一' });
+    assert.doesNotMatch(ep, /data-lib-edit/, '非管理员看不到分集编辑');
+  }
+
+  // 剧集详情页：必须铺满整行（不能沿用海报墙的多列网格），返回按钮要在最上面
+  {
+    const { library, element } = boot();
+    const internals = library.internals;
+    const state = internals.state;
+    state.libraries = [{ id: 'lib-series', name: '剧集库', kind: 'series', preset_id: 'default', folders: [] }];
+    state.activeLibraryId = 'lib-series';
+    state.seriesFocus = 's-1';
+    state.seriesInfo = { id: 's-1', title: '风起长林', cover_path: '', size_bytes: 2048 };
+    state.seasons = [{ season: 1, episodes: 2 }];
+    state.seasonFocus = 1;
+    state.films = [
+      { id: 'e-1', season: 1, episode: 1, title: '第一集', cover_path: '' },
+      { id: 'e-2', season: 1, episode: 2, title: '第二集', cover_path: '' },
+    ];
+    internals.render();
+    const grid = element('library-grid');
+    assert.equal(grid.classList.contains('lib-grid--series'), true, '剧集详情页要铺满整行，不能被挤成 168px 的格子');
+    assert.match(grid.innerHTML, /data-lib-series-back/, '剧集页必须有返回按钮');
+    assert.ok(grid.innerHTML.indexOf('data-lib-series-back') < grid.innerHTML.indexOf('<h2>'),
+      '返回按钮要在标题之前，别被内容挤到看不见');
+
+    // 回到剧集列表后恢复海报墙
+    state.seriesFocus = '';
+    internals.render();
+    assert.equal(grid.classList.contains('lib-grid--series'), false);
+  }
+
+  console.log('library client tests passed');
+}
+
+main().catch((error) => { console.error(error); process.exitCode = 1; });
