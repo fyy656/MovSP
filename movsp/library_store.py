@@ -1543,6 +1543,36 @@ def _conditions(library_id: str = '', folder_id: str = '', status: str = '', que
     return conditions, params
 
 
+def random_film(library_id: str = '', folder_id: str = '', status: str = '', query: str = '',
+                group_by: str = '', group: str = '', exclude: str = '',
+                seasons: int | None = None) -> dict | None:
+    """按当前筛选条件随机取一部「能播的」影片。
+
+    用途：媒体库的「随机播放」。只在该库范围内抽，不跨库。
+    只挑真的有视频文件的条目（剧集条目本身没有视频，跳过），
+    并支持排除上一部，避免连点两次抽到同一部。
+    """
+    conditions, params = _conditions(library_id, folder_id, status, query, group_by, group)
+    # 只取能播的：电影要有 video_path，剧集没有 video_path 但有 files
+    conditions.append("(coalesce(f.video_path,'')<>'' OR f.kind='series')")
+    conditions.append("f.kind IN ('movie','series')")
+    if exclude:
+        conditions.append('f.id<>?')
+        params.append(str(exclude))
+    where = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
+    with connection() as db:
+        row = db.execute(
+            'SELECT f.id FROM films f' + where + ' ORDER BY RANDOM() LIMIT 1',
+            params).fetchone()
+        if not row:
+            return None
+        film_id = row['id']
+    return get_film(film_id, reconcile=False)
+
+
+
+
+
 # 待确认状态的最长保留时间。
 # 多结果时不自动采用任何一条，等用户挑；但用户可能一直不回来，
 # 超时后撤销待确认，让这部片回到「未刮削」可以重新刮。

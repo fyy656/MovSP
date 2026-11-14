@@ -3072,6 +3072,21 @@ def library_scan(scan_id: str, _: dict = Depends(current_user)) -> dict:
     return {"scan": scan}
 
 
+@app.get("/api/library/films/random")
+def library_random_film(library_id: str = "", folder_id: str = "", status: str = "",
+                        query: str = Query(default="", max_length=200),
+                        group_by: str = "", group: str = Query(default="", max_length=200),
+                        exclude: str = Query(default="", max_length=64),
+                        seasons: int | None = None,
+                        _: dict = Depends(current_user)) -> dict:
+    """媒体库「随机播放」：按当前筛选随机取一部能播的影片。"""
+    film = library_store.random_film(library_id, folder_id, status, query.strip(),
+                                     group_by, group, exclude, seasons)
+    if not film:
+        raise HTTPException(status_code=404, detail="这个范围里没有可播放的影片")
+    return {"film": film}
+
+
 @app.get("/api/library/films")
 def library_films(library_id: str = "", folder_id: str = "", status: str = "",
                   query: str = Query(default="", max_length=200),

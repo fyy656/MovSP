@@ -886,6 +886,14 @@
       batchButton.disabled = series || !hasLibraries || !state.activeLibraryId || !state.total;
       batchButton.title = `把当前筛选的 ${state.total} 部影片加入刮削队列`;
     }
+    const randomButton = el('library-random-play');
+    if (randomButton) {
+      // 随机播放对所有用户开放；没有影片时禁用
+      randomButton.disabled = !hasLibraries || !state.total;
+      randomButton.title = state.total
+        ? `从当前范围（${state.total} 部）随机播放一部`
+        : '当前范围没有可播放的影片';
+    }
     const addFolder = el('library-add-folder');
     if (addFolder) addFolder.hidden = !isAdmin() || !hasLibraries || libraryIsAll();
     const settings = el('library-settings');
@@ -1806,6 +1814,42 @@
       target = direction > 0 ? items[0] : items[items.length - 1];
     }
     if (target) openPlayer(target.id);
+  }
+
+  /**
+   * 随机播放：按当前筛选范围随机取一部能播的影片。
+   *
+   * 由后端随机（而不是前端在已加载的几十条里抽），
+   * 这样整个媒体库都会参与，不受分页影响。
+   * 传入 exclude 避免连点两次抽到同一部。
+   */
+  async function randomPlay() {
+    const button = el('library-random-play');
+    if (button?.disabled) return;
+    try {
+      const params = filterParams({ limit: 1, offset: 0 });
+      // 随机接口不认排序与分页，去掉避免干扰
+      params.delete('sort');
+      params.delete('limit');
+      params.delete('offset');
+      if (state.playingFilmId) params.set('exclude', state.playingFilmId);
+      const payload = await api(`/api/library/films/random?${params}`);
+      const film = payload?.film;
+      if (!film) {
+        showToast('没有可播放的影片', 'warning');
+        return;
+      }
+      // 剧集条目本身没有视频：先进入剧集页，让用户看到分集
+      if (film.kind === 'series') {
+        showToast(`随机到剧集：${film.title || ''}`);
+        await openSeries(film.id);
+        return;
+      }
+      showToast(`随机播放：${film.title || film.dvdid || ''}`);
+      openPlayer(film.id);
+    } catch (error) {
+      showToast(error.message || '随机播放失败', 'danger');
+    }
   }
 
   async function playFilm(filmId, options = {}) {
@@ -2851,6 +2895,11 @@
       render();
       return;
     }
+    if (event.target.closest('#library-random-play')) {
+      event.preventDefault();
+      randomPlay();
+      return;
+    }
     if (event.target.closest('#library-batch-scrape')) {
       event.preventDefault();
       batchScrape();
@@ -3165,6 +3214,8 @@
       // 演员跳转与浏览历史
       openActress, popLibraryHistory, pushLibraryHistory, groupNavMarkup,
       openStudio, openGroupFilter,
+      // 随机播放
+      randomPlay,
       seriesDetailMarkup, seriesHeaderMarkup, collectFields, openSeries,
       // 详情页图片墙与放大
       loadFilmGallery, openImageZoom,

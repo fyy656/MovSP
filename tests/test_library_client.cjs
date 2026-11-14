@@ -566,6 +566,54 @@ async function main() {
               '图片失败原因优先于缺失字段提示');
   }
 
+  // 1.22) 随机播放：按当前筛选调随机接口，排除上一部
+  {
+    const movie = film({ id: 'f-r1', kind: 'movie', dvdid: 'R-1', video_path: '/x/a.mkv' });
+    const { library, calls } = boot({
+      routes: {
+        '/api/library/films/random': { film: movie },
+        '/api/library/films/f-r1/playback': { url: 'http://local/a.mkv', mode: 'native' },
+      },
+    });
+    const state = library.internals.state;
+    state.libraries = [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])];
+    state.activeLibraryId = 'lib-a';
+    state.total = 42;
+    state.playingFilmId = 'f-prev';
+
+    await library.internals.randomPlay();
+
+    const call = calls.find((c) => c.url.startsWith('/api/library/films/random'));
+    assert.ok(call, '应调用随机接口');
+    assert.match(call.url, /library_id=lib-a/, '带上当前库');
+    assert.match(call.url, /exclude=f-prev/, '排除正在播放的那部');
+    assert.doesNotMatch(call.url, /[?&]limit=/, '随机接口不需要分页参数');
+    assert.doesNotMatch(call.url, /[?&]offset=/, '随机接口不需要分页参数');
+  }
+
+  // 1.23) 随机播放：抽到剧集时进剧集页而不是直接播
+  {
+    const seriesFilm = film({ id: 'f-r2', kind: 'series', title: '某剧' });
+    const { library, calls } = boot({
+      routes: {
+        '/api/library/films/random': { film: seriesFilm },
+        '/api/library/films/f-r2': { film: seriesFilm },
+        '/api/library/films': filmPage([]),
+      },
+    });
+    const state = library.internals.state;
+    state.libraries = [libraryEntry('lib-a', '主库', [folder('r-1', 'A')])];
+    state.activeLibraryId = 'lib-a';
+    state.total = 5;
+
+    await library.internals.randomPlay();
+    // 剧集没有独立视频，应进入剧集页（seriesFocus 被设置）
+    assert.equal(state.seriesFocus, 'f-r2', '抽到剧集应进剧集页');
+    // calls 里还有 toast 记录，只筛有 url 的
+    assert.ok(!calls.some((c) => c.url && c.url.includes('/playback')),
+              '不应直接请求播放地址');
+  }
+
   // 2) 统计筛选按钮
   {
     const { library } = boot();
