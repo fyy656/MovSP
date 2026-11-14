@@ -1970,18 +1970,38 @@ def _artwork_should_overwrite(film: dict, task: dict | None) -> bool:
     规则：**默认不覆盖**——目录里已经有 poster.jpg / fanart.jpg 就不再下载，
     避免每次刮削都重下同一张图。
 
-    例外：剧集的季号变了才覆盖。一季一个目录时，第五季的目录里往往还留着
-    第一季的 poster.jpg，不覆盖就永远显示旧季的图。
+    两种必须覆盖的情况：
+      1. 换了一部片（TMDb / IMDb ID 变了）：旧图属于上一部作品，
+         不换就会出现「NFO 是新的、海报还是旧的」；
+      2. 剧集季号变了：一季一个目录时，新季目录里往往还留着上一季的 poster.jpg。
     """
     film = film or {}
+    query = (task or {}).get('scrape_query') or {}
+
+    # 1) 外部 ID 变化：换了另一部作品。
+    #    拿「本次刮削实际使用的 ID」和「库里上一次记下的 ID」比较。
+    used = query.get('external_id') or {}
+    used_tmdb = str(used.get('tmdb') or '').strip()
+    used_imdb = str(used.get('imdb') or '').strip()
+    have_tmdb = str(film.get('tmdb_id') or '').strip()
+    have_imdb = str(film.get('imdb_id') or '').strip()
+    if used_tmdb and have_tmdb and used_tmdb != have_tmdb:
+        return True
+    if used_imdb and have_imdb and used_imdb != have_imdb:
+        return True
+    # 库里没有 ID 却显式指定了：用户「清空输入」后重填再刮，
+    # 目录里留着的还是上一部作品的封面，必须换掉。
+    if (used_tmdb and not have_tmdb) or (used_imdb and not have_imdb):
+        return True
+
+    # 2) 剧集换季
     if film.get('kind') not in ('series', 'episode'):
         return False
     try:
-        wanted = int(((task or {}).get('scrape_query') or {}).get('season') or 0)
+        wanted = int(query.get('season') or 0)
     except (TypeError, ValueError):
         wanted = 0
     current = int(film.get('season_number') or 0)
-    # 两边都有季号且不同 → 换了季，必须换图
     return bool(wanted and current and wanted != current)
 
 
