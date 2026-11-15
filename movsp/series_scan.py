@@ -436,12 +436,32 @@ def parse_tvshow_nfo(path: Path) -> dict:
         value = (node.text or "").strip()
         if kind in ("tmdb", "imdb") and value:
             data[f"{kind}_id"] = value
+    # 剧集海报：跳过「季海报」节点（它们带 season/type 属性），
+    # 否则会拿第一张季图当整部剧的封面。
     thumb = ""
+    season_posters: dict[int, str] = {}
     for node in root.findall("thumb"):
-        if (node.text or "").strip():
-            thumb = _local_picture(node.text.strip(), path.parent)
-            break
+        value = (node.text or "").strip()
+        if not value:
+            continue
+        aspect = (node.get("aspect") or "").lower()
+        kind = (node.get("type") or "").lower()
+        season_attr = (node.get("season") or "").strip()
+        if kind == "season" or (season_attr and aspect == "poster"):
+            # tMM 写法：<thumb aspect="poster" season="2" type="season">URL</thumb>
+            try:
+                number = int(season_attr)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                season_posters[number] = value
+            continue
+        if not thumb:
+            thumb = _local_picture(value, path.parent)
     data["poster_path"] = thumb
+    if season_posters:
+        # 每季海报的远程地址，供下载成 seasonNN-poster.jpg
+        data["season_posters"] = {str(k): v for k, v in sorted(season_posters.items())}
     data["nfo_path"] = str(path)
     return {key: value for key, value in data.items() if value not in ("", [], None)}
 

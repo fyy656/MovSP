@@ -88,25 +88,35 @@ class SeasonFromNfoTests(unittest.TestCase):
         self.assertTrue(series_scan.find_season_poster(d, 2))
 
     def test_one_season_per_dir_prefers_season_poster(self):
-        """一季一顶层目录：有 poster.jpg 也要优先用 seasonNN-poster.jpg。"""
+        """一季一顶层目录：用户填了季号后，有 poster.jpg 也要优先用 seasonNN-poster.jpg。
+
+        季号只认用户输入（数据库），season.nfo 不作数。
+        """
         media = self._media('season-per-dir-')
         for season, year in ((1, 2019), (2, 2021)):
             folder = media / f'[某剧 第{season}季].Show.{year}.S{season:02d}'
             folder.mkdir(parents=True)
             (folder / f'S{season:02d}E01.mkv').write_bytes(b'x' * 1024)
-            (folder / 'season.nfo').write_text(SEASON_NFO % season, encoding='utf-8')
             (folder / f'season{season:02d}-poster.jpg').write_bytes(JPEG + bytes([season]))
             # 剧集级同名海报，用来验证不会被误用
             (folder / 'poster.jpg').write_bytes(JPEG + b'show-level')
 
         _, shows = self._scan(media)
         self.assertEqual(len(shows), 2, '一季一个目录 → 两个剧集条目')
+        # 模拟用户在资料页给每一部填季号
+        for show, season in zip(sorted(shows, key=lambda s: s['dir_path']), (1, 2)):
+            library_store.update_film(show['id'], {
+                'title': show['title'], 'tmdb_id': '1', 'imdb_id': '', 'write_nfo': False,
+                'actress': [], 'runtime': 0, 'season_number': season})
+
+        covers = set()
         for show in shows:
-            self.assertTrue(show.get('cover_path'), f"{show['title']} 应有封面")
-            self.assertRegex(Path(show['cover_path']).name, r'season0\d-poster\.jpg',
-                             '必须用季海报，不能用剧集级 poster.jpg')
-        # 两季封面必须不同
-        covers = {Path(s['cover_path']).name for s in shows}
+            covered = library_store._series_cover(
+                Path(show['dir_path']), {},
+                library_store._saved_season_number(show['id']))
+            self.assertRegex(Path(covered).name, r'season0\d-poster\.jpg',
+                             '填了季号必须用季海报，不能用剧集级 poster.jpg')
+            covers.add(Path(covered).name)
         self.assertEqual(len(covers), 2, '两季应各用各的季海报')
 
     def test_show_dir_with_season_subdirs(self):

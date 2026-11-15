@@ -1020,55 +1020,101 @@ def _record_for_files(root: dict, directory: Path, files: list[Path], single_gro
     }
 
 
-def _series_cover(series_dir: Path, meta: dict) -> str:
+def _saved_season_number(film_id: str) -> int:
+    """读数据库里保存的季号（用户在资料页填的）。
+
+    扫描时构造记录发生在写库之前，所以这里读的是**上一次**保存的值。
+    用户改过季号后重新扫描，封面会按新季号重新选图。
+    """
+    try:
+        with connection() as db:
+            row = db.execute(
+                'SELECT season_number FROM films WHERE id=?', (str(film_id),)).fetchone()
+        return int(row['season_number'] or 0) if row else 0
+    except (sqlite3.Error, TypeError, ValueError):
+        return 0
+
+
+def _only_season_poster(folder: Path) -> str:
+    """目录里只有一个季海报时返回它，否则空。
+
+    用于「用户还没填季号」的情况：只有一个候选就不存在猜错，
+    可以安全地拿它当封面。有多个季海报时必须等用户指定，
+    否则会出现「三季都显示同一张」的老问题。
+    """
+    import re as _re
+
+    pattern = _re.compile(r'(?i)^season\s*(\d{1,2})[\s._-]*(?:poster)?\.(?:jpg|jpeg|png|webp)$')
+    try:
+        entries = [p for p in folder.iterdir()
+                   if p.is_file() and pattern.match(p.name)]
+    except OSError:
+        return ''
+    seasons = {pattern.match(p.name).group(1).lstrip('0') or '0' for p in entries}
+    if len(entries) == 1 and len(seasons) == 1:
+        return str(entries[0])
+    return ''
+
+
+def _series_cover(series_dir: Path, meta: dict, user_season: int = 0) -> str:
     """剧集封面，按 Emby 规范决定优先级。
 
-    季号**只认 NFO**（`season.nfo` 的 `<seasonnumber>`），不从目录名推断——
-    目录名里的数字不可靠，用户刮削时会写入准确的季号。
+    季号**只认用户在资料页填的那个值**（数据库 films.season_number），
+    不从目录名推断、也不读 season.nfo —— 用户明确要求以输入为准。
 
-    两种情况都要对：
+    `user_season` 为 0 表示「这部没指定季」，此时按普通剧集处理。
 
-    A. 总目录 + 季子目录（名姝/Season 1、Season 2）
-       —— 根目录的剧集级 poster.jpg 优先；没有就用第一季的季海报兜底。
-
-    B. 一季一个顶层目录（名姝S01.… / 名姝S02.…）
-       —— 目录里若有 season.nfo 指明季号，就用该季的 seasonNN-poster.jpg，
-          否则直接拿 poster.jpg 会让所有季长得一模一样。
+    优先级：
+      1. 用户指定了季号 → 该季的 Emby 季海报 `seasonNN-poster.jpg`
+      2. 目录里的剧集级海报（poster/folder/cover/default）
+      3. NFO 记录的本地海报
+      4. 总目录结构下的季子目录兜底（避免整部剧一片空白）
     """
     base = Path(str(series_dir))
-    # 本目录对应的季号：只看 NFO
-    own_season = series_scan._season_number_from_nfo(base)
+    season = int(user_season or 0)
 
-    # 1) NFO 指明了季号：优先本季的 Emby 季海报
-    if own_season and own_season > 0:
-        season_poster = series_scan.find_season_poster(base, own_season)
+    # 1) 用户指定了季号：用该季的季海报
+    if season > 0:
+        season_poster = series_scan.find_season_poster(base, season)
         if season_poster:
             return season_poster
+        # 一季一个目录时季目录可能就是本目录；再看子目录
+        try:
+            for child in sorted(base.iterdir()):
+                if child.is_dir() and series_scan.season_from_dir_name(child.name) == season:
+                    found = series_scan.find_season_poster(child, season)
+                    if found:
+                        return found
+        except OSError:
+            pass
 
-    # 2) 目录里通用的剧集级海报
+    # 2) 目录里的剧集级海报
     cover = series_scan.find_poster(base)
     if cover:
         return cover
 
-    # 3) NFO 里记录的本地海报
+    # 3) NFO 记录的本地海报
     poster = str((meta or {}).get('poster_path') or '')
     if poster and not poster.startswith(('http://', 'https://')) and Path(poster).is_file():
         return poster
 
-    # 4) 总目录结构：根目录没图时，用季子目录的海报兜底
-    #    （子目录若是严格意义的季目录，仍然以它的 NFO 为准）
+    # 4) 没填季号时：目录里若只有**唯一一个** seasonNN-poster.jpg，
+    #    直接用它是安全的（不存在猜错的问题——只有一个候选）。
+    if season <= 0:
+        only = _only_season_poster(base)
+        if only:
+            return only
+
+    # 5) 总目录结构兜底：根目录没图时，取第一个季子目录的海报
     try:
         for child in sorted(base.iterdir()):
             if not child.is_dir():
                 continue
-            child_season = series_scan._season_number_from_nfo(child)
+            child_season = series_scan.season_from_dir_name(child.name)
             if child_season is None:
-                child_season = series_scan.season_from_dir_name(child.name)
-            fallback = ''
-            if child_season and child_season > 0:
-                fallback = series_scan.find_season_poster(child, child_season)
-            if not fallback:
-                fallback = series_scan.find_poster(child)
+                continue
+            fallback = (series_scan.find_season_poster(child, child_season)
+                        or series_scan.find_poster(child))
             if fallback:
                 return fallback
     except OSError:
@@ -1081,8 +1127,9 @@ def _series_record(root: dict, series_dir: Path, entries: list[dict]) -> dict:
     show_nfo = series_dir / 'tvshow.nfo'
     meta = series_scan.parse_tvshow_nfo(show_nfo) if show_nfo.is_file() else {}
     title = str(meta.get('title') or '') or series_scan.clean_series_title(series_dir.name) or series_dir.name
-    # 封面：季号只认 NFO，不从目录名推断（见 _series_cover）
-    cover = _series_cover(series_dir, meta)
+    # 封面：季号只认用户填的值（见 _series_cover）
+    film_id = _film_id(root['id'], str(series_dir), 'series')
+    cover = _series_cover(series_dir, meta, _saved_season_number(film_id))
     size = 0
     mtime = 0.0
     for entry in entries:
@@ -2717,6 +2764,33 @@ def _download_episode_still(episode: dict, url: str, overwrite: bool = True) -> 
         return ''
 
 
+def _season_poster_url_from_nfo(film: dict, season: int) -> str:
+    """从剧集的 tvshow.nfo 里取某一季的海报地址。
+
+    tMM / Emby 会这样记：
+      <thumb aspect="poster" season="2" type="season">https://…</thumb>
+
+    刮削时 TMDb 一般会直接给季海报，这里是兜底：
+    用户自己整理过 NFO、或用其它工具刮削过的情况。
+    """
+    try:
+        base = Path(str(film.get('dir_path') or ''))
+    except (TypeError, ValueError):
+        return ''
+    for candidate in (base / 'tvshow.nfo', ):
+        if not candidate.is_file():
+            continue
+        try:
+            meta = series_scan.parse_tvshow_nfo(candidate)
+        except (OSError, ValueError):
+            continue
+        posters = meta.get('season_posters') or {}
+        url = str(posters.get(str(int(season))) or '').strip()
+        if url.startswith(('http://', 'https://')):
+            return url
+    return ''
+
+
 def _download_season_poster(film: dict, season: int, url: str,
                             overwrite: bool = True) -> str:
     """下载某一季的海报。
@@ -2801,7 +2875,11 @@ def apply_season_result(series_id: str, season: int, data: dict) -> dict:
 
     # 季海报：TMDb 每季都有独立海报，之前完全没有落盘，
     # 结果所有季共用剧集的封面（媒体库里看起来三季一模一样）。
-    poster_saved = _download_season_poster(series, int(season), (data or {}).get('poster') or '')
+    # URL 优先用 TMDb 直接返回的；没有时退回 tvshow.nfo 里 tMM 记下的季海报地址。
+    poster_url = str((data or {}).get('poster') or '').strip()
+    if not poster_url.startswith(('http://', 'https://')):
+        poster_url = _season_poster_url_from_nfo(series, int(season))
+    poster_saved = _download_season_poster(series, int(season), poster_url)
 
     updated: list[int] = []
     missing: list[int] = []
