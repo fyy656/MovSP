@@ -1029,6 +1029,22 @@ def _series_record(root: dict, series_dir: Path, entries: list[dict]) -> dict:
     if not cover:
         poster = str(meta.get('poster_path') or '')
         cover = poster if poster and not poster.startswith(('http://', 'https://')) else ''
+    # 多季分目录（Season 1/2/3）时，剧集根目录往往没有海报，
+    # 图片都在季子目录里。用第一季的季海报当剧集封面，
+    # 否则整个剧集在媒体库里是一片空白。
+    if not cover:
+        try:
+            for child in sorted(series_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                if series_scan.season_from_dir_name(child.name) is None:
+                    continue
+                season_poster = series_scan.find_poster(child)
+                if season_poster:
+                    cover = season_poster
+                    break
+        except OSError:
+            pass
     size = 0
     mtime = 0.0
     for entry in entries:
@@ -2650,6 +2666,58 @@ def _download_episode_still(episode: dict, url: str, overwrite: bool = True) -> 
         return ''
 
 
+def _download_season_poster(film: dict, season: int, url: str,
+                            overwrite: bool = True) -> str:
+    """下载某一季的海报。
+
+    命名按 Emby / Jellyfin 规则，两种写法都写一份，兼容性最好：
+      * 季目录里的 `poster.jpg`  —— 多季分目录时最标准
+      * 剧集目录里的 `season01-poster.jpg` —— 单目录放全部季时用
+    """
+    import requests
+
+    url = str(url or '').strip()
+    if not url.startswith(('http://', 'https://')):
+        return ''
+    try:
+        season_dir = _season_dir(film, season)
+    except (OSError, KeyError, ValueError):
+        return ''
+    if not season_dir.is_dir():
+        return ''
+
+    targets = [season_dir / 'poster.jpg']
+    # 季目录就是剧集目录时，再补一份带季号的命名
+    base = Path(str(film.get('dir_path') or ''))
+    if season_dir == base:
+        targets = [base / f'season{int(season):02d}-poster.jpg']
+
+    primary = targets[0]
+    if primary.is_file() and not overwrite:
+        return str(primary)
+
+    try:
+        data = _fetch_image(url)
+    except Exception as exc:  # noqa: BLE001 - 图片失败不算刮削失败
+        try:
+            from . import oplog
+            oplog.get('scrape').warning('季海报下载失败 S%s: %s', season, exc)
+        except Exception:  # noqa: BLE001
+            pass
+        return ''
+
+    saved = ''
+    for target in targets:
+        try:
+            temporary = target.with_name(target.stem + '.tmp.jpg')
+            temporary.write_bytes(data)
+            temporary.replace(target)
+            saved = saved or str(target)
+        except OSError:
+            continue
+    return saved
+
+
 def apply_season_result(series_id: str, season: int, data: dict) -> dict:
     """把一整季的分集资料写进各集的 NFO，并同步索引。
 
@@ -2676,6 +2744,10 @@ def apply_season_result(series_id: str, season: int, data: dict) -> dict:
             "WHERE parent_id=? AND kind='episode' AND season=?",
             (series_id, int(season))).fetchall()
     by_number = {int(row['episode']): dict(row) for row in rows if row['episode'] is not None}
+
+    # 季海报：TMDb 每季都有独立海报，之前完全没有落盘，
+    # 结果所有季共用剧集的封面（媒体库里看起来三季一模一样）。
+    poster_saved = _download_season_poster(series, int(season), (data or {}).get('poster') or '')
 
     updated: list[int] = []
     missing: list[int] = []
@@ -2740,6 +2812,7 @@ def apply_season_result(series_id: str, season: int, data: dict) -> dict:
         'updated': sorted(updated),
         'missing': sorted(missing),
         'season_nfo': season_written,
+        'season_poster': bool(poster_saved),
     }
 
 
