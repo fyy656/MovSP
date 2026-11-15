@@ -1020,31 +1020,69 @@ def _record_for_files(root: dict, directory: Path, files: list[Path], single_gro
     }
 
 
+def _series_cover(series_dir: Path, meta: dict) -> str:
+    """剧集封面，按 Emby 规范决定优先级。
+
+    季号**只认 NFO**（`season.nfo` 的 `<seasonnumber>`），不从目录名推断——
+    目录名里的数字不可靠，用户刮削时会写入准确的季号。
+
+    两种情况都要对：
+
+    A. 总目录 + 季子目录（名姝/Season 1、Season 2）
+       —— 根目录的剧集级 poster.jpg 优先；没有就用第一季的季海报兜底。
+
+    B. 一季一个顶层目录（名姝S01.… / 名姝S02.…）
+       —— 目录里若有 season.nfo 指明季号，就用该季的 seasonNN-poster.jpg，
+          否则直接拿 poster.jpg 会让所有季长得一模一样。
+    """
+    base = Path(str(series_dir))
+    # 本目录对应的季号：只看 NFO
+    own_season = series_scan._season_number_from_nfo(base)
+
+    # 1) NFO 指明了季号：优先本季的 Emby 季海报
+    if own_season and own_season > 0:
+        season_poster = series_scan.find_season_poster(base, own_season)
+        if season_poster:
+            return season_poster
+
+    # 2) 目录里通用的剧集级海报
+    cover = series_scan.find_poster(base)
+    if cover:
+        return cover
+
+    # 3) NFO 里记录的本地海报
+    poster = str((meta or {}).get('poster_path') or '')
+    if poster and not poster.startswith(('http://', 'https://')) and Path(poster).is_file():
+        return poster
+
+    # 4) 总目录结构：根目录没图时，用季子目录的海报兜底
+    #    （子目录若是严格意义的季目录，仍然以它的 NFO 为准）
+    try:
+        for child in sorted(base.iterdir()):
+            if not child.is_dir():
+                continue
+            child_season = series_scan._season_number_from_nfo(child)
+            if child_season is None:
+                child_season = series_scan.season_from_dir_name(child.name)
+            fallback = ''
+            if child_season and child_season > 0:
+                fallback = series_scan.find_season_poster(child, child_season)
+            if not fallback:
+                fallback = series_scan.find_poster(child)
+            if fallback:
+                return fallback
+    except OSError:
+        pass
+    return ''
+
+
 def _series_record(root: dict, series_dir: Path, entries: list[dict]) -> dict:
     """一个剧集目录 → series 条目。它本身没有视频，播放的是它的分集。"""
     show_nfo = series_dir / 'tvshow.nfo'
     meta = series_scan.parse_tvshow_nfo(show_nfo) if show_nfo.is_file() else {}
     title = str(meta.get('title') or '') or series_scan.clean_series_title(series_dir.name) or series_dir.name
-    cover = series_scan.find_poster(series_dir)
-    if not cover:
-        poster = str(meta.get('poster_path') or '')
-        cover = poster if poster and not poster.startswith(('http://', 'https://')) else ''
-    # 多季分目录（Season 1/2/3）时，剧集根目录往往没有海报，
-    # 图片都在季子目录里。用第一季的季海报当剧集封面，
-    # 否则整个剧集在媒体库里是一片空白。
-    if not cover:
-        try:
-            for child in sorted(series_dir.iterdir()):
-                if not child.is_dir():
-                    continue
-                if series_scan.season_from_dir_name(child.name) is None:
-                    continue
-                season_poster = series_scan.find_poster(child)
-                if season_poster:
-                    cover = season_poster
-                    break
-        except OSError:
-            pass
+    # 封面：季号只认 NFO，不从目录名推断（见 _series_cover）
+    cover = _series_cover(series_dir, meta)
     size = 0
     mtime = 0.0
     for entry in entries:
@@ -2624,11 +2662,24 @@ def read_nfo(film_id: str) -> dict | None:
 
 
 def _season_dir(film: dict, season: int) -> Path:
-    """季目录：多季时 NFO 放在 Sxx 子目录，单季就放在剧集目录。"""
+    """某一季对应的目录。
+
+    优先级：
+      1. 子目录里的 `season.nfo` 指明该季号 → 那个子目录
+      2. 子目录名是严格的季标记（`S01` / `Season 1` / `第一季`）→ 那个子目录
+      3. 都不匹配 → 剧集根目录（一季一个顶层目录时就是这种情况）
+
+    不从长目录名里猜季号：那类名字（`名姝S01.Harlots…`）里的数字
+    可能是剧名的一部分，季号以 NFO 为准。
+    """
     base = Path(film['dir_path'])
     try:
         for child in base.iterdir():
-            if child.is_dir() and series_scan.season_from_dir_name(child.name) == int(season):
+            if not child.is_dir():
+                continue
+            if series_scan._season_number_from_nfo(child) == int(season):
+                return child
+            if series_scan.season_from_dir_name(child.name) == int(season):
                 return child
     except OSError:
         pass
@@ -2687,9 +2738,12 @@ def _download_season_poster(film: dict, season: int, url: str,
         return ''
 
     targets = [season_dir / 'poster.jpg']
-    # 季目录就是剧集目录时，再补一份带季号的命名
     base = Path(str(film.get('dir_path') or ''))
     if season_dir == base:
+        # 季目录就是剧集根目录（一季一个顶层目录）：
+        # 主用 Emby 规范的 seasonNN-poster.jpg，
+        # 但此时目录里若已有 poster.jpg，说明是剧集级封面，不能覆盖它，
+        # 否则其它季也会跟着变成这一季的图。
         targets = [base / f'season{int(season):02d}-poster.jpg']
 
     primary = targets[0]

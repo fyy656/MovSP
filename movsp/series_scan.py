@@ -297,6 +297,28 @@ def _season_number_from_nfo(folder: Path) -> int | None:
 # ---------------------------------------------------------------- 图片
 
 
+def find_season_poster(folder: Path, season: int) -> str:
+    """某一季的海报（Emby 规范）。
+
+    按 Emby / Jellyfin 的季图片命名，依次尝试：
+      1. `season01-poster.jpg`（季号补零/不补零都认）
+      2. `Season 1/poster.jpg` 这类季目录里的通用命名 —— 由调用方传入季目录
+      3. `season1.jpg`（部分整理工具用这个）
+    """
+    number = int(season)
+    names = [
+        f"season{number:02d}-poster", f"season{number}-poster",
+        f"Season {number:02d}-poster", f"Season {number}-poster",
+        f"season{number:02d}", f"season{number}",
+    ]
+    for name in names:
+        for extension in IMAGE_EXTENSIONS:
+            candidate = folder / f"{name}{extension}"
+            if candidate.is_file():
+                return str(candidate)
+    return ""
+
+
 def find_poster(folder: Path, stem: str = "") -> str:
     """剧集/分集封面（Primary）。
 
